@@ -1,47 +1,52 @@
-# Temporal Workers
+<p align="center">
+  <img src="logo.png" alt="nomad-temporal-jobs" width="400">
+</p>
+
+# Nomad Temporal Jobs
+
+[![CI](https://github.com/afreidah/nomad-temporal-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/afreidah/nomad-temporal-jobs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup) runs as an independent worker with its own container image, task queue, and Nomad service job. A shared trigger binary dispatches workflows on schedule.
 
+```
+  Nomad periodic triggers              Temporal Server
+  (temporal-*-trigger)                 (temporal-server.service.consul:7233)
+        |                                     |
+        | ExecuteWorkflow                     | Task Queue dispatch
+        v                                     v
+  +--------------+     +-----------------------+     +------------------+
+  | workflow-    |     | backup-worker         |     | trivy-scan-      |
+  | trigger      |---->| backup-task-queue     |     | worker           |
+  | (all three) |     +-----------------------+     | trivy-task-queue |
+  +--------------+     | cleanup-worker        |     +------------------+
+                       | cleanup-task-queue    |
+                       +-----------------------+
+                              |
+                              | SSH
+                              v
+                       Nomad client nodes
+```
+
+Each worker is a long-running Temporal worker process that polls its dedicated task queue. Workflows are pure orchestration; all I/O happens in activities. Activities are registered as struct methods, sharing pooled connections (DB, S3) across invocations.
+
 ## Table of Contents
 
-- [Architecture](#architecture)
 - [Workflow Domains](#workflow-domains)
 - [Shared Infrastructure](#shared-infrastructure)
 - [Trigger Binary](#trigger-binary)
+- [Retry and Error Handling](#retry-and-error-handling)
 - [Configuration](#configuration)
 - [Observability](#observability)
 - [Development](#development)
 - [Deployment](#deployment)
 - [Project Structure](#project-structure)
 
-## Architecture
-
-```
-  Nomad periodic triggers           Temporal Server
-  (temporal-*-trigger)              (temporal-server.service.consul:7233)
-        |                                  |
-        | ExecuteWorkflow                  | Task Queue dispatch
-        v                                  v
-  +-------------+    +------------------+    +----------------+
-  | workflow-    |    | backup-worker    |    | trivy-scan-    |
-  | trigger      |--->| backup-task-queue|    | worker          |
-  | (all 3)     |    +------------------+    | trivy-task-queue|
-  +-------------+    | cleanup-worker   |    +----------------+
-                     | cleanup-task-queue|
-                     +------------------+
-                            |
-                            | SSH
-                            v
-                     Nomad client nodes
-```
-
-Each worker is a long-running Temporal worker process that polls its dedicated task queue. Workflows are pure orchestration; all I/O happens in activities. Activities are registered as struct methods, sharing pooled connections (DB, S3) across invocations.
-
 ## Workflow Domains
 
 ### Backup
 
-Snapshots Nomad Raft state, Consul Raft state (includes Vault data), all PostgreSQL databases (pg_dumpall), and the container registry. Each snapshot is stored locally on an NFS mount and uploaded to S3 for off-site redundancy. Old backups are cleaned up based on configurable retention (default: 7 days local, 30 days S3).
+Snapshots Nomad Raft state, Consul Raft state (includes Vault data), and all PostgreSQL databases (pg_dumpall). Each snapshot is stored locally on an NFS mount and uploaded to S3 for off-site redundancy. Old backups are cleaned up based on configurable retention (default: 7 days local, 30 days S3).
 
 **Task queue:** `backup-task-queue`
 **Schedule:** Daily at 2 AM
@@ -70,12 +75,12 @@ SSHes to each Nomad client node, identifies job data directories that no longer 
 
 The `shared/` package provides common functionality used by all workers:
 
-| Package | Purpose |
-|---------|---------|
-| `shared/telemetry.go` | OpenTelemetry tracer initialization with OTLP gRPC export to Tempo |
-| `shared/logging.go` | JSON slog logger wrapped for Temporal SDK compatibility |
-| `shared/metrics.go` | Prometheus metrics handler for Temporal SDK metrics (Tally bridge) |
-| `shared/nomad.go` | OTel-instrumented Nomad API client factory |
+| File | Purpose |
+|------|---------|
+| `telemetry.go` | OpenTelemetry tracer initialization with OTLP gRPC export to Tempo |
+| `logging.go` | JSON slog logger wrapped for Temporal SDK compatibility |
+| `metrics.go` | Prometheus metrics handler for Temporal SDK metrics (Tally bridge) |
+| `nomad.go` | OTel-instrumented Nomad API client factory |
 
 All workers use `StartClientSpan` with `PeerServiceAttr` to produce service graph edges in Tempo/Grafana for every external call (Nomad, Consul, PostgreSQL, S3, Trivy server).
 
@@ -88,6 +93,49 @@ A single trigger binary (`cmd/trigger/`) handles all three workflows. It connect
 | `backup` | `Backup` | `backup-task-queue` | `LOCAL_RETENTION_DAYS`, `S3_RETENTION_DAYS` |
 | `trivy` | `Scan` | `trivy-task-queue` | -- |
 | `cleanup` | `Cleanup` | `cleanup-task-queue` | `DRY_RUN`, `GRACE_DAYS`, `DOCKER_PRUNE`, `CLEANUP_DATA_DIR` |
+
+## Retry and Error Handling
+
+### Activity Timeouts
+
+Each activity has both a `StartToCloseTimeout` (max time for a single attempt) and a `ScheduleToCloseTimeout` (max total time including all retries). Quick operations (Nomad/Consul snapshots, DB saves) use 5/15 minute timeouts. Long operations (PostgreSQL dumps, image scanning) use 30/60 minute timeouts.
+
+### Retry Policy
+
+All activities share a common retry policy with exponential backoff:
+
+| Parameter | Value |
+|-----------|-------|
+| Initial interval | 1 second |
+| Backoff coefficient | 2.0 |
+| Maximum interval | 1 minute |
+| Maximum attempts | 3 |
+
+### Error Classification (Trivy Scan)
+
+Trivy scan activities distinguish between transient and permanent failures:
+
+| Error Type | Examples | Behavior |
+|------------|----------|----------|
+| Transient | Connection refused, timeout, connection reset | Returns error; Temporal retries automatically |
+| Permanent | Image not found, manifest unknown | Returns `NonRetryableApplicationError`; Temporal stops immediately |
+| Parse failure | Invalid trivy JSON output | Returns `NonRetryableApplicationError` |
+
+### Backup Failure Behavior
+
+| Step | On Failure |
+|------|-----------|
+| Nomad/Consul/PostgreSQL snapshot | Workflow terminates with error |
+| S3 upload | Warning logged, workflow continues |
+| S3 quota exceeded | Oldest backup evicted, upload retried (up to 3 evictions) |
+| Local/S3 cleanup | Warning logged, workflow continues |
+
+### Cleanup Safety Features
+
+- Dry-run mode (default: enabled) reports what would be deleted without removing anything
+- Grace period (default: 7 days) prevents deletion of recently-used directories
+- System directories (`alloc`, `plugins`, `tmp`, `server`, `client`) are always excluded
+- Node failures are tracked; the workflow reports which nodes failed
 
 ## Configuration
 
@@ -146,9 +194,17 @@ All workers initialize OpenTelemetry with OTLP gRPC export. The Temporal SDK tra
 - `trivy-scan-worker` -> nomad, trivy-server, postgres (via otelsql)
 - `cleanup-worker` -> nomad
 
+The trigger binary also initializes tracing, producing a root span that connects to the workflow execution trace.
+
 ### Metrics
 
-Temporal SDK metrics are exposed via Prometheus on `:9090/metrics`. Includes workflow/activity latency histograms, retry counts, task queue depth, and failure rates.
+Temporal SDK metrics are exposed via Prometheus on `:9090/metrics`. Key metrics include:
+
+| Metric prefix | Description |
+|---------------|-------------|
+| `temporal_workflow_*` | Workflow execution counts, latency, failures |
+| `temporal_activity_*` | Activity execution counts, latency, retries |
+| `temporal_task_queue_*` | Task queue depth and poll latency |
 
 ### Logging
 
@@ -158,39 +214,51 @@ JSON structured logs via `log/slog` to stdout. The Temporal SDK logger is wrappe
 
 ```bash
 # Build all packages
-go build ./...
+make build
 
-# Run tests for a specific domain
-go test ./trivyscan/... ./shared/...
-go test ./backup/... ./shared/...
-go test ./nodecleanup/... ./shared/...
+# Run all tests with race detector
+make test
 
-# Lint
-go vet ./...
+# Static analysis
+make vet
+
+# Lint (golangci-lint)
+make lint
+
+# Vulnerability scan
+make govulncheck
+
+# Build and push all images
+make push-all
+
+# Build and push a specific domain
+make push-backup
+make push-trivy
+make push-cleanup
 ```
 
-Each domain has its own `Makefile` for container builds:
+Each domain also has its own `Makefile` in its subdirectory for independent builds:
 
 ```bash
-cd trivyscan && make push      # build and push trivy-scan-worker image
-cd backup && make push         # build and push backup-worker image
-cd nodecleanup && make push    # build and push cleanup-worker image
+cd backup && make help
+cd trivyscan && make help
+cd nodecleanup && make help
 ```
 
 ## Deployment
 
 Each domain is deployed as a separate Nomad service job. Trigger jobs are Nomad periodic batch jobs that invoke the shared trigger binary.
 
-Nomad job files are in `nomad/jobs/temporal-workflows/`:
+### Nomad Jobs
 
-| Job File | Type | Description |
-|----------|------|-------------|
-| `backup-worker/backup-worker.nomad.hcl` | service | Backup workflow worker |
-| `trivy-scan-worker/trivy-scan-worker.nomad.hcl` | service | Trivy scan workflow worker |
-| `cleanup-worker/cleanup-worker.nomad.hcl` | service | Node cleanup workflow worker |
-| `temporal-backup-trigger.nomad.hcl` | periodic batch | Triggers backup at 2 AM |
-| `temporal-trivy-trigger.nomad.hcl` | periodic batch | Triggers trivy scan at 3 AM |
-| `temporal-cleanup-trigger.nomad.hcl` | periodic batch | Triggers cleanup at 5 AM |
+| Job | Type | Image | Task Queue |
+|-----|------|-------|------------|
+| `backup-worker` | service | `backup-worker` | `backup-task-queue` |
+| `trivy-scan-worker` | service | `trivy-scan-worker` | `trivy-task-queue` |
+| `cleanup-worker` | service | `cleanup-worker` | `cleanup-task-queue` |
+| `temporal-backup-trigger` | periodic batch | `backup-worker` | -- |
+| `temporal-trivy-trigger` | periodic batch | `backup-worker` | -- |
+| `temporal-cleanup-trigger` | periodic batch | `backup-worker` | -- |
 
 ### Manual Triggering
 
@@ -213,46 +281,57 @@ temporal workflow start --task-queue cleanup-task-queue --type Cleanup \
 ## Project Structure
 
 ```
-temporal-workers/
-  go.mod                           Module definition (munchbox/temporal-workers)
-  go.sum                           Dependency lock file
-  README.md                        This file
+nomad-temporal-jobs/
+  .github/workflows/
+    ci.yml                           CI: lint, test, vet, govulncheck, version check
+  .gitignore                         Ignores coverage output and dist artifacts
+  .golangci.yml                      Linter configuration (gocritic, misspell)
+  .version                           Root version tag
+  LICENSE                            MIT
+  Makefile                           Root: build, test, lint, push-all targets
+  README.md                          This file
+  go.mod                             Module definition
+  go.sum                             Dependency lock file
   shared/
-    telemetry.go                   OTel tracer init, span helpers, peer.service attributes
-    logging.go                     JSON slog logger with Temporal SDK adapter
-    metrics.go                     Prometheus metrics handler via Tally bridge
-    nomad.go                       OTel-instrumented Nomad API client factory
+    telemetry.go                     OTel tracer init, span helpers, peer.service attributes
+    logging.go                       JSON slog logger with Temporal SDK adapter
+    metrics.go                       Prometheus metrics handler via Tally bridge
+    nomad.go                         OTel-instrumented Nomad API client factory
   cmd/
     trigger/
-      main.go                     Workflow dispatcher (backup, trivy, cleanup)
+      main.go                       Workflow dispatcher (backup, trivy, cleanup)
   backup/
-    .version                       Image version tag
-    Dockerfile                     Multi-stage build (Debian, Nomad/Consul/PG18 CLI)
-    Makefile                       Build and push targets
+    .version                         Image version tag
+    Dockerfile                       Multi-stage build (Debian, Nomad/Consul/PG18 CLI)
+    Makefile                         Build and push targets
     activities/
-      activities.go                Activity struct: snapshots, S3 upload, retention cleanup
+      activities.go                  Activity struct: snapshots, S3 upload, retention cleanup
     workflows/
-      backup.go                    Sequential snapshot orchestration with S3 upload
+      backup.go                      Sequential snapshot orchestration with S3 upload
     worker/
-      main.go                     Worker entry point (tracing, slog, metrics, Temporal client)
+      main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   trivyscan/
-    .version                       Image version tag
-    Dockerfile                     Multi-stage build (Alpine, Trivy CLI)
-    Makefile                       Build and push targets
+    .version                         Image version tag
+    Dockerfile                       Multi-stage build (Alpine, Trivy CLI)
+    Makefile                         Build and push targets
     activities/
-      activities.go                Activity struct: Nomad image discovery, Trivy scan, DB save
+      activities.go                  Activity struct: Nomad image discovery, Trivy scan, DB save
     workflows/
-      scan.go                      Parallel batch scanning with per-image error handling
+      scan.go                        Parallel batch scanning with per-image error handling
     worker/
-      main.go                     Worker entry point (tracing, slog, metrics, Temporal client)
+      main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   nodecleanup/
-    .version                       Image version tag
-    Dockerfile                     Multi-stage build (Alpine, SSH only)
-    Makefile                       Build and push targets
+    .version                         Image version tag
+    Dockerfile                       Multi-stage build (Alpine, SSH only)
+    Makefile                         Build and push targets
     activities/
-      activities.go                Activity struct: node discovery, SSH cleanup, script generation
+      activities.go                  Activity struct: node discovery, SSH cleanup, script gen
     workflows/
-      cleanup.go                   Sequential per-node cleanup with failure tracking
+      cleanup.go                     Sequential per-node cleanup with failure tracking
     worker/
-      main.go                     Worker entry point (tracing, slog, metrics, Temporal client)
+      main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
 ```
+
+## License
+
+MIT
