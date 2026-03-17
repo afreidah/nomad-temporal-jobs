@@ -13,7 +13,6 @@
 package workflows
 
 import (
-	"fmt"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -145,9 +144,4 @@ func Backup(ctx workflow.Context, retention activities.RetentionConfig) (*activi
 		"registry", result.RegistryBackup)
 
 	return result, nil
-}
-
-// formatErr builds a prefixed error message for the BackupResult.Error field.
-func formatErr(prefix string, err error) string {
-	return fmt.Sprintf("%s: %s", prefix, err.Error())
 }

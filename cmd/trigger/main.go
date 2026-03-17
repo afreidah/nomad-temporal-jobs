@@ -36,7 +36,7 @@ func main() {
 
 	// --- Tracing ---
 	shutdownTracer := shared.InitTracer(ctx, "temporal-trigger-"+workflowName)
-	defer shutdownTracer(ctx)
+	defer func() { _ = shutdownTracer(ctx) }()
 
 	// --- Temporal client ---
 	temporalAddr := envOrDefault("TEMPORAL_ADDRESS", "localhost:7233")

@@ -41,5 +41,12 @@ push-cleanup: ## Build and push cleanup-worker image
 
 push-all: push-backup push-trivy push-cleanup ## Build and push all images
 
-.PHONY: help build test vet lint govulncheck push-backup push-trivy push-cleanup push-all
+changelog: ## Generate CHANGELOG.md from git history
+	git cliff -o CHANGELOG.md
+
+release: ## Tag and push to trigger a GitHub Release
+	git tag $$(cat .version)
+	git push origin $$(cat .version)
+
+.PHONY: help build test vet lint govulncheck push-backup push-trivy push-cleanup push-all changelog release
 .DEFAULT_GOAL := help

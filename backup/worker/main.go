@@ -32,7 +32,7 @@ func main() {
 
 	// --- Tracing ---
 	shutdownTracer := shared.InitTracer(ctx, "backup-worker")
-	defer shutdownTracer(ctx)
+	defer func() { _ = shutdownTracer(ctx) }()
 
 	// --- Structured logging ---
 	temporalLogger, slogger := shared.NewLogger("backup-worker")
