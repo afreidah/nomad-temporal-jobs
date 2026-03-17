@@ -154,7 +154,7 @@ func (a *Activities) GetRunningImages(ctx context.Context) ([]string, error) {
 	logger.Info("Discovering running images from Nomad")
 
 	// --- Client span for nomad edge in service graph ---
-	ctx, span := shared.StartClientSpan(ctx, "nomad.get_running_images",
+	_, span := shared.StartClientSpan(ctx, "nomad.get_running_images",
 		shared.PeerServiceAttr("nomad"),
 	)
 	defer span.End()

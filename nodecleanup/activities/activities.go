@@ -113,7 +113,7 @@ func (a *Activities) GetAllNomadClientNodes(ctx context.Context) ([]NodeInfo, er
 	logger := activity.GetLogger(ctx)
 	logger.Info("Retrieving all Nomad client nodes")
 
-	ctx, span := shared.StartClientSpan(ctx, "nomad.list_nodes",
+	_, span := shared.StartClientSpan(ctx, "nomad.list_nodes",
 		shared.PeerServiceAttr("nomad"),
 	)
 	defer span.End()
@@ -439,13 +439,13 @@ func parseCleanupOutput(result *CleanupResult, output string) {
 		for _, part := range strings.Fields(line) {
 			switch {
 			case strings.HasPrefix(part, "scanned="):
-				fmt.Sscanf(part, "scanned=%d", &result.Scanned)
+				_, _ = fmt.Sscanf(part, "scanned=%d", &result.Scanned)
 			case strings.HasPrefix(part, "orphaned="):
-				fmt.Sscanf(part, "orphaned=%d", &result.Orphaned)
+				_, _ = fmt.Sscanf(part, "orphaned=%d", &result.Orphaned)
 			case strings.HasPrefix(part, "deleted="):
-				fmt.Sscanf(part, "deleted=%d", &result.Deleted)
+				_, _ = fmt.Sscanf(part, "deleted=%d", &result.Deleted)
 			case strings.HasPrefix(part, "skipped="):
-				fmt.Sscanf(part, "skipped=%d", &result.Skipped)
+				_, _ = fmt.Sscanf(part, "skipped=%d", &result.Skipped)
 			case strings.HasPrefix(part, "docker_freed="):
 				result.DockerSpaceFreed = strings.TrimPrefix(part, "docker_freed=")
 			}

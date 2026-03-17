@@ -1,0 +1,21 @@
+# -------------------------------------------------------------------------------
+# Dependabot Configuration
+#
+# Author: Alex Freidah
+#
+# Automated dependency updates for Go modules and GitHub Actions. Checks for
+# new versions weekly.
+# -------------------------------------------------------------------------------
+
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
