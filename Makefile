@@ -88,10 +88,12 @@ web-build: web-godoc ## Build the project website
 web-docker: ## Build website Docker image for local architecture
 	docker build --pull -f web/Dockerfile -t $(WEB_IMAGE):$(WEB_TAG) .
 
-web-push: ## Build and push multi-arch website image to registry
-	@docker buildx inspect tw-web-builder >/dev/null 2>&1 || \
-		docker buildx create --name tw-web-builder --driver-opt network=host --use
+builder: ## Ensure the Buildx builder exists
+	@docker buildx inspect munchbox-builder >/dev/null 2>&1 || \
+		docker buildx create --name munchbox-builder --driver-opt network=host --use
 	@docker buildx inspect --bootstrap
+
+web-push: builder ## Build and push multi-arch website image to registry
 	docker buildx build \
 	  --pull \
 	  --platform $(PLATFORMS) \
@@ -100,5 +102,5 @@ web-push: ## Build and push multi-arch website image to registry
 	  --output type=image,push=true \
 	  .
 
-.PHONY: help build test vet lint govulncheck push-backup push-trivy push-cleanup push-all changelog release web-tools web-godoc web-serve web-build web-docker web-push
+.PHONY: help builder build test vet lint govulncheck push-backup push-trivy push-cleanup push-all changelog release web-tools web-godoc web-serve web-build web-docker web-push
 .DEFAULT_GOAL := help
