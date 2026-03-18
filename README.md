@@ -7,25 +7,33 @@
 [![CI](https://github.com/afreidah/nomad-temporal-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/afreidah/nomad-temporal-jobs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+<p align="center">
+  <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
+</p>
+
 Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup) runs as an independent worker with its own container image, task queue, and Nomad service job. A shared trigger binary dispatches workflows on schedule.
 
 ```
-  Nomad periodic triggers              Temporal Server
-  (temporal-*-trigger)                 (temporal-server.service.consul:7233)
-        |                                     |
-        | ExecuteWorkflow                     | Task Queue dispatch
-        v                                     v
-  +--------------+     +-----------------------+     +------------------+
-  | workflow-    |     | backup-worker         |     | trivy-scan-      |
-  | trigger      |---->| backup-task-queue     |     | worker           |
-  | (all three) |     +-----------------------+     | trivy-task-queue |
-  +--------------+     | cleanup-worker        |     +------------------+
-                       | cleanup-task-queue    |
-                       +-----------------------+
-                              |
-                              | SSH
-                              v
-                       Nomad client nodes
+  Nomad periodic jobs           Temporal Server
+  (temporal-*-trigger)          (temporal-server.service.consul:7233)
+         |                               |
+         | ExecuteWorkflow               | Task Queue dispatch
+         v                               v
+  +----------------+          +------------------------+
+  | workflow-      |          | backup-worker          |
+  | trigger        |--------->| backup-task-queue      |
+  | (selects one)  |    |     +------------------------+
+  +----------------+    |     | trivy-scan-worker      |
+                        +---->| trivy-task-queue       |
+                        |     +------------------------+
+                        |     | cleanup-worker         |
+                        +---->| cleanup-task-queue     |
+                              +------------------------+
+                                        |
+                                        v
+                              Nomad, Consul, S3,
+                              PostgreSQL, Trivy,
+                              SSH (client nodes)
 ```
 
 Each worker is a long-running Temporal worker process that polls its dedicated task queue. Workflows are pure orchestration; all I/O happens in activities. Activities are registered as struct methods, sharing pooled connections (DB, S3) across invocations.

@@ -1,0 +1,33 @@
+# -------------------------------------------------------------------------------
+# GoReleaser Configuration - Release Automation
+#
+# Project: Munchbox / Author: Alex Freidah
+#
+# Creates GitHub Releases on version tag pushes (v*). No binaries or packages
+# are built — each worker domain has its own container image built separately.
+# -------------------------------------------------------------------------------
+
+version: 2
+
+builds:
+  - skip: true
+
+checksum:
+  disable: true
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))?\!?:.+$'
+      order: 0
+    - title: Bug Fixes
+      regexp: '^.*?fix(\(.+\))?\!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
+
+release:
+  github:
+    owner: afreidah
+    name: nomad-temporal-jobs
