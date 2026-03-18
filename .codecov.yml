@@ -1,0 +1,24 @@
+# -------------------------------------------------------------------------------
+# Codecov Configuration
+#
+# Author: Alex Freidah
+#
+# Configures PR status checks and excludes process entry points, metric
+# definitions, and telemetry wiring from coverage reports.
+# -------------------------------------------------------------------------------
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto         # compare against base commit coverage
+        threshold: 1%        # allow 1% drop without failing
+    patch:
+      default:
+        target: 80%          # new/changed lines should be 80% covered
+
+ignore:
+  - "cmd/"                 # process entry points, not unit-testable
+  - "shared/telemetry.go"  # OTel wiring, not unit-testable
+  - "shared/metrics.go"    # Prometheus/Tally bridge, not unit-testable
+  - "*/worker/"            # worker entry points, not unit-testable
