@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.1
 	github.com/hashicorp/nomad/api v0.0.0-20260316193234-fe53ba32ff2b
-	github.com/lib/pq v1.11.2
+	github.com/lib/pq v1.12.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	github.com/uber-go/tally/v4 v4.1.17
