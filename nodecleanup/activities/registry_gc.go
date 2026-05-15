@@ -1,15 +1,24 @@
 // -------------------------------------------------------------------------------
-// Registry Garbage-Collect Activity - Docker Registry Blob Cleanup
+// Registry Garbage-Collect Activities - Saga-Style Decomposition
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// Runs `registry garbage-collect` against the storage volume of the cluster's
-// container registry. Uses the Nomad API to scale the registry job to 0 for
-// the duration of the GC run (the registry must be quiesced or concurrent
-// pushes can drop blob references and corrupt storage), then scales back to 1.
+// The registry GC workflow is decomposed into six small focused activities so
+// Temporal can apply per-step retry policies, surface each step in the
+// workflow history, and (crucially) so the workflow can use a saga-style
+// `defer` with `workflow.NewDisconnectedContext` to guarantee the
+// scale-back-to-1 compensation runs even if GC fails or the workflow is
+// cancelled mid-flight.
 //
-// The GC itself runs as a one-shot docker container against the same bind
-// mount as the live registry, so no copy of the data is ever made.
+//   1. FindRegistryNode             - locate the node hosting the registry alloc
+//   2. MeasureRegistryDataDir       - du -sb over SSH; before/after sizes
+//   3. ScaleRegistry                - POST /v1/job/{name}/scale (idempotent)
+//   4. WaitRegistryAllocsDrained    - poll until 0 running allocs
+//   5. WaitRegistryAllocRunning     - poll until >=1 running alloc
+//   6. RunRegistryGarbageCollect    - long-running; ssh + docker run
+//
+// Activities 3-5 talk to the Nomad API directly via the shared Nomad client
+// (no SSH). Activities 2 and 6 SSH to the registry host.
 // -------------------------------------------------------------------------------
 
 package activities
@@ -18,12 +27,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"munchbox/temporal-workers/shared"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/temporal"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -35,6 +46,9 @@ import (
 type RegistryGCConfig struct {
 	// JobName identifies the registry's Nomad job. Defaults to "registry".
 	JobName string `json:"job_name"`
+	// GroupName is the task group inside the job to scale. Defaults to the
+	// JobName (matches the convention used by the munchbox-service pack).
+	GroupName string `json:"group_name"`
 	// RegistryDataDir is the host path bind-mounted into the registry
 	// container as /var/lib/registry. Defaults to
 	// "/mnt/gdrive/munchbox-data/registry".
@@ -43,15 +57,35 @@ type RegistryGCConfig struct {
 	// Should match the running registry's image. Defaults to "registry:3".
 	RegistryImage string `json:"registry_image"`
 	// DryRun runs garbage-collect with --dry-run, logging blobs that
-	// would be deleted without actually freeing space. Default false.
+	// would be deleted without actually freeing space.
 	DryRun bool `json:"dry_run"`
-	// DeleteUntagged tells GC to also remove manifests that aren't
-	// referenced by any tag (and their blobs). Default true — without
-	// it, image-pushed-then-retagged accumulates as "untagged" forever.
+	// DeleteUntagged tells GC to also remove manifests not referenced by
+	// any tag (and the blobs they reference). Default true — without it
+	// every tag overwrite (e.g. CI re-pushing :latest) leaves an
+	// orphaned manifest forever.
 	DeleteUntagged bool `json:"delete_untagged"`
 }
 
-// RegistryGCResult holds the outcome of a single registry GC activity run.
+// ApplyDefaults fills in unset fields with their defaults. Called by the
+// workflow before any activities run so every activity sees a fully
+// populated config and the values are deterministic across replay.
+func (c *RegistryGCConfig) ApplyDefaults() {
+	if c.JobName == "" {
+		c.JobName = "registry"
+	}
+	if c.GroupName == "" {
+		c.GroupName = c.JobName
+	}
+	if c.RegistryDataDir == "" {
+		c.RegistryDataDir = "/mnt/gdrive/munchbox-data/registry"
+	}
+	if c.RegistryImage == "" {
+		c.RegistryImage = "registry:3"
+	}
+}
+
+// RegistryGCResult holds the workflow-level outcome reported back to the
+// trigger / caller.
 type RegistryGCResult struct {
 	NodeName       string `json:"node_name"`
 	NodeAddr       string `json:"node_addr"`
@@ -60,106 +94,33 @@ type RegistryGCResult struct {
 	BeforeBytes    string `json:"before_bytes"`
 	AfterBytes     string `json:"after_bytes"`
 	DryRun         bool   `json:"dry_run"`
-	Output         string `json:"output"`
+}
+
+// RegistryGCRunResult is the small struct returned by
+// RunRegistryGarbageCollect. The workflow folds it into RegistryGCResult.
+type RegistryGCRunResult struct {
+	BlobsDeleted int    `json:"blobs_deleted"`
+	Output       string `json:"output"`
 }
 
 // -------------------------------------------------------------------------
-// ACTIVITIES
+// ACTIVITY 1: FIND REGISTRY NODE
 // -------------------------------------------------------------------------
 
-// RegistryGarbageCollect locates the node currently running the registry
-// alloc, scales the job to 0 to quiesce writes, runs the GC sequence
-// against the bind-mounted storage, then scales the job back to 1. Returns
-// before/after sizes and the parsed blob/byte counters from the GC tool.
-func (a *Activities) RegistryGarbageCollect(ctx context.Context, config RegistryGCConfig) (RegistryGCResult, error) {
+// FindRegistryNode queries the Nomad API for the running alloc of the
+// registry job and returns the NodeInfo for SSH dialing. Wraps a
+// "no running alloc" condition as a non-retryable error so the workflow
+// fails fast instead of retry-storming on a terminally-misconfigured
+// cluster.
+func (a *Activities) FindRegistryNode(ctx context.Context, jobName string) (NodeInfo, error) {
 	logger := activity.GetLogger(ctx)
+	logger.Info("Finding registry node", "job", jobName)
 
-	// Defaults
-	if config.JobName == "" {
-		config.JobName = "registry"
-	}
-	if config.RegistryDataDir == "" {
-		config.RegistryDataDir = "/mnt/gdrive/munchbox-data/registry"
-	}
-	if config.RegistryImage == "" {
-		config.RegistryImage = "registry:3"
-	}
-
-	_, span := shared.StartClientSpan(ctx, "registry.garbage_collect",
-		shared.PeerServiceAttr("registry"),
+	_, span := shared.StartClientSpan(ctx, "nomad.find_registry_node",
+		shared.PeerServiceAttr("nomad"),
 	)
 	defer span.End()
 
-	// --- Find the node hosting the registry alloc ---
-	node, err := a.findRegistryNode(ctx, config.JobName)
-	if err != nil {
-		return RegistryGCResult{}, fmt.Errorf("locate registry node: %w", err)
-	}
-	logger.Info("Found registry node", "node", node.Name, "address", node.Address, "job", config.JobName)
-
-	result := RegistryGCResult{
-		NodeName: node.Name,
-		NodeAddr: node.Address,
-		DryRun:   config.DryRun,
-	}
-
-	// --- SSH in and run the GC sequence ---
-	sshConfig, err := a.buildSSHConfig(node)
-	if err != nil {
-		return result, fmt.Errorf("build SSH config: %w", err)
-	}
-
-	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:22", node.Address), sshConfig)
-	if err != nil {
-		return result, fmt.Errorf("SSH connect to %s: %w", node.Name, err)
-	}
-	defer client.Close()
-
-	sudoPrefix := ""
-	if node.IsOracle {
-		sudoPrefix = "sudo "
-	}
-
-	script := buildRegistryGCScript(config, node.HTTPAddr, os.Getenv("NOMAD_TOKEN"), sudoPrefix)
-
-	session, err := client.NewSession()
-	if err != nil {
-		return result, fmt.Errorf("SSH session: %w", err)
-	}
-	defer session.Close()
-
-	var stdout, stderr bytes.Buffer
-	session.Stdout = &stdout
-	session.Stderr = &stderr
-
-	logger.Info("Executing registry-gc script", "node", node.Name, "dry_run", config.DryRun)
-	if err := session.Run(script); err != nil {
-		result.Output = stdout.String() + "\n--- stderr ---\n" + stderr.String()
-		return result, fmt.Errorf("registry-gc script failed: %w", err)
-	}
-
-	result.Output = stdout.String()
-	parseRegistryGCOutput(&result, stdout.String())
-
-	logger.Info("Registry GC complete",
-		"node", node.Name,
-		"blobs_deleted", result.BlobsDeleted,
-		"bytes_reclaimed", result.BytesReclaimed,
-		"before", result.BeforeBytes,
-		"after", result.AfterBytes,
-		"dry_run", config.DryRun)
-
-	return result, nil
-}
-
-// -------------------------------------------------------------------------
-// HELPERS
-// -------------------------------------------------------------------------
-
-// findRegistryNode queries the Nomad API for the running alloc of the
-// registry job and returns the NodeInfo for SSH dialing. Errors if the job
-// has no running alloc.
-func (a *Activities) findRegistryNode(ctx context.Context, jobName string) (NodeInfo, error) {
 	client, err := shared.NewNomadClient()
 	if err != nil {
 		return NodeInfo{}, fmt.Errorf("create Nomad client: %w", err)
@@ -194,15 +155,169 @@ func (a *Activities) findRegistryNode(ctx context.Context, jobName string) (Node
 		}, nil
 	}
 
-	return NodeInfo{}, fmt.Errorf("no running alloc for job %q", jobName)
+	return NodeInfo{}, temporal.NewNonRetryableApplicationError(
+		fmt.Sprintf("no running alloc for job %q", jobName),
+		"NoRunningAlloc",
+		nil,
+	)
 }
 
-// buildRegistryGCScript renders the bash script that runs on the registry
-// host. Sequence: capture pre-size, scale job to 0, wait for allocs to
-// terminate, run the registry GC docker container, scale job back to 1,
-// capture post-size. The before/after sizes use `du -sh` against the bind
-// mount.
-func buildRegistryGCScript(config RegistryGCConfig, httpAddr, token, sudoPrefix string) string {
+// -------------------------------------------------------------------------
+// ACTIVITY 2: MEASURE REGISTRY DATA DIR
+// -------------------------------------------------------------------------
+
+// MeasureRegistryDataDir returns the size in bytes of the registry's
+// bind-mounted storage directory on the given node. Used for before/after
+// reporting. SSH-only because /mnt/gdrive is host-side; the Nomad API
+// doesn't expose disk usage.
+func (a *Activities) MeasureRegistryDataDir(ctx context.Context, node NodeInfo, dataDir string) (int64, error) {
+	logger := activity.GetLogger(ctx)
+	logger.Info("Measuring registry data dir", "node", node.Name, "path", dataDir)
+
+	sudoPrefix := ""
+	if node.IsOracle {
+		sudoPrefix = "sudo "
+	}
+	out, err := a.runSSHCommand(node, fmt.Sprintf("%sdu -sb %s | cut -f1", sudoPrefix, shellQuote(dataDir)))
+	if err != nil {
+		return 0, fmt.Errorf("du on %s: %w", node.Name, err)
+	}
+	n, parseErr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if parseErr != nil {
+		return 0, fmt.Errorf("parse du output %q: %w", out, parseErr)
+	}
+	return n, nil
+}
+
+// -------------------------------------------------------------------------
+// ACTIVITY 3: SCALE REGISTRY
+// -------------------------------------------------------------------------
+
+// ScaleRegistry scales the named Nomad job's task group to the target
+// count. Idempotent — Nomad accepts the call when the job is already at
+// the requested count and returns success. Used both to scale down to 0
+// before GC and to scale back to 1 in the deferred compensation. A
+// "job not found" error is wrapped as non-retryable; transient API errors
+// surface plain so Temporal retries per the activity's RetryPolicy.
+func (a *Activities) ScaleRegistry(ctx context.Context, jobName, groupName string, count int) error {
+	logger := activity.GetLogger(ctx)
+	logger.Info("Scaling registry job", "job", jobName, "group", groupName, "count", count)
+
+	_, span := shared.StartClientSpan(ctx, "nomad.scale_registry",
+		shared.PeerServiceAttr("nomad"),
+	)
+	defer span.End()
+
+	client, err := shared.NewNomadClient()
+	if err != nil {
+		return fmt.Errorf("create Nomad client: %w", err)
+	}
+	c := count
+	msg := fmt.Sprintf("registry-gc workflow: scale to %d", count)
+	if _, _, err := client.Jobs().Scale(jobName, groupName, &c, msg, false, nil, nil); err != nil {
+		if strings.Contains(err.Error(), "job not found") || strings.Contains(err.Error(), "404") {
+			return temporal.NewNonRetryableApplicationError(
+				fmt.Sprintf("scale %s/%s to %d: %v", jobName, groupName, count, err),
+				"JobNotFound",
+				err,
+			)
+		}
+		return fmt.Errorf("scale %s/%s to %d: %w", jobName, groupName, count, err)
+	}
+	return nil
+}
+
+// -------------------------------------------------------------------------
+// ACTIVITY 4: WAIT FOR ALLOCS DRAINED
+// -------------------------------------------------------------------------
+
+// WaitRegistryAllocsDrained polls the Nomad API until the named job has
+// zero running allocations. Heartbeats every poll. Bounded by the
+// activity's StartToCloseTimeout (set on the workflow side); returns
+// ctx.Err() when exceeded.
+func (a *Activities) WaitRegistryAllocsDrained(ctx context.Context, jobName string) error {
+	return a.waitAllocCount(ctx, jobName, 0, 3*time.Second, "drained")
+}
+
+// -------------------------------------------------------------------------
+// ACTIVITY 5: WAIT FOR ALLOC RUNNING
+// -------------------------------------------------------------------------
+
+// WaitRegistryAllocRunning polls the Nomad API until the named job has at
+// least one running allocation (i.e. the scale-up succeeded and a new
+// alloc passed its start sequence). Bounded by the activity's
+// StartToCloseTimeout.
+func (a *Activities) WaitRegistryAllocRunning(ctx context.Context, jobName string) error {
+	return a.waitAllocCount(ctx, jobName, 1, 3*time.Second, "running")
+}
+
+// waitAllocCount is the shared poll loop for the wait activities. Target
+// 0 succeeds when running drops to 0; >=1 succeeds when running is at
+// least target.
+func (a *Activities) waitAllocCount(ctx context.Context, jobName string, target int, interval time.Duration, label string) error {
+	logger := activity.GetLogger(ctx)
+	client, err := shared.NewNomadClient()
+	if err != nil {
+		return fmt.Errorf("create Nomad client: %w", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		allocs, _, err := client.Jobs().Allocations(jobName, false, nil)
+		if err != nil {
+			logger.Warn("alloc list failed; will retry", "job", jobName, "error", err)
+		} else {
+			running := 0
+			for _, al := range allocs {
+				if al.ClientStatus == "running" {
+					running++
+				}
+			}
+			activity.RecordHeartbeat(ctx, running)
+			if (target == 0 && running == 0) || (target > 0 && running >= target) {
+				logger.Info("Wait condition met", "job", jobName, "label", label, "running", running)
+				return nil
+			}
+			logger.Info("Waiting", "job", jobName, "label", label, "running", running, "target", target)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+// -------------------------------------------------------------------------
+// ACTIVITY 6: RUN GARBAGE-COLLECT
+// -------------------------------------------------------------------------
+
+// RunRegistryGarbageCollect SSHes to the registry host and runs the
+// docker garbage-collect command against the bind-mounted storage. This
+// is the long-running step (multi-GB registries take minutes); it
+// heartbeats periodically and reports the count of "blob eligible for
+// deletion" lines emitted by the registry tool.
+//
+// Configured with MaxAttempts=1 by the workflow — a partial GC run
+// shouldn't be repeated; let the deferred scale-back put the registry
+// online instead and surface the failure.
+func (a *Activities) RunRegistryGarbageCollect(ctx context.Context, node NodeInfo, config RegistryGCConfig) (RegistryGCRunResult, error) {
+	logger := activity.GetLogger(ctx)
+	logger.Info("Running registry garbage-collect",
+		"node", node.Name, "image", config.RegistryImage,
+		"dry_run", config.DryRun, "delete_untagged", config.DeleteUntagged)
+
+	sudoPrefix := ""
+	if node.IsOracle {
+		sudoPrefix = "sudo "
+	}
+
 	dryRunFlag := ""
 	if config.DryRun {
 		dryRunFlag = "--dry-run"
@@ -212,141 +327,134 @@ func buildRegistryGCScript(config RegistryGCConfig, httpAddr, token, sudoPrefix 
 		deleteUntaggedFlag = "--delete-untagged"
 	}
 
-	return fmt.Sprintf(`#!/bin/bash
-set -euo pipefail
+	// The registry image embeds /etc/distribution/config.yml as the
+	// default config its binary reads. The garbage-collect subcommand
+	// only needs the storage rootdirectory from that config, which the
+	// embedded default points at /var/lib/registry — same path as the
+	// live container's bind mount.
+	cmd := fmt.Sprintf(
+		`%sdocker run --rm -v %s:/var/lib/registry %s garbage-collect %s %s /etc/distribution/config.yml`,
+		sudoPrefix,
+		shellQuote(config.RegistryDataDir),
+		shellQuote(config.RegistryImage),
+		dryRunFlag,
+		deleteUntaggedFlag,
+	)
 
-JOB_NAME="%s"
-DATA_DIR="%s"
-IMAGE="%s"
-NOMAD_HTTP_ADDR="%s"
-NOMAD_TOKEN="%s"
-DRY_RUN_FLAG="%s"
-DELETE_UNTAGGED_FLAG="%s"
+	out, err := a.runSSHCommandWithHeartbeat(ctx, node, cmd, 30*time.Second)
+	if err != nil {
+		return RegistryGCRunResult{Output: out}, fmt.Errorf("docker run garbage-collect on %s: %w", node.Name, err)
+	}
 
-NOMAD_CA=""
-for ca in /etc/nomad.d/tls/ca.crt /opt/nomad/tls/vault-intermediate-ca.pem; do
-  if [ -f "$ca" ]; then
-    NOMAD_CA="$ca"
-    break
-  fi
-done
-if [ -z "$NOMAD_CA" ]; then
-  echo "ERROR: Could not find Nomad CA certificate"
-  exit 1
-fi
-
-api() {
-  %scurl -sf --cacert "$NOMAD_CA" -H "X-Nomad-Token: $NOMAD_TOKEN" "$@"
+	return RegistryGCRunResult{
+		BlobsDeleted: parseBlobsDeleted(out),
+		Output:       out,
+	}, nil
 }
 
-scale_job() {
-  local count=$1
-  echo "Scaling $JOB_NAME to count=$count"
-  api -X POST "https://${NOMAD_HTTP_ADDR}/v1/job/${JOB_NAME}/scale" \
-    -d "{\"Count\": $count, \"Reason\": \"registry-gc\"}" >/dev/null
+// -------------------------------------------------------------------------
+// SSH HELPERS (private; used only by the saga activities)
+// -------------------------------------------------------------------------
+
+// runSSHCommand opens an SSH session to the node, runs cmd, and returns
+// stdout. Used by short measurement commands.
+func (a *Activities) runSSHCommand(node NodeInfo, cmd string) (string, error) {
+	cfg, err := a.buildSSHConfig(node)
+	if err != nil {
+		return "", err
+	}
+	cli, err := ssh.Dial("tcp", node.Address+":22", cfg)
+	if err != nil {
+		return "", fmt.Errorf("ssh dial %s: %w", node.Name, err)
+	}
+	defer cli.Close()
+
+	session, err := cli.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("ssh session: %w", err)
+	}
+	defer session.Close()
+
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+	if err := session.Run(cmd); err != nil {
+		return stdout.String(), fmt.Errorf("ssh run %q: %w (stderr: %s)", cmd, err, stderr.String())
+	}
+	return stdout.String(), nil
 }
 
-wait_for_no_running_allocs() {
-  local deadline=$(( $(date +%%s) + 180 ))
-  while [ $(date +%%s) -lt $deadline ]; do
-    local count
-    count=$(api "https://${NOMAD_HTTP_ADDR}/v1/job/${JOB_NAME}/allocations" \
-      | jq '[.[] | select(.ClientStatus == "running")] | length' 2>/dev/null || echo "?")
-    if [ "$count" = "0" ]; then
-      return 0
-    fi
-    echo "Waiting for $JOB_NAME allocs to drain (running=$count)..."
-    sleep 3
-  done
-  echo "ERROR: timed out waiting for $JOB_NAME allocs to drain"
-  return 1
-}
+// runSSHCommandWithHeartbeat runs an SSH command that may take a long
+// time (registry GC) and emits an activity.RecordHeartbeat every
+// `interval` so the activity's HeartbeatTimeout can detect stalls.
+// Returns combined stdout+stderr captured up to that point.
+func (a *Activities) runSSHCommandWithHeartbeat(ctx context.Context, node NodeInfo, cmd string, interval time.Duration) (string, error) {
+	cfg, err := a.buildSSHConfig(node)
+	if err != nil {
+		return "", err
+	}
+	cli, err := ssh.Dial("tcp", node.Address+":22", cfg)
+	if err != nil {
+		return "", fmt.Errorf("ssh dial %s: %w", node.Name, err)
+	}
+	defer cli.Close()
 
-wait_for_running_alloc() {
-  local deadline=$(( $(date +%%s) + 300 ))
-  while [ $(date +%%s) -lt $deadline ]; do
-    local count
-    count=$(api "https://${NOMAD_HTTP_ADDR}/v1/job/${JOB_NAME}/allocations" \
-      | jq '[.[] | select(.ClientStatus == "running")] | length' 2>/dev/null || echo "?")
-    if [ "$count" = "1" ]; then
-      return 0
-    fi
-    echo "Waiting for $JOB_NAME alloc to come back (running=$count)..."
-    sleep 3
-  done
-  echo "ERROR: timed out waiting for $JOB_NAME alloc to come back"
-  return 1
-}
+	session, err := cli.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("ssh session: %w", err)
+	}
+	defer session.Close()
 
-before_bytes=$(%sdu -sb "$DATA_DIR" | cut -f1)
-echo "BEFORE_BYTES=$before_bytes"
-echo "BEFORE_HUMAN=$(%sdu -sh "$DATA_DIR" | cut -f1)"
+	var combined bytes.Buffer
+	session.Stdout = &combined
+	session.Stderr = &combined
 
-scale_job 0
-wait_for_no_running_allocs
+	if err := session.Start(cmd); err != nil {
+		return "", fmt.Errorf("ssh start %q: %w", cmd, err)
+	}
 
-# The registry image embeds /etc/distribution/config.yml as the default
-# config the binary reads. The garbage-collect subcommand only needs the
-# storage rootdirectory from that config, which the embedded default points
-# at /var/lib/registry — same path as the live container's bind mount.
-echo "=== Running registry garbage-collect ==="
-%sdocker run --rm \
-  -v "$DATA_DIR:/var/lib/registry" \
-  "$IMAGE" \
-  garbage-collect $DRY_RUN_FLAG $DELETE_UNTAGGED_FLAG /etc/distribution/config.yml 2>&1 | tee /tmp/registry-gc.out
-echo "=== End of registry garbage-collect output ==="
+	done := make(chan error, 1)
+	go func() { done <- session.Wait() }()
 
-scale_job 1
-wait_for_running_alloc
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-after_bytes=$(%sdu -sb "$DATA_DIR" | cut -f1)
-echo "AFTER_BYTES=$after_bytes"
-echo "AFTER_HUMAN=$(%sdu -sh "$DATA_DIR" | cut -f1)"
-
-# Parse blobs deleted from the GC output. Format:
-#   "blob eligible for deletion: sha256:..." per blob
-blobs_deleted=$(grep -c "^blob eligible for deletion:" /tmp/registry-gc.out 2>/dev/null || echo 0)
-echo "BLOBS_DELETED=$blobs_deleted"
-
-reclaimed=$(( before_bytes - after_bytes ))
-echo "RECLAIMED_BYTES=$reclaimed"
-echo "RESULT: blobs_deleted=$blobs_deleted reclaimed_bytes=$reclaimed before_bytes=$before_bytes after_bytes=$after_bytes"
-`, config.JobName, config.RegistryDataDir, config.RegistryImage, httpAddr, token,
-		dryRunFlag, deleteUntaggedFlag,
-		sudoPrefix, sudoPrefix, sudoPrefix, sudoPrefix, sudoPrefix, sudoPrefix)
-}
-
-// parseRegistryGCOutput pulls the structured RESULT line and BEFORE/AFTER
-// human-readable sizes out of the script's stdout and populates the result
-// struct.
-func parseRegistryGCOutput(result *RegistryGCResult, output string) {
-	for _, line := range strings.Split(output, "\n") {
-		switch {
-		case strings.HasPrefix(line, "BEFORE_HUMAN="):
-			result.BeforeBytes = strings.TrimPrefix(line, "BEFORE_HUMAN=")
-		case strings.HasPrefix(line, "AFTER_HUMAN="):
-			result.AfterBytes = strings.TrimPrefix(line, "AFTER_HUMAN=")
-		case strings.HasPrefix(line, "RESULT:"):
-			for _, part := range strings.Fields(line) {
-				switch {
-				case strings.HasPrefix(part, "blobs_deleted="):
-					_, _ = fmt.Sscanf(part, "blobs_deleted=%d", &result.BlobsDeleted)
-				case strings.HasPrefix(part, "reclaimed_bytes="):
-					var n int64
-					if _, err := fmt.Sscanf(part, "reclaimed_bytes=%d", &n); err == nil {
-						result.BytesReclaimed = humanBytes(n)
-					}
-				}
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return combined.String(), fmt.Errorf("ssh run %q: %w (output: %s)", cmd, err, combined.String())
 			}
+			return combined.String(), nil
+		case <-ticker.C:
+			activity.RecordHeartbeat(ctx, combined.Len())
+		case <-ctx.Done():
+			_ = session.Signal(ssh.SIGTERM)
+			return combined.String(), ctx.Err()
 		}
 	}
 }
 
-// humanBytes renders a byte count in a compact human-friendly form (KiB,
-// MiB, GiB) matching the shape of `du -h`. Used for the BytesReclaimed
-// field so log lines and result JSON read consistently with the BeforeBytes
-// / AfterBytes values.
-func humanBytes(n int64) string {
+// -------------------------------------------------------------------------
+// PARSE / FORMAT HELPERS
+// -------------------------------------------------------------------------
+
+// parseBlobsDeleted counts "blob eligible for deletion:" lines emitted by
+// the registry garbage-collect tool.
+func parseBlobsDeleted(output string) int {
+	count := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "blob eligible for deletion:") {
+			count++
+		}
+	}
+	return count
+}
+
+// HumanBytes renders a byte count in a compact human-friendly form (KiB,
+// MiB, GiB) matching the shape of `du -h`. Exported so the workflow can
+// format the before/after/reclaimed sizes consistently.
+func HumanBytes(n int64) string {
 	const unit = 1024
 	if n < 0 {
 		return fmt.Sprintf("%dB", n)
@@ -370,3 +478,9 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f%s", val, suffixes[exp])
 }
 
+// shellQuote single-quotes a string for safe inclusion in a remote bash
+// command. Embedded single quotes are escaped via the canonical
+// `'\''` sequence.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
