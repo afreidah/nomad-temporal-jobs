@@ -66,8 +66,10 @@ func main() {
 		runTrivy(ctx, c, workflowID)
 	case "cleanup":
 		runCleanup(ctx, c, workflowID)
+	case "registry-gc":
+		runRegistryGC(ctx, c, workflowID)
 	default:
-		log.Fatalf("Unknown workflow: %s (supported: backup, trivy, cleanup)\n", workflowName)
+		log.Fatalf("Unknown workflow: %s (supported: backup, trivy, cleanup, registry-gc)\n", workflowName)
 	}
 }
 
@@ -154,6 +156,44 @@ func runCleanup(ctx context.Context, c client.Client, workflowID string) {
 			log.Printf("    Errors: %v", r.Errors)
 		}
 	}
+}
+
+// runRegistryGC starts the registry garbage-collect workflow and waits for
+// completion. Reuses the cleanup-task-queue (same worker) since the work
+// shares the SSH + Nomad-client infra.
+func runRegistryGC(ctx context.Context, c client.Client, workflowID string) {
+	config := cleanupact.RegistryGCConfig{
+		JobName:         envOrDefault("REGISTRY_JOB_NAME", "registry"),
+		RegistryDataDir: envOrDefault("REGISTRY_DATA_DIR", "/mnt/gdrive/munchbox-data/registry"),
+		RegistryImage:   envOrDefault("REGISTRY_IMAGE", "registry:3"),
+		DryRun:          envOrDefault("DRY_RUN", "true") != "false",
+		DeleteUntagged:  envOrDefault("DELETE_UNTAGGED", "true") != "false",
+	}
+
+	we, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        workflowID,
+		TaskQueue: "cleanup-task-queue",
+	}, cleanupwf.RegistryGC, config)
+	if err != nil {
+		log.Fatalln("Unable to start registry-gc workflow:", err)
+	}
+
+	log.Printf("Started registry-gc workflow: %s (RunID: %s)", we.GetID(), we.GetRunID())
+	log.Printf("Config: JobName=%s, DataDir=%s, Image=%s, DryRun=%v, DeleteUntagged=%v",
+		config.JobName, config.RegistryDataDir, config.RegistryImage,
+		config.DryRun, config.DeleteUntagged)
+
+	var result cleanupact.RegistryGCResult
+	if err := we.Get(ctx, &result); err != nil {
+		log.Fatalf("Registry GC workflow failed: %v\n", err)
+	}
+
+	log.Println("Registry GC complete!")
+	log.Printf("  Node:           %s (%s)", result.NodeName, result.NodeAddr)
+	log.Printf("  Blobs deleted:  %d", result.BlobsDeleted)
+	log.Printf("  Bytes:          %s -> %s (reclaimed %s)",
+		result.BeforeBytes, result.AfterBytes, result.BytesReclaimed)
+	log.Printf("  Dry run:        %v", result.DryRun)
 }
 
 // envOrDefault reads an environment variable, returning fallback if unset

@@ -76,6 +76,7 @@ func main() {
 	w := worker.New(c, taskQueue, worker.Options{})
 
 	w.RegisterWorkflow(workflows.Cleanup)
+	w.RegisterWorkflow(workflows.RegistryGC)
 	w.RegisterActivity(acts)
 
 	slogger.Info("Cleanup worker starting",
