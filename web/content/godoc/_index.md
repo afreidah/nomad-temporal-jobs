@@ -47,14 +47,14 @@ weight: 30
 <a class="landing-card" href="nodecleanup-activities/">
 <div>
 <strong>nodecleanup/activities</strong>
-<p>Node discovery, SSH-based orphaned directory cleanup, and Docker pruning.</p>
+<p>Node discovery, SSH-based orphaned directory cleanup, Docker pruning, and registry GC saga steps.</p>
 </div>
 </a>
 
 <a class="landing-card" href="nodecleanup-workflows/">
 <div>
 <strong>nodecleanup/workflows</strong>
-<p>Sequential node cleanup orchestration with dry-run and grace period defaults.</p>
+<p>Sequential node cleanup orchestration plus the registry GC saga with deferred scale-back compensation.</p>
 </div>
 </a>
 

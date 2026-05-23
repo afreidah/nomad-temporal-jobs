@@ -11,7 +11,7 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup) runs as an independent worker with its own container image, task queue, and Nomad service job. A shared trigger binary dispatches workflows on schedule.
+Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup) runs as an independent worker with its own container image, task queue, and Nomad service job. The cleanup worker hosts two workflows — orphaned-data cleanup and Docker registry garbage collection — on a shared task queue. A shared trigger binary dispatches workflows on schedule.
 
 ```
   Nomad periodic jobs           Temporal Server
@@ -28,6 +28,7 @@ Temporal workflow workers for automated infrastructure operations. Each domain (
                         |     +------------------------+
                         |     | cleanup-worker         |
                         +---->| cleanup-task-queue     |
+                              | (cleanup + registry-gc)|
                               +------------------------+
                                         |
                                         v
@@ -41,6 +42,7 @@ Each worker is a long-running Temporal worker process that polls its dedicated t
 ## Table of Contents
 
 - [Workflow Domains](#workflow-domains)
+- [Registry GC Saga](#registry-gc-saga)
 - [Shared Infrastructure](#shared-infrastructure)
 - [Trigger Binary](#trigger-binary)
 - [Retry and Error Handling](#retry-and-error-handling)
@@ -57,7 +59,7 @@ Each worker is a long-running Temporal worker process that polls its dedicated t
 Snapshots Nomad Raft state, Consul Raft state (includes Vault data), and all PostgreSQL databases (pg_dumpall). Each snapshot is stored locally on an NFS mount and uploaded to S3 for off-site redundancy. Old backups are cleaned up based on configurable retention (default: 7 days local, 30 days S3).
 
 **Task queue:** `backup-task-queue`
-**Schedule:** Daily at 2 AM
+**Schedule:** Nomad periodic job
 **Image:** `backup-worker`
 **Dependencies:** Nomad CLI, Consul CLI, pg_dumpall, S3-compatible storage
 
@@ -66,7 +68,7 @@ Snapshots Nomad Raft state, Consul Raft state (includes Vault data), and all Pos
 Discovers all running Docker images from the Nomad API, scans each through the Trivy server in parallel batches, and stores CVE results in PostgreSQL. Transient errors (server down) are retried by Temporal; permanent errors (image not found) are recorded and skipped.
 
 **Task queue:** `trivy-task-queue`
-**Schedule:** Daily at 3 AM
+**Schedule:** Nomad periodic job
 **Image:** `trivy-scan-worker`
 **Dependencies:** Trivy CLI, Nomad API, PostgreSQL
 
@@ -75,9 +77,42 @@ Discovers all running Docker images from the Nomad API, scans each through the T
 SSHes to each Nomad client node, identifies job data directories that no longer correspond to running allocations, and removes those older than the grace period. Optionally prunes unused Docker images. Supports dry-run mode for safe previewing.
 
 **Task queue:** `cleanup-task-queue`
-**Schedule:** Daily at 5 AM
+**Schedule:** Nomad periodic job
 **Image:** `cleanup-worker`
 **Dependencies:** SSH access to all Nomad client nodes, Nomad API
+
+### Registry Garbage Collection
+
+Reclaims disk space from the Docker registry by running the registry's `garbage-collect` against its bind-mounted storage. Because the registry tool requires the registry to be offline, the workflow scales the registry Nomad job to 0, waits for its allocations to drain, runs GC over SSH, then scales it back to 1. It reports blobs deleted and bytes reclaimed (before/after sizes). Runs on the cleanup worker, sharing its SSH and Nomad-client infrastructure. See [Registry GC Saga](#registry-gc-saga) for the compensation guarantees.
+
+**Task queue:** `cleanup-task-queue` (shared with node cleanup)
+**Workflow:** `RegistryGC`
+**Image:** `cleanup-worker`
+**Dependencies:** SSH access to the registry host, Nomad API (job scaling), Docker on the registry host
+
+## Registry GC Saga
+
+The registry GC workflow is structured as a saga so the registry is never left stranded offline. The sequence decomposes into per-step activities, each with its own retry policy:
+
+| Step | Activity | Retry |
+|------|----------|-------|
+| Locate registry host | `FindRegistryNode` | 3 attempts, exponential backoff |
+| Measure storage (before) | `MeasureRegistryDataDir` | 3 attempts |
+| Scale registry to 0 | `ScaleRegistry` | 3 attempts (idempotent) |
+| Wait for allocs to drain | `WaitRegistryAllocsDrained` | bounded by timeout, heartbeats each poll |
+| Run garbage-collect | `RunRegistryGarbageCollect` | **1 attempt** (no retry on partial GC) |
+| Measure storage (after) | `MeasureRegistryDataDir` | 3 attempts |
+
+Once the scale-down to 0 succeeds, a **compensation** is registered with `defer` and `workflow.NewDisconnectedContext`. It scales the registry back to 1 and waits for a running allocation — and it always fires, even if GC fails, an activity times out, or the workflow is cancelled mid-flight. Scaling is idempotent, so re-issuing `count=1` is a safe no-op on the happy path. If the scale-back itself fails, the workflow logs a `CRITICAL` recovery message and joins the error so it surfaces to the operator.
+
+| Config | Default | Description |
+|--------|---------|-------------|
+| `JobName` | `registry` | Nomad job for the registry |
+| `GroupName` | (= `JobName`) | Task group to scale |
+| `RegistryDataDir` | `/mnt/gdrive/munchbox-data/registry` | Host path bind-mounted as `/var/lib/registry` |
+| `RegistryImage` | `registry:3` | Image used for the one-shot GC run |
+| `DryRun` | `true` (via trigger) | Report blobs that would be deleted without freeing space |
+| `DeleteUntagged` | `true` | Also remove manifests not referenced by any tag |
 
 ## Shared Infrastructure
 
@@ -94,13 +129,14 @@ All workers use `StartClientSpan` with `PeerServiceAttr` to produce service grap
 
 ## Trigger Binary
 
-A single trigger binary (`cmd/trigger/`) handles all three workflows. It connects to Temporal with OTel tracing, starts the requested workflow, waits for completion, and logs the result. The binary is bundled into the `backup-worker` image and selected via the `WORKFLOW_NAME` environment variable.
+A single trigger binary (`cmd/trigger/`) handles all four workflows. It connects to Temporal with OTel tracing, starts the requested workflow, waits for completion, and logs the result. The binary is bundled into the `backup-worker` image and selected via the `WORKFLOW_NAME` environment variable.
 
 | WORKFLOW_NAME | Workflow | Task Queue | Additional Env Vars |
 |---------------|----------|------------|---------------------|
 | `backup` | `Backup` | `backup-task-queue` | `LOCAL_RETENTION_DAYS`, `S3_RETENTION_DAYS` |
 | `trivy` | `Scan` | `trivy-task-queue` | -- |
 | `cleanup` | `Cleanup` | `cleanup-task-queue` | `DRY_RUN`, `GRACE_DAYS`, `DOCKER_PRUNE`, `CLEANUP_DATA_DIR` |
+| `registry-gc` | `RegistryGC` | `cleanup-task-queue` | `REGISTRY_JOB_NAME`, `REGISTRY_DATA_DIR`, `REGISTRY_IMAGE`, `DRY_RUN`, `DELETE_UNTAGGED` |
 
 ## Retry and Error Handling
 
@@ -192,6 +228,18 @@ All configuration is via environment variables, injected by Nomad job templates 
 | `SSH_HOST_CA_PATH` | `/root/.ssh/ssh-host-ca.pub` | SSH host CA public key path |
 | `NOMAD_TOKEN` | -- | Nomad API token (read nodes/allocations) |
 
+### Registry GC
+
+Registry GC runs on the cleanup worker, so it inherits the SSH and `NOMAD_TOKEN` settings above (the Nomad token additionally needs job-scale permission). These variables are read by the trigger:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REGISTRY_JOB_NAME` | `registry` | Nomad job hosting the registry |
+| `REGISTRY_DATA_DIR` | `/mnt/gdrive/munchbox-data/registry` | Host path bind-mounted as `/var/lib/registry` |
+| `REGISTRY_IMAGE` | `registry:3` | Image used for the one-shot GC run |
+| `DRY_RUN` | `true` | Report blobs that would be deleted without freeing space |
+| `DELETE_UNTAGGED` | `true` | Also remove manifests not referenced by any tag |
+
 ## Observability
 
 ### Tracing
@@ -267,6 +315,7 @@ Each domain is deployed as a separate Nomad service job. Trigger jobs are Nomad 
 | `temporal-backup-trigger` | periodic batch | `backup-worker` | -- |
 | `temporal-trivy-trigger` | periodic batch | `backup-worker` | -- |
 | `temporal-cleanup-trigger` | periodic batch | `backup-worker` | -- |
+| `temporal-registry-gc-trigger` | periodic batch | `backup-worker` | -- |
 
 ### Manual Triggering
 
@@ -284,6 +333,11 @@ temporal workflow start --task-queue trivy-task-queue --type Scan \
 temporal workflow start --task-queue cleanup-task-queue --type Cleanup \
   --address temporal-server.service.consul:7233 \
   --input '{"data_dir":"/opt/nomad/data","grace_days":7,"dry_run":true,"docker_prune":false}'
+
+# Registry garbage collection (dry run)
+temporal workflow start --task-queue cleanup-task-queue --type RegistryGC \
+  --address temporal-server.service.consul:7233 \
+  --input '{"job_name":"registry","registry_data_dir":"/mnt/gdrive/munchbox-data/registry","registry_image":"registry:3","dry_run":true,"delete_untagged":true}'
 ```
 
 ## Project Structure
@@ -334,10 +388,12 @@ nomad-temporal-jobs/
     Makefile                         Build and push targets
     activities/
       activities.go                  Activity struct: node discovery, SSH cleanup, script gen
+      registry_gc.go                 Saga activities: find node, scale, drain, GC, measure
     workflows/
       cleanup.go                     Sequential per-node cleanup with failure tracking
+      registry_gc.go                 Saga orchestration with deferred scale-back compensation
     worker/
-      main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
+      main.go                       Worker entry point (registers Cleanup + RegistryGC workflows)
 ```
 
 ## License
