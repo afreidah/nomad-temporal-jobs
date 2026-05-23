@@ -13,6 +13,7 @@ archetype: "home"
 {{% badge style="info" title=" " icon="fas fa-database" %}}Automated Backups{{% /badge %}}
 {{% badge style="red" title=" " icon="fas fa-shield-alt" %}}Trivy Scanning{{% /badge %}}
 {{% badge style="green" icon="fas fa-broom" %}}Node Cleanup{{% /badge %}}
+{{% badge style="green" title=" " icon="fas fa-recycle" %}}Registry GC{{% /badge %}}
 {{% badge style="warning" title=" " icon="fas fa-fire" %}}Prometheus Metrics{{% /badge %}}
 {{% badge style="primary" icon="fas fa-project-diagram" %}}OpenTelemetry{{% /badge %}}
 
@@ -31,7 +32,7 @@ archetype: "home"
 <h2 style="text-align: center; color: #34d399;">Temporal workflow workers for infrastructure automation</h2>
 
 <p style="text-align: center; max-width: 700px; margin: 0 auto; color: #94a3b8; font-size: 1.1rem;">
-Three independent Temporal workers handle nightly backup orchestration, container vulnerability scanning, and orphaned data cleanup across Nomad client nodes.
+Three independent Temporal workers handle backup orchestration, container vulnerability scanning, and orphaned data cleanup across Nomad client nodes &mdash; with the cleanup worker also reclaiming Docker registry storage via a saga-style garbage-collect.
 </p>
 
 <div class="hero-bullets">
@@ -39,6 +40,7 @@ Three independent Temporal workers handle nightly backup orchestration, containe
 - Automated nightly backups of Nomad, Consul, and PostgreSQL with S3 offsite replication and configurable retention
 - Vulnerability scanning of all running container images with parallel batched Trivy scans and CVE persistence
 - Orphaned data directory cleanup across Nomad nodes with dry-run safety and grace period filtering
+- Docker registry garbage collection that scales the registry offline, runs GC, and always scales it back via saga compensation
 
 </div>
 
@@ -52,7 +54,7 @@ Three independent Temporal workers handle nightly backup orchestration, containe
 <div>
 <strong>Automated Backups</strong>
 <p>Nomad Raft, Consul Raft, and PostgreSQL snapshots with S3 upload and retention cleanup.</p>
-<div class="feature-detail">Scheduled daily at 2 AM. Snapshots are stored locally on NFS and uploaded to S3. S3 uploads are non-fatal &mdash; local backups succeed even if S3 is unreachable. Configurable retention: 7 days local, 30 days S3 by default.</div>
+<div class="feature-detail">Runs as a Nomad periodic job. Snapshots are stored locally on NFS and uploaded to S3. S3 uploads are non-fatal &mdash; local backups succeed even if S3 is unreachable. Configurable retention: 7 days local, 30 days S3 by default.</div>
 </div>
 </div>
 
@@ -69,6 +71,14 @@ Three independent Temporal workers handle nightly backup orchestration, containe
 <strong>Node Cleanup</strong>
 <p>SSH to each Nomad client node, identify orphaned directories, and remove stale data safely.</p>
 <div class="feature-detail">Connects to every Nomad client node via SSH. Enumerates job data directories, cross-references against running jobs, and removes orphaned entries older than the grace period. Optional Docker image pruning. Dry-run mode enabled by default for safe preview.</div>
+</div>
+</div>
+
+<div class="feature-item">
+<div>
+<strong>Registry Garbage Collection</strong>
+<p>Reclaim Docker registry storage with a saga that never leaves the registry offline.</p>
+<div class="feature-detail">Scales the registry Nomad job to 0, waits for allocations to drain, runs <code>garbage-collect</code> over SSH, then scales back to 1. The scale-back is a deferred compensation on a disconnected context &mdash; it always fires, even if GC fails or the workflow is cancelled. Reports blobs deleted and bytes reclaimed.</div>
 </div>
 </div>
 

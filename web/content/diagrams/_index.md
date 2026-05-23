@@ -37,4 +37,11 @@ weight: 20
 </div>
 </a>
 
+<a class="landing-card" href="registry-gc-workflow/">
+<div>
+<strong>Registry GC Workflow</strong>
+<p>Saga-style scale-down, garbage-collect, and guaranteed scale-back compensation.</p>
+</div>
+</a>
+
 </div>

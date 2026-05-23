@@ -104,12 +104,12 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
     CRON: {
       title: 'Nomad Periodic Jobs',
       badge: 'entry', badgeText: 'scheduler',
-      body: '<p>Three Nomad periodic batch jobs trigger workflows on schedule:</p><p><b>Backup:</b> daily at 2 AM<br><b>Trivy scan:</b> daily at 3 AM<br><b>Node cleanup:</b> daily at 5 AM</p><p>Each job runs the shared trigger binary with <code>WORKFLOW_NAME</code> set to the target workflow.</p>'
+      body: '<p>Nomad periodic batch jobs trigger the workflows on schedule &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC).</p><p>Each job runs the shared trigger binary with <code>WORKFLOW_NAME</code> set to the target workflow.</p>'
     },
     TRIGGER: {
       title: 'Workflow Trigger Binary',
       badge: 'entry', badgeText: 'dispatcher',
-      body: '<p>Single Go binary (<code>cmd/trigger/main.go</code>) that dispatches all workflows. Initializes OTel tracing, connects to Temporal, and starts the workflow selected by <code>WORKFLOW_NAME</code> env var.</p><p>Supports: <code>backup</code>, <code>trivy</code>, <code>cleanup</code>. Passes configuration via environment variables (<code>LOCAL_RETENTION_DAYS</code>, <code>S3_RETENTION_DAYS</code>, <code>GRACE_DAYS</code>, <code>DRY_RUN</code>, etc.).</p><p>Waits for completion and logs the result before exiting.</p>'
+      body: '<p>Single Go binary (<code>cmd/trigger/main.go</code>) that dispatches all workflows. Initializes OTel tracing, connects to Temporal, and starts the workflow selected by <code>WORKFLOW_NAME</code> env var.</p><p>Supports: <code>backup</code>, <code>trivy</code>, <code>cleanup</code>, <code>registry-gc</code>. Passes configuration via environment variables (<code>LOCAL_RETENTION_DAYS</code>, <code>S3_RETENTION_DAYS</code>, <code>GRACE_DAYS</code>, <code>DRY_RUN</code>, <code>DELETE_UNTAGGED</code>, etc.).</p><p>Waits for completion and logs the result before exiting.</p>'
     },
     TEMPORAL: {
       title: 'Temporal Server',
@@ -129,7 +129,7 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
     CTQ: {
       title: 'cleanup-task-queue',
       badge: 'middleware', badgeText: 'task queue',
-      body: '<p>Temporal task queue for node cleanup workflow and activities. Only the cleanup worker polls this queue.</p><p>Retry policy: 1s initial interval, 2.0 backoff, 1m max interval, 3 max attempts.</p>'
+      body: '<p>Temporal task queue shared by the node cleanup and registry GC workflows and their activities. Only the cleanup worker polls this queue.</p><p>Retry policy: 1s initial interval, 2.0 backoff, 1m max interval, 3 max attempts (the long-running registry GC step runs with 1 attempt).</p>'
     },
     BWORKER: {
       title: 'Backup Worker',
@@ -144,7 +144,7 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
     CWORKER: {
       title: 'Cleanup Worker',
       badge: 'handler', badgeText: 'worker',
-      body: '<p>Connects to each Nomad client node via SSH and removes orphaned job data directories. Nodes processed sequentially.</p><p>Excludes system dirs (alloc, plugins, tmp, server, client). Grace period filter skips recently modified directories. Optional Docker image prune.</p><p>Dry-run mode enabled by default for safe preview. Activity timeout: 10min start-to-close / 30min schedule-to-close per node.</p><p><a href="../nodecleanup-workflow/">Node cleanup workflow diagram &rarr;</a></p>'
+      body: '<p>Connects to each Nomad client node via SSH and removes orphaned job data directories. Nodes processed sequentially.</p><p>Excludes system dirs (alloc, plugins, tmp, server, client). Grace period filter skips recently modified directories. Optional Docker image prune.</p><p>Dry-run mode enabled by default for safe preview. Activity timeout: 10min start-to-close / 30min schedule-to-close per node.</p><p>This worker also hosts the <b>registry GC saga</b> on the same task queue &mdash; it scales the registry offline, runs <code>garbage-collect</code> over SSH, and always scales it back via deferred compensation.</p><p><a href="../nodecleanup-workflow/">Node cleanup workflow diagram &rarr;</a><br><a href="../registry-gc-workflow/">Registry GC workflow diagram &rarr;</a></p>'
     },
     NOMAD_API: {
       title: 'Nomad API',
