@@ -209,8 +209,8 @@ func (a *Activities) TakeConsulSnapshot(ctx context.Context) (string, error) {
 }
 
 // TakePostgresBackup creates a full dump of all PostgreSQL databases
-// compressed with gzip. Captures authentik, nextcloud, temporal, and all
-// roles and permissions via pg_dumpall. Requires PGPASSWORD in the
+// compressed with gzip. Uses pg_dumpall so every database, role, and
+// permission set in the cluster is captured. Requires PGPASSWORD in the
 // environment.
 func (a *Activities) TakePostgresBackup(ctx context.Context) (string, error) {
 	logger := activity.GetLogger(ctx)
