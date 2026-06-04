@@ -342,13 +342,14 @@ func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string
 	)
 	defer span.End()
 
-	if err := os.MkdirAll(a.config.PostgresBackupDir, 0o755); err != nil {
+	safe := SanitizeDBName(database)
+	dbDir := filepath.Join(a.config.PostgresBackupDir, safe)
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		return "", fmt.Errorf("create backup dir: %w", err)
 	}
 
 	timestamp := time.Now().Format("20060102150405")
-	filename := filepath.Join(a.config.PostgresBackupDir,
-		fmt.Sprintf("postgres-%s-%s.sql.gz", sanitizeDBName(database), timestamp))
+	filename := filepath.Join(dbDir, fmt.Sprintf("postgres-%s-%s.sql.gz", safe, timestamp))
 
 	// Positional args ($1..$4) avoid shell-injection from the database name.
 	// pipefail ensures pg_dump failures propagate through the gzip pipe.
@@ -555,9 +556,10 @@ func isQuotaError(err error) bool {
 	return strings.Contains(err.Error(), "InsufficientStorage") || strings.Contains(err.Error(), "507")
 }
 
-// sanitizeDBName makes a database name safe for use in a backup filename by
+// SanitizeDBName makes a database name safe for use in a backup path (the
+// per-database subdirectory and filename, and the matching S3 prefix) by
 // replacing any character outside [A-Za-z0-9._-] with an underscore.
-func sanitizeDBName(s string) string {
+func SanitizeDBName(s string) string {
 	return strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
@@ -661,37 +663,39 @@ func cleanupDirectory(dir string, cutoff time.Time, logger interface {
 	Info(string, ...interface{})
 	Warn(string, ...interface{})
 }) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
 			logger.Info("Backup directory does not exist, skipping", "dir", dir)
 			return nil
 		}
-		return fmt.Errorf("read dir %s: %w", dir, err)
+		return fmt.Errorf("stat dir %s: %w", dir, err)
 	}
 
+	// WalkDir recurses so per-database subdirectories are cleaned too.
 	deleted := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
 		}
 
-		name := entry.Name()
+		name := d.Name()
 		isBackup := filepath.Ext(name) == ".snap" ||
 			strings.HasSuffix(name, ".sql.gz") ||
 			strings.HasSuffix(name, ".tar.gz")
 		if !isBackup {
-			continue
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
 			logger.Warn("Failed to stat file", "file", name, "error", err)
-			continue
+			return nil
 		}
 
 		if info.ModTime().Before(cutoff) {
-			path := filepath.Join(dir, name)
 			if err := os.Remove(path); err != nil {
 				logger.Warn("Failed to remove old backup", "path", path, "error", err)
 			} else {
@@ -700,6 +704,10 @@ func cleanupDirectory(dir string, cutoff time.Time, logger interface {
 				deleted++
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk dir %s: %w", dir, err)
 	}
 
 	logger.Info("Cleanup complete", "dir", dir, "deleted_count", deleted)

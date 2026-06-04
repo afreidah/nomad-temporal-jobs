@@ -199,8 +199,8 @@ func TestSanitizeDBName(t *testing.T) {
 		"backups.legacy": "backups.legacy",
 	}
 	for in, want := range cases {
-		if got := sanitizeDBName(in); got != want {
-			t.Errorf("sanitizeDBName(%q) = %q, want %q", in, got, want)
+		if got := SanitizeDBName(in); got != want {
+			t.Errorf("SanitizeDBName(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

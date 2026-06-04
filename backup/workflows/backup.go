@@ -190,8 +190,10 @@ func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *a
 			}
 			entry.LocalPath = path
 
+			// Each database uploads under its own subdir: backups/postgres/<db>/.
+			dbPrefix := s3PrefixPostgres + "/" + activities.SanitizeDBName(db)
 			var key string
-			if err := workflow.ExecuteActivity(qCtx, a.UploadToS3, path, s3PrefixPostgres).Get(qCtx, &key); err != nil {
+			if err := workflow.ExecuteActivity(qCtx, a.UploadToS3, path, dbPrefix).Get(qCtx, &key); err != nil {
 				logger.Warn("Postgres database S3 upload failed", "database", db, "error", err)
 			} else {
 				entry.S3Key = key
