@@ -30,11 +30,20 @@ import (
 // CONFIGURATION
 // -------------------------------------------------------------------------
 
-// Config holds SSH-related settings for node cleanup activities.
+// Config holds SSH and Postgres settings for node cleanup activities. SSH
+// serves orphaned-data, registry-GC, and aptly cleanup; the Postgres fields
+// serve the postgres-maintenance workflow.
 type Config struct {
 	SSHKeyPath    string // Path to SSH private key (default: /root/.ssh/id_ed25519)
 	SSHCertPath   string // Path to SSH client certificate (default: /root/.ssh/id_ed25519-cert.pub)
 	SSHHostCAPath string // Path to SSH host CA public key (default: /root/.ssh/ssh-host-ca.pub)
+
+	PostgresHost        string // default: postgres-primary.service.consul
+	PostgresPort        string // default: 5432
+	PostgresUser        string // default: postgres
+	PostgresPassword    string // from PGPASSWORD; no default
+	PostgresSSLMode     string // default: prefer
+	PostgresSSLRootCert string // optional CA path for verify-ca/verify-full
 }
 
 // Validate applies defaults for optional fields.
@@ -47,6 +56,18 @@ func (c *Config) Validate() {
 	}
 	if c.SSHHostCAPath == "" {
 		c.SSHHostCAPath = "/root/.ssh/ssh-host-ca.pub"
+	}
+	if c.PostgresHost == "" {
+		c.PostgresHost = "postgres-primary.service.consul"
+	}
+	if c.PostgresPort == "" {
+		c.PostgresPort = "5432"
+	}
+	if c.PostgresUser == "" {
+		c.PostgresUser = "postgres"
+	}
+	if c.PostgresSSLMode == "" {
+		c.PostgresSSLMode = "prefer"
 	}
 }
 

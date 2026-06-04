@@ -70,6 +70,13 @@ func main() {
 		SSHKeyPath:    envOrDefault("SSH_KEY_PATH", "/root/.ssh/id_ed25519"),
 		SSHCertPath:   envOrDefault("SSH_CERT_PATH", "/root/.ssh/id_ed25519-cert.pub"),
 		SSHHostCAPath: envOrDefault("SSH_HOST_CA_PATH", "/root/.ssh/ssh-host-ca.pub"),
+
+		PostgresHost:        envOrDefault("PG_HOST", "postgres-primary.service.consul"),
+		PostgresPort:        envOrDefault("PG_PORT", "5432"),
+		PostgresUser:        envOrDefault("PG_USER", "postgres"),
+		PostgresPassword:    os.Getenv("PGPASSWORD"),
+		PostgresSSLMode:     envOrDefault("PG_SSLMODE", "prefer"),
+		PostgresSSLRootCert: os.Getenv("PG_SSLROOTCERT"),
 	})
 
 	// --- Worker registration ---
@@ -77,6 +84,8 @@ func main() {
 
 	w.RegisterWorkflow(workflows.Cleanup)
 	w.RegisterWorkflow(workflows.RegistryGC)
+	w.RegisterWorkflow(workflows.PostgresMaintenance)
+	w.RegisterWorkflow(workflows.AptlyCleanup)
 	w.RegisterActivity(acts)
 
 	slogger.Info("Cleanup worker starting",

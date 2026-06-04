@@ -21,11 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/XSAM/otelsql"
-	_ "github.com/lib/pq"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 
@@ -83,27 +80,17 @@ func New(cfg Config) (*Activities, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName, cfg.DBSSLMode)
-	if cfg.DBSSLRootCert != "" {
-		connStr += " sslrootcert=" + cfg.DBSSLRootCert
-	}
-
-	db, err := otelsql.Open("postgres", connStr,
-		otelsql.WithAttributes(
-			semconv.DBSystemPostgreSQL,
-			semconv.DBNamespace(cfg.DBName),
-			semconv.ServerAddress(cfg.DBHost),
-			semconv.ServerPort(5432),
-		),
-	)
+	db, err := shared.NewPostgresDB(shared.PostgresConfig{
+		Host:        cfg.DBHost,
+		Port:        cfg.DBPort,
+		User:        cfg.DBUser,
+		Password:    cfg.DBPassword,
+		DBName:      cfg.DBName,
+		SSLMode:     cfg.DBSSLMode,
+		SSLRootCert: cfg.DBSSLRootCert,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("connect to postgres: %w", err)
-	}
-
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("ping postgres: %w", err)
+		return nil, err
 	}
 
 	return &Activities{config: cfg, db: db}, nil

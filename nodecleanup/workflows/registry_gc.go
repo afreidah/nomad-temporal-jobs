@@ -11,10 +11,10 @@
 // at count=0 because the workflow died mid-sequence.
 //
 // Step-by-step retry policies (set on the activity options):
-//   - FindRegistryNode, ScaleRegistry, MeasureRegistryDataDir:
+//   - FindJobNode, ScaleJob, MeasureDataDir:
 //     3 attempts, exponential backoff. Transient Nomad API blips deserve
 //     retry.
-//   - WaitRegistryAllocs{Drained,Running}: bounded by StartToCloseTimeout
+//   - WaitJob{Drained,Running}: bounded by StartToCloseTimeout
 //     (5 min). Internal poll loop heartbeats; Temporal kills the activity
 //     if it stalls.
 //   - RunRegistryGarbageCollect: MaxAttempts=1. Don't restart a partially
@@ -101,7 +101,7 @@ func RegistryGC(ctx workflow.Context, config activities.RegistryGCConfig) (resul
 	// -----------------------------------------------------------------
 
 	var node activities.NodeInfo
-	if err = workflow.ExecuteActivity(fastCtx, a.FindRegistryNode, config.JobName).Get(ctx, &node); err != nil {
+	if err = workflow.ExecuteActivity(fastCtx, a.FindJobNode, config.JobName).Get(ctx, &node); err != nil {
 		return result, fmt.Errorf("find registry node: %w", err)
 	}
 	result.NodeName = node.Name
@@ -112,7 +112,7 @@ func RegistryGC(ctx workflow.Context, config activities.RegistryGCConfig) (resul
 	// -----------------------------------------------------------------
 
 	var beforeBytes int64
-	if err = workflow.ExecuteActivity(fastCtx, a.MeasureRegistryDataDir, node, config.RegistryDataDir).Get(ctx, &beforeBytes); err != nil {
+	if err = workflow.ExecuteActivity(fastCtx, a.MeasureDataDir, node, config.RegistryDataDir).Get(ctx, &beforeBytes); err != nil {
 		return result, fmt.Errorf("measure registry data dir (before): %w", err)
 	}
 	result.BeforeBytes = activities.HumanBytes(beforeBytes)
@@ -121,7 +121,7 @@ func RegistryGC(ctx workflow.Context, config activities.RegistryGCConfig) (resul
 	// Scale registry down to 0
 	// -----------------------------------------------------------------
 
-	if err = workflow.ExecuteActivity(fastCtx, a.ScaleRegistry, config.JobName, config.GroupName, 0).Get(ctx, nil); err != nil {
+	if err = workflow.ExecuteActivity(fastCtx, a.ScaleJob, config.JobName, config.GroupName, 0).Get(ctx, nil); err != nil {
 		// Scale-down failed; nothing to compensate. Return without
 		// registering the deferred scale-back.
 		return result, fmt.Errorf("scale registry to 0: %w", err)
@@ -143,7 +143,7 @@ func RegistryGC(ctx workflow.Context, config activities.RegistryGCConfig) (resul
 		fastCleanupCtx := workflow.WithActivityOptions(cleanupCtx, fastOpts)
 		pollCleanupCtx := workflow.WithActivityOptions(cleanupCtx, pollOpts)
 
-		scaleErr := workflow.ExecuteActivity(fastCleanupCtx, a.ScaleRegistry, config.JobName, config.GroupName, 1).
+		scaleErr := workflow.ExecuteActivity(fastCleanupCtx, a.ScaleJob, config.JobName, config.GroupName, 1).
 			Get(fastCleanupCtx, nil)
 		if scaleErr != nil {
 			logger.Error("CRITICAL: failed to scale registry back to 1; manual recovery required",
@@ -152,7 +152,7 @@ func RegistryGC(ctx workflow.Context, config activities.RegistryGCConfig) (resul
 			return
 		}
 
-		waitErr := workflow.ExecuteActivity(pollCleanupCtx, a.WaitRegistryAllocRunning, config.JobName).
+		waitErr := workflow.ExecuteActivity(pollCleanupCtx, a.WaitJobRunning, config.JobName).
 			Get(pollCleanupCtx, nil)
 		if waitErr != nil {
 			logger.Error("registry scaled but did not become running in time; check Nomad",
@@ -165,7 +165,7 @@ func RegistryGC(ctx workflow.Context, config activities.RegistryGCConfig) (resul
 	// Wait for registry allocs to drain
 	// -----------------------------------------------------------------
 
-	if err = workflow.ExecuteActivity(pollCtx, a.WaitRegistryAllocsDrained, config.JobName).Get(ctx, nil); err != nil {
+	if err = workflow.ExecuteActivity(pollCtx, a.WaitJobDrained, config.JobName).Get(ctx, nil); err != nil {
 		return result, fmt.Errorf("wait for registry allocs to drain: %w", err)
 	}
 
@@ -184,7 +184,7 @@ func RegistryGC(ctx workflow.Context, config activities.RegistryGCConfig) (resul
 	// -----------------------------------------------------------------
 
 	var afterBytes int64
-	if err = workflow.ExecuteActivity(fastCtx, a.MeasureRegistryDataDir, node, config.RegistryDataDir).Get(ctx, &afterBytes); err != nil {
+	if err = workflow.ExecuteActivity(fastCtx, a.MeasureDataDir, node, config.RegistryDataDir).Get(ctx, &afterBytes); err != nil {
 		return result, fmt.Errorf("measure registry data dir (after): %w", err)
 	}
 	result.AfterBytes = activities.HumanBytes(afterBytes)
