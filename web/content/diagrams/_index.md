@@ -12,7 +12,7 @@ weight: 20
 <a class="landing-card" href="architecture/">
 <div>
 <strong>Architecture Overview</strong>
-<p>All workers, Temporal server, trigger binary, and external services.</p>
+<p>All workers, Temporal server, and external services.</p>
 </div>
 </a>
 

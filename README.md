@@ -11,25 +11,25 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup) runs as an independent worker with its own container image, task queue, and Nomad service job. The cleanup worker hosts two workflows — orphaned-data cleanup and Docker registry garbage collection — on a shared task queue. A shared trigger binary dispatches workflows on schedule.
+Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup) runs as an independent worker with its own container image, task queue, and Nomad service job. The cleanup worker hosts two workflows — orphaned-data cleanup and Docker registry garbage collection — on a shared task queue. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
 
 ```
-  Nomad periodic jobs           Temporal Server
-  (temporal-*-trigger)          (temporal-server.service.consul:7233)
+  Temporal Schedules            Temporal Server
+  (Terraform-managed)           (temporal-server.service.consul:7233)
          |                               |
-         | ExecuteWorkflow               | Task Queue dispatch
+         | start workflow on cron        | Task Queue dispatch
          v                               v
-  +----------------+          +------------------------+
-  | workflow-      |          | backup-worker          |
-  | trigger        |--------->| backup-task-queue      |
-  | (selects one)  |    |     +------------------------+
-  +----------------+    |     | trivy-scan-worker      |
-                        +---->| trivy-task-queue       |
-                        |     +------------------------+
-                        |     | cleanup-worker         |
-                        +---->| cleanup-task-queue     |
-                              | (cleanup + registry-gc)|
-                              +------------------------+
+                            +------------------------+
+                            | backup-worker          |
+                            | backup-task-queue      |
+                            +------------------------+
+                            | trivy-scan-worker      |
+                            | trivy-task-queue       |
+                            +------------------------+
+                            | cleanup-worker         |
+                            | cleanup-task-queue     |
+                            | (cleanup + registry-gc)|
+                            +------------------------+
                                         |
                                         v
                               Nomad, Consul, S3,
@@ -44,7 +44,7 @@ Each worker is a long-running Temporal worker process that polls its dedicated t
 - [Workflow Domains](#workflow-domains)
 - [Registry GC Saga](#registry-gc-saga)
 - [Shared Infrastructure](#shared-infrastructure)
-- [Trigger Binary](#trigger-binary)
+- [Scheduling](#scheduling)
 - [Retry and Error Handling](#retry-and-error-handling)
 - [Configuration](#configuration)
 - [Observability](#observability)
@@ -56,16 +56,16 @@ Each worker is a long-running Temporal worker process that polls its dedicated t
 
 ### Backup
 
-Snapshots Nomad Raft state, Consul Raft state (includes Vault data), and all PostgreSQL databases (pg_dumpall). Each snapshot is stored locally on an NFS mount and uploaded to S3 for off-site redundancy. Old backups are cleaned up based on configurable retention (default: 7 days local, 30 days S3).
+Snapshots Nomad Raft state, Consul Raft state (includes Vault data), and PostgreSQL. The three legs run concurrently. The PostgreSQL leg dumps cluster-wide globals (roles, tablespaces, grants) once, enumerates the databases, then dumps each one to its own file with bounded concurrency (`PG_DUMP_CONCURRENCY`, default 4). Each artifact is stored locally on an NFS mount and uploaded to S3 for off-site redundancy. Old backups are cleaned up based on configurable retention (default: 7 days local, 30 days S3).
 
 **Task queue:** `backup-task-queue`
 **Schedule:** Nomad periodic job
 **Image:** `backup-worker`
-**Dependencies:** Nomad CLI, Consul CLI, pg_dumpall, S3-compatible storage
+**Dependencies:** Nomad CLI, Consul CLI, pg_dump/pg_dumpall, S3-compatible storage
 
 ### Trivy Scan
 
-Discovers all running Docker images from the Nomad API, scans each through the Trivy server in parallel batches, and stores CVE results in PostgreSQL. Transient errors (server down) are retried by Temporal; permanent errors (image not found) are recorded and skipped.
+Discovers all running Docker images from the Nomad API, scans them through the Trivy server with bounded concurrency, and stores CVE results in PostgreSQL. Transient errors (server down) are retried by Temporal; permanent errors (image not found) are recorded and skipped.
 
 **Task queue:** `trivy-task-queue`
 **Schedule:** Nomad periodic job
@@ -111,7 +111,7 @@ Once the scale-down to 0 succeeds, a **compensation** is registered with `defer`
 | `GroupName` | (= `JobName`) | Task group to scale |
 | `RegistryDataDir` | `/mnt/gdrive/munchbox-data/registry` | Host path bind-mounted as `/var/lib/registry` |
 | `RegistryImage` | `registry:3` | Image used for the one-shot GC run |
-| `DryRun` | `true` (via trigger) | Report blobs that would be deleted without freeing space |
+| `DryRun` | `true` (overridden by schedule input) | Report blobs that would be deleted without freeing space |
 | `DeleteUntagged` | `true` | Also remove manifests not referenced by any tag |
 
 ## Shared Infrastructure
@@ -127,22 +127,22 @@ The `shared/` package provides common functionality used by all workers:
 
 All workers use `StartClientSpan` with `PeerServiceAttr` to produce service graph edges in Tempo/Grafana for every external call (Nomad, Consul, PostgreSQL, S3, Trivy server).
 
-## Trigger Binary
+## Scheduling
 
-A single trigger binary (`cmd/trigger/`) handles all four workflows. It connects to Temporal with OTel tracing, starts the requested workflow, waits for completion, and logs the result. The binary is bundled into the `backup-worker` image and selected via the `WORKFLOW_NAME` environment variable.
+Workflows fire on cron from Temporal Schedules, defined as code in `infrastructure/terragrunt` (the `temporal-config` module, applied via the `global/temporal-config` leaf). Each schedule starts one workflow on its task queue with a JSON `input` that deserializes into the workflow's config struct. The workers themselves just poll their queues — nothing in this repo triggers them.
 
-| WORKFLOW_NAME | Workflow | Task Queue | Additional Env Vars |
-|---------------|----------|------------|---------------------|
-| `backup` | `Backup` | `backup-task-queue` | `LOCAL_RETENTION_DAYS`, `S3_RETENTION_DAYS` |
-| `trivy` | `Scan` | `trivy-task-queue` | -- |
-| `cleanup` | `Cleanup` | `cleanup-task-queue` | `DRY_RUN`, `GRACE_DAYS`, `DOCKER_PRUNE`, `CLEANUP_DATA_DIR` |
-| `registry-gc` | `RegistryGC` | `cleanup-task-queue` | `REGISTRY_JOB_NAME`, `REGISTRY_DATA_DIR`, `REGISTRY_IMAGE`, `DRY_RUN`, `DELETE_UNTAGGED` |
+| Schedule | Workflow | Task Queue | Cron | Input |
+|----------|----------|------------|------|-------|
+| `backup-daily` | `Backup` | `backup-task-queue` | `0 1 * * *` | `BackupConfig` (local/S3 days, dump concurrency) |
+| `trivy-daily` | `Scan` | `trivy-task-queue` | `0 3 * * *` | `ScanConfig` (scan concurrency) |
+| `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, dry-run, docker prune) |
+| `registry-gc-weekly` | `RegistryGC` | `cleanup-task-queue` | `0 2 * * 0` | `RegistryGCConfig` (job/dir/image, dry-run, delete-untagged) |
 
 ## Retry and Error Handling
 
 ### Activity Timeouts
 
-Each activity has both a `StartToCloseTimeout` (max time for a single attempt) and a `ScheduleToCloseTimeout` (max total time including all retries). Quick operations (Nomad/Consul snapshots, DB saves) use 5/15 minute timeouts. Long operations (PostgreSQL dumps, image scanning) use 30/60 minute timeouts.
+Each activity has both a `StartToCloseTimeout` (max time for a single attempt) and a `ScheduleToCloseTimeout` (max total time including all retries). Quick operations (Nomad/Consul snapshots, globals dump, database listing, S3 uploads, cleanup) use 5/15 minute timeouts. Long operations (per-database `pg_dump`, image scanning) use 30/60 minute timeouts; per-database dumps additionally heartbeat with a 2 minute timeout.
 
 ### Retry Policy
 
@@ -169,7 +169,9 @@ Trivy scan activities distinguish between transient and permanent failures:
 
 | Step | On Failure |
 |------|-----------|
-| Nomad/Consul/PostgreSQL snapshot | Workflow terminates with error |
+| Nomad/Consul snapshot | Leg fails; workflow terminates with error |
+| PostgreSQL globals dump or database listing | Leg fails; workflow terminates with error |
+| Per-database dump | Leg fails after all databases are attempted; workflow terminates with error |
 | S3 upload | Warning logged, workflow continues |
 | S3 quota exceeded | Oldest backup evicted, upload retried (up to 3 evictions) |
 | Local/S3 cleanup | Warning logged, workflow continues |
@@ -203,7 +205,9 @@ All configuration is via environment variables, injected by Nomad job templates 
 | `S3_SECRET_KEY` | -- | S3 secret access key |
 | `NOMAD_TOKEN` | -- | Nomad API token (snapshot permissions) |
 | `CONSUL_HTTP_TOKEN` | -- | Consul API token (snapshot permissions) |
-| `PGPASSWORD` | -- | PostgreSQL password for pg_dumpall |
+| `PG_HOST` | `postgres-primary.service.consul` | PostgreSQL host for dumps |
+| `PG_USER` | `postgres` | PostgreSQL user for dumps |
+| `PGPASSWORD` | -- | PostgreSQL password for pg_dump/pg_dumpall |
 
 ### Trivy Scan Worker
 
@@ -230,15 +234,7 @@ All configuration is via environment variables, injected by Nomad job templates 
 
 ### Registry GC
 
-Registry GC runs on the cleanup worker, so it inherits the SSH and `NOMAD_TOKEN` settings above (the Nomad token additionally needs job-scale permission). These variables are read by the trigger:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REGISTRY_JOB_NAME` | `registry` | Nomad job hosting the registry |
-| `REGISTRY_DATA_DIR` | `/mnt/gdrive/munchbox-data/registry` | Host path bind-mounted as `/var/lib/registry` |
-| `REGISTRY_IMAGE` | `registry:3` | Image used for the one-shot GC run |
-| `DRY_RUN` | `true` | Report blobs that would be deleted without freeing space |
-| `DELETE_UNTAGGED` | `true` | Also remove manifests not referenced by any tag |
+Registry GC runs on the cleanup worker, so it inherits the SSH and `NOMAD_TOKEN` settings above (the Nomad token additionally needs job-scale permission). Its workflow config (job name, data dir, image, dry-run, delete-untagged) comes from the `registry-gc-weekly` schedule input — see the `RegistryGCConfig` table under [Registry Garbage Collection](#registry-garbage-collection).
 
 ## Observability
 
@@ -249,8 +245,6 @@ All workers initialize OpenTelemetry with OTLP gRPC export. The Temporal SDK tra
 - `backup-worker` -> nomad, consul, postgres-primary, s3-orchestrator
 - `trivy-scan-worker` -> nomad, trivy-server, postgres (via otelsql)
 - `cleanup-worker` -> nomad
-
-The trigger binary also initializes tracing, producing a root span that connects to the workflow execution trace.
 
 ### Metrics
 
@@ -301,9 +295,22 @@ cd trivyscan && make help
 cd nodecleanup && make help
 ```
 
+### Versioning
+
+A `.version` file holds the tag for the artifact built from its directory, and each is bumped independently:
+
+| File | Tags | Bumped when |
+|------|------|-------------|
+| `backup/.version` | `backup-worker` image | the backup worker changes |
+| `trivyscan/.version` | `trivy-scan-worker` image | the trivy worker changes |
+| `nodecleanup/.version` | `cleanup-worker` image | the cleanup worker changes |
+| `./.version` (root) | git release tag + `temporal-workers-web` image | cutting a repo release |
+
+`make push-backup` (and `push-all`) read each worker's own `.version` — the root version is never used for worker images. The worker tags drift apart on purpose: rebuild only what changed, and an image tag tells you exactly which worker code it holds.
+
 ## Deployment
 
-Each domain is deployed as a separate Nomad service job. Trigger jobs are Nomad periodic batch jobs that invoke the shared trigger binary.
+Each domain is deployed as a separate Nomad service job. Workflows are started on cron by Temporal Schedules (Terraform-managed in `infrastructure/terragrunt`), not by Nomad jobs.
 
 ### Nomad Jobs
 
@@ -312,22 +319,21 @@ Each domain is deployed as a separate Nomad service job. Trigger jobs are Nomad 
 | `backup-worker` | service | `backup-worker` | `backup-task-queue` |
 | `trivy-scan-worker` | service | `trivy-scan-worker` | `trivy-task-queue` |
 | `cleanup-worker` | service | `cleanup-worker` | `cleanup-task-queue` |
-| `temporal-backup-trigger` | periodic batch | `backup-worker` | -- |
-| `temporal-trivy-trigger` | periodic batch | `backup-worker` | -- |
-| `temporal-cleanup-trigger` | periodic batch | `backup-worker` | -- |
-| `temporal-registry-gc-trigger` | periodic batch | `backup-worker` | -- |
 
-### Manual Triggering
+### Manual Runs
+
+Schedules can be triggered on demand (`temporal schedule trigger --schedule-id backup-daily`), or a one-off workflow started directly with the Temporal CLI:
 
 ```bash
 # Backup
 temporal workflow start --task-queue backup-task-queue --type Backup \
   --address temporal-server.service.consul:7233 \
-  --input '{"local_days":7,"s3_days":30}'
+  --input '{"local_days":7,"s3_days":30,"dump_concurrency":4}'
 
 # Trivy scan
 temporal workflow start --task-queue trivy-task-queue --type Scan \
-  --address temporal-server.service.consul:7233
+  --address temporal-server.service.consul:7233 \
+  --input '{"concurrency":10}'
 
 # Node cleanup (dry run)
 temporal workflow start --task-queue cleanup-task-queue --type Cleanup \
@@ -359,9 +365,6 @@ nomad-temporal-jobs/
     logging.go                       JSON slog logger with Temporal SDK adapter
     metrics.go                       Prometheus metrics handler via Tally bridge
     nomad.go                         OTel-instrumented Nomad API client factory
-  cmd/
-    trigger/
-      main.go                       Workflow dispatcher (backup, trivy, cleanup)
   backup/
     .version                         Image version tag
     Dockerfile                       Multi-stage build (Debian, Nomad/Consul/PG18 CLI)
@@ -369,7 +372,7 @@ nomad-temporal-jobs/
     activities/
       activities.go                  Activity struct: snapshots, S3 upload, retention cleanup
     workflows/
-      backup.go                      Sequential snapshot orchestration with S3 upload
+      backup.go                      Concurrent snapshot legs + per-database PostgreSQL fan-out
     worker/
       main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   trivyscan/
@@ -379,7 +382,7 @@ nomad-temporal-jobs/
     activities/
       activities.go                  Activity struct: Nomad image discovery, Trivy scan, DB save
     workflows/
-      scan.go                        Parallel batch scanning with per-image error handling
+      scan.go                        Bounded-concurrency scanning with per-image error handling
     worker/
       main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   nodecleanup/

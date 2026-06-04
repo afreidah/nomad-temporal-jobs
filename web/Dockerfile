@@ -6,7 +6,6 @@ COPY shared/ shared/
 COPY backup/ backup/
 COPY trivyscan/ trivyscan/
 COPY nodecleanup/ nodecleanup/
-COPY cmd/ cmd/
 RUN go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
 RUN mkdir -p /godoc && \
     for entry in "shared:./shared" "backup-activities:./backup/activities" "backup-workflows:./backup/workflows" "trivyscan-activities:./trivyscan/activities" "trivyscan-workflows:./trivyscan/workflows" "nodecleanup-activities:./nodecleanup/activities" "nodecleanup-workflows:./nodecleanup/workflows"; do \

@@ -4,8 +4,8 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Tests workflow orchestration using the Temporal test suite. Activities are
-// mocked to verify the workflow executes snapshots sequentially, handles S3
-// upload failures gracefully, and applies retention defaults.
+// mocked to verify the concurrent snapshot legs, per-database PostgreSQL
+// fan-out, graceful S3 upload handling, and config defaults.
 // -------------------------------------------------------------------------------
 
 package workflows
@@ -13,29 +13,34 @@ package workflows
 import (
 	"testing"
 
-	"go.temporal.io/sdk/testsuite"
 	"github.com/stretchr/testify/mock"
+	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/backup/activities"
 )
 
-// TestBackup_Success verifies the happy path: all snapshots succeed, all
-// S3 uploads succeed, cleanup runs.
+// mockAllSuccess wires every backup activity to succeed. Individual tests
+// override specific activities to exercise failure paths.
+func mockAllSuccess(env *testsuite.TestWorkflowEnvironment, dbs []string) {
+	env.OnActivity(a.TakeNomadSnapshot, mock.Anything).Return("/nomad.snap", nil)
+	env.OnActivity(a.TakeConsulSnapshot, mock.Anything).Return("/consul.snap", nil)
+	env.OnActivity(a.BackupPostgresGlobals, mock.Anything).Return("/pg-globals.sql.gz", nil)
+	env.OnActivity(a.ListPostgresDatabases, mock.Anything).Return(dbs, nil)
+	env.OnActivity(a.BackupPostgresDatabase, mock.Anything, mock.Anything).Return("/pg-db.sql.gz", nil)
+	env.OnActivity(a.UploadToS3, mock.Anything, mock.Anything, mock.Anything).Return("s3key", nil)
+	env.OnActivity(a.CleanupOldBackups, mock.Anything, mock.Anything).Return(nil)
+	env.OnActivity(a.CleanupOldS3Backups, mock.Anything, mock.Anything).Return(nil)
+}
+
+// TestBackup_Success verifies the happy path: all legs succeed, every
+// database is dumped and uploaded, cleanup runs.
 func TestBackup_Success(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	env.OnActivity(a.TakeNomadSnapshot, mock.Anything).Return("/nomad.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/nomad.snap", "backups/nomad").Return("backups/nomad/nomad.snap", nil)
-	env.OnActivity(a.TakeConsulSnapshot, mock.Anything).Return("/consul.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/consul.snap", "backups/consul").Return("backups/consul/consul.snap", nil)
-	env.OnActivity(a.TakePostgresBackup, mock.Anything).Return("/postgres.sql.gz", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/postgres.sql.gz", "backups/postgres").Return("backups/postgres/postgres.sql.gz", nil)
-	env.OnActivity(a.CleanupOldBackups, mock.Anything, 7).Return(nil)
-	env.OnActivity(a.CleanupOldS3Backups, mock.Anything, 30).Return(nil)
+	mockAllSuccess(env, []string{"app", "metrics"})
 
-	retention := activities.RetentionConfig{LocalDays: 7, S3Days: 30}
-	env.ExecuteWorkflow(Backup, retention)
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{LocalDays: 7, S3Days: 30, DumpConcurrency: 2})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
@@ -51,31 +56,33 @@ func TestBackup_Success(t *testing.T) {
 	if !result.Success {
 		t.Error("Expected Success=true")
 	}
-	if result.NomadSnapshot != "/nomad.snap" {
-		t.Errorf("NomadSnapshot = %q", result.NomadSnapshot)
+	if result.NomadSnapshot != "/nomad.snap" || result.ConsulSnapshot != "/consul.snap" {
+		t.Errorf("snapshots = %q / %q", result.NomadSnapshot, result.ConsulSnapshot)
 	}
-	if result.NomadS3Key != "backups/nomad/nomad.snap" {
-		t.Errorf("NomadS3Key = %q", result.NomadS3Key)
+	if result.PostgresGlobals != "/pg-globals.sql.gz" {
+		t.Errorf("PostgresGlobals = %q", result.PostgresGlobals)
+	}
+	if len(result.PostgresDatabases) != 2 {
+		t.Fatalf("PostgresDatabases len = %d, want 2", len(result.PostgresDatabases))
+	}
+	for _, db := range result.PostgresDatabases {
+		if db.LocalPath == "" || db.S3Key == "" {
+			t.Errorf("database %q missing path/key: %+v", db.Database, db)
+		}
 	}
 }
 
-// TestBackup_RetentionDefaults verifies that zero-value retention config
-// gets populated with defaults (7 local, 30 S3).
-func TestBackup_RetentionDefaults(t *testing.T) {
+// TestBackup_Defaults verifies a zero-value config gets retention (7/30) and
+// concurrency (4) defaults applied.
+func TestBackup_Defaults(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	env.OnActivity(a.TakeNomadSnapshot, mock.Anything).Return("/nomad.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/nomad.snap", "backups/nomad").Return("", nil)
-	env.OnActivity(a.TakeConsulSnapshot, mock.Anything).Return("/consul.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/consul.snap", "backups/consul").Return("", nil)
-	env.OnActivity(a.TakePostgresBackup, mock.Anything).Return("/pg.sql.gz", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/pg.sql.gz", "backups/postgres").Return("", nil)
-	env.OnActivity(a.CleanupOldBackups, mock.Anything, 7).Return(nil)
-	env.OnActivity(a.CleanupOldS3Backups, mock.Anything, 30).Return(nil)
+	// Zero config: DumpConcurrency must default to a positive value or the
+	// bounded fan-out would deadlock, so a clean completion proves defaults.
+	mockAllSuccess(env, []string{"app"})
 
-	// Pass zero retention — workflow should apply defaults
-	env.ExecuteWorkflow(Backup, activities.RetentionConfig{})
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
@@ -85,16 +92,45 @@ func TestBackup_RetentionDefaults(t *testing.T) {
 	}
 }
 
+// TestBackup_NoDatabases verifies the workflow succeeds when the cluster has
+// no user databases (globals still backed up).
+func TestBackup_NoDatabases(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	mockAllSuccess(env, nil)
+
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{DumpConcurrency: 2})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("Workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("Workflow failed: %v", err)
+	}
+	var result activities.BackupResult
+	_ = env.GetWorkflowResult(&result)
+	if len(result.PostgresDatabases) != 0 {
+		t.Errorf("expected no databases, got %d", len(result.PostgresDatabases))
+	}
+	if !result.Success {
+		t.Error("Expected Success=true")
+	}
+}
+
 // TestBackup_NomadFailure verifies the workflow terminates when the Nomad
-// snapshot fails.
+// snapshot fails, even though the other legs succeed.
 func TestBackup_NomadFailure(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
+	// Register the failing override first: testify uses the first matching
+	// expectation, so it must precede the generic success mocks.
 	env.OnActivity(a.TakeNomadSnapshot, mock.Anything).
 		Return("", testsuite.ErrMockStartChildWorkflowFailed)
+	mockAllSuccess(env, []string{"app"})
 
-	env.ExecuteWorkflow(Backup, activities.RetentionConfig{LocalDays: 7, S3Days: 30})
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{LocalDays: 7, S3Days: 30, DumpConcurrency: 2})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
@@ -104,23 +140,40 @@ func TestBackup_NomadFailure(t *testing.T) {
 	}
 }
 
-// TestBackup_S3UploadFailureContinues verifies that S3 upload failures are
-// non-fatal — the workflow continues with remaining snapshots.
+// TestBackup_DatabaseDumpFailure verifies a single database dump failure
+// fails the workflow after the other databases are attempted.
+func TestBackup_DatabaseDumpFailure(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	// Override first: testify matches the first registered expectation, so the
+	// failing "broken" dump must precede the generic success mocks.
+	env.OnActivity(a.BackupPostgresDatabase, mock.Anything, "broken").
+		Return("", testsuite.ErrMockStartChildWorkflowFailed)
+	mockAllSuccess(env, []string{"app", "broken"})
+
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{DumpConcurrency: 2})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("Workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err == nil {
+		t.Fatal("Expected workflow error when a database dump fails")
+	}
+}
+
+// TestBackup_S3UploadFailureContinues verifies S3 upload failures are
+// non-fatal -- the workflow still completes successfully.
 func TestBackup_S3UploadFailureContinues(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	env.OnActivity(a.TakeNomadSnapshot, mock.Anything).Return("/nomad.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/nomad.snap", "backups/nomad").
+	// Override first so every upload fails regardless of leg.
+	env.OnActivity(a.UploadToS3, mock.Anything, mock.Anything, mock.Anything).
 		Return("", testsuite.ErrMockStartChildWorkflowFailed)
-	env.OnActivity(a.TakeConsulSnapshot, mock.Anything).Return("/consul.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/consul.snap", "backups/consul").Return("key", nil)
-	env.OnActivity(a.TakePostgresBackup, mock.Anything).Return("/pg.sql.gz", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/pg.sql.gz", "backups/postgres").Return("key", nil)
-	env.OnActivity(a.CleanupOldBackups, mock.Anything, 7).Return(nil)
-	env.OnActivity(a.CleanupOldS3Backups, mock.Anything, 30).Return(nil)
+	mockAllSuccess(env, []string{"app"})
 
-	env.ExecuteWorkflow(Backup, activities.RetentionConfig{LocalDays: 7, S3Days: 30})
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{LocalDays: 7, S3Days: 30, DumpConcurrency: 2})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
@@ -136,28 +189,5 @@ func TestBackup_S3UploadFailureContinues(t *testing.T) {
 	}
 	if !result.Success {
 		t.Error("Expected Success=true despite S3 failure")
-	}
-}
-
-// TestBackup_PostgresFailure verifies the workflow terminates when the
-// PostgreSQL backup fails.
-func TestBackup_PostgresFailure(t *testing.T) {
-	suite := &testsuite.WorkflowTestSuite{}
-	env := suite.NewTestWorkflowEnvironment()
-
-	env.OnActivity(a.TakeNomadSnapshot, mock.Anything).Return("/nomad.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/nomad.snap", "backups/nomad").Return("", nil)
-	env.OnActivity(a.TakeConsulSnapshot, mock.Anything).Return("/consul.snap", nil)
-	env.OnActivity(a.UploadToS3, mock.Anything, "/consul.snap", "backups/consul").Return("", nil)
-	env.OnActivity(a.TakePostgresBackup, mock.Anything).
-		Return("", testsuite.ErrMockStartChildWorkflowFailed)
-
-	env.ExecuteWorkflow(Backup, activities.RetentionConfig{LocalDays: 7, S3Days: 30})
-
-	if !env.IsWorkflowCompleted() {
-		t.Fatal("Workflow did not complete")
-	}
-	if err := env.GetWorkflowError(); err == nil {
-		t.Fatal("Expected workflow error when PostgreSQL backup fails")
 	}
 }

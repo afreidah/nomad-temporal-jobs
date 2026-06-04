@@ -112,5 +112,25 @@ func TestScanResult_ZeroValue(t *testing.T) {
 	}
 }
 
+// -------------------------------------------------------------------------
+// SCAN CONFIG DEFAULTS
+// -------------------------------------------------------------------------
+
+func TestScanConfig_ApplyDefaults(t *testing.T) {
+	var c ScanConfig
+	c.ApplyDefaults()
+	if c.Concurrency != 10 {
+		t.Errorf("Concurrency = %d, want 10", c.Concurrency)
+	}
+}
+
+func TestScanConfig_ApplyDefaults_PreservesValue(t *testing.T) {
+	c := ScanConfig{Concurrency: 4}
+	c.ApplyDefaults()
+	if c.Concurrency != 4 {
+		t.Errorf("ApplyDefaults overwrote set value: %d", c.Concurrency)
+	}
+}
+
 // nullString is tested directly since it's an unexported helper
 var _ = sql.NullString{} // ensure sql import is used

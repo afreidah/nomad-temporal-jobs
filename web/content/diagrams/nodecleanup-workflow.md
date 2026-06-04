@@ -94,7 +94,7 @@ Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and 
     START: {
       title: 'Cleanup Workflow',
       badge: 'workflow', badgeText: 'workflow entry',
-      body: '<p>Orchestrates sequential cleanup of orphaned data directories across all Nomad client nodes.</p><p>Receives <code>CleanupConfig</code> with <code>DataDir</code>, <code>GraceDays</code>, <code>DryRun</code>, and <code>DockerPrune</code> settings from the trigger binary.</p>'
+      body: '<p>Orchestrates sequential cleanup of orphaned data directories across all Nomad client nodes.</p><p>Receives <code>CleanupConfig</code> with <code>DataDir</code>, <code>GraceDays</code>, <code>DryRun</code>, and <code>DockerPrune</code> settings from the schedule input.</p>'
     },
     DEFAULTS: {
       title: 'Apply Config Defaults',
@@ -204,7 +204,7 @@ Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and 
     DONE: {
       title: 'Workflow Complete',
       badge: 'workflow', badgeText: 'result',
-      body: '<p>Returns <code>[]CleanupResult</code> with per-node breakdown. The trigger binary logs the outcome.</p><p>If any nodes failed, the workflow returns a non-nil error alongside the partial results.</p>'
+      body: '<p>Returns <code>[]CleanupResult</code> with per-node breakdown.</p><p>If any nodes failed, the workflow returns a non-nil error alongside the partial results.</p>'
     }
   };
 

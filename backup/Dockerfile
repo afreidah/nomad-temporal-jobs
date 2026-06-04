@@ -3,8 +3,8 @@
 #
 # Project: Nomad Temporal Jobs / Author: Alex Freidah
 #
-# Builds the backup-worker and workflow-trigger binaries with HashiCorp CLI
-# tools (nomad, consul) and PostgreSQL 18 client for snapshot operations.
+# Builds the backup-worker binary with HashiCorp CLI tools (nomad, consul)
+# and PostgreSQL 18 client for snapshot operations.
 # Uses Debian for access to the official PostgreSQL apt repo.
 # -------------------------------------------------------------------------------
 
@@ -23,12 +23,8 @@ RUN go mod download
 
 COPY shared/ shared/
 COPY backup/ backup/
-COPY trivyscan/ trivyscan/
-COPY nodecleanup/ nodecleanup/
-COPY cmd/ cmd/
 
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o backup-worker ./backup/worker
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o workflow-trigger ./cmd/trigger
 
 # -------------------------------------------------------------------------
 # STAGE 2: RUNTIME
@@ -73,7 +69,6 @@ RUN curl -fsSL https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${
     && chmod +x /usr/local/bin/consul
 
 COPY --from=builder /build/backup-worker /usr/local/bin/
-COPY --from=builder /build/workflow-trigger /usr/local/bin/
 
 # Pre-create backup directories (mounted as volumes at runtime)
 RUN mkdir -p /mnt/gdrive/nomad-snapshots \

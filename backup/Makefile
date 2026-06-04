@@ -9,7 +9,11 @@
 
 REGISTRY   ?= registry.munchbox.cc
 IMAGE      := backup-worker
-VERSION    ?= $(shell cat .version 2>/dev/null || echo latest)
+# --- image tag is owned by this dir's .version; never inherited from env ---
+VERSION    := $(strip $(shell cat .version 2>/dev/null))
+ifeq ($(VERSION),)
+$(error .version missing in $(CURDIR) -- each worker owns its own image tag)
+endif
 
 FULL_TAG   := $(REGISTRY)/$(IMAGE):$(VERSION)
 CACHE_TAG  := $(REGISTRY)/$(IMAGE):cache

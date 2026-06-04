@@ -30,6 +30,11 @@ lint: ## Run golangci-lint
 govulncheck: ## Scan for known vulnerabilities
 	govulncheck ./...
 
+# -------------------------------------------------------------------------
+# Each worker image tags from its OWN <dir>/.version; the sub-make reads it
+# in that dir. Root .version (release tag + web image) is unrelated here.
+# -------------------------------------------------------------------------
+
 push-backup: ## Build and push backup-worker image
 	cd backup && $(MAKE) push
 

@@ -66,10 +66,12 @@ func main() {
 
 	// --- Activity dependencies ---
 	acts, err := activities.New(activities.Config{
-		S3Endpoint:  envOrDefault("S3_ENDPOINT", "http://s3-orchestrator.service.consul:9000"),
-		S3Bucket:    envOrDefault("S3_BUCKET", "unified"),
-		S3AccessKey: os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey: os.Getenv("S3_SECRET_KEY"),
+		S3Endpoint:   envOrDefault("S3_ENDPOINT", "http://s3-orchestrator.service.consul:9000"),
+		S3Bucket:     envOrDefault("S3_BUCKET", "unified"),
+		S3AccessKey:  os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey:  os.Getenv("S3_SECRET_KEY"),
+		PostgresHost: envOrDefault("PG_HOST", "postgres-primary.service.consul"),
+		PostgresUser: envOrDefault("PG_USER", "postgres"),
 	})
 	if err != nil {
 		log.Fatalln("Failed to initialize activities:", err)
@@ -91,8 +93,7 @@ func main() {
 	}
 }
 
-// envOrDefault reads an environment variable, returning fallback if unset
-// or empty.
+// envOrDefault reads an environment variable, returning fallback if unset or empty.
 func envOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
