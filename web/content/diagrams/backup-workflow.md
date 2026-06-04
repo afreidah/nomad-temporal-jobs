@@ -4,7 +4,7 @@ linkTitle: "Backup"
 weight: 10
 ---
 
-Sequential backup orchestration showing the snapshot, upload, and retention cleanup flow. **Hover over any step** for implementation details.
+Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreSQL) run in parallel, joining before retention cleanup. The PostgreSQL leg fans per-database dumps out with bounded concurrency. **Hover over any step** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -43,21 +43,20 @@ Sequential backup orchestration showing the snapshot, upload, and retention clea
 (function() {
   var diagramSrc = [
     'flowchart TD',
-    '    START([Backup\\nWorkflow]):::workflow --> DEFAULTS[Apply Retention\\nDefaults]:::workflow',
+    '    START([Backup\\nWorkflow]):::workflow --> DEFAULTS[Apply Config\\nDefaults]:::workflow',
     '    DEFAULTS --> NOMAD_SNAP[Take Nomad\\nSnapshot]:::activity',
+    '    DEFAULTS --> CONSUL_SNAP[Take Consul\\nSnapshot]:::activity',
+    '    DEFAULTS --> PG_GLOBALS[Dump Postgres\\nGlobals]:::activity',
     '    NOMAD_SNAP --> NOMAD_S3{Upload to\\nS3?}:::decision',
-    '    NOMAD_S3 -->|success| CONSUL_SNAP[Take Consul\\nSnapshot]:::activity',
-    '    NOMAD_S3 -->|failure| WARN1[Log Warning\\nContinue]:::decision',
-    '    WARN1 --> CONSUL_SNAP',
+    '    NOMAD_S3 -->|non-fatal| JOIN',
     '    CONSUL_SNAP --> CONSUL_S3{Upload to\\nS3?}:::decision',
-    '    CONSUL_S3 -->|success| PG_DUMP[Take PostgreSQL\\nBackup]:::activity',
-    '    CONSUL_S3 -->|failure| WARN2[Log Warning\\nContinue]:::decision',
-    '    WARN2 --> PG_DUMP',
-    '    PG_DUMP --> PG_S3{Upload to\\nS3?}:::decision',
-    '    PG_S3 -->|success| REG_SNAP[Take Registry\\nBackup]:::activity',
-    '    PG_S3 -->|failure| WARN3[Log Warning\\nContinue]:::decision',
-    '    WARN3 --> REG_SNAP',
-    '    REG_SNAP --> LOCAL_CLEAN[Cleanup Old\\nLocal Backups]:::activity',
+    '    CONSUL_S3 -->|non-fatal| JOIN',
+    '    PG_GLOBALS --> PG_GLOBALS_S3{Upload to\\nS3?}:::decision',
+    '    PG_GLOBALS_S3 -->|non-fatal| PG_LIST[List\\nDatabases]:::activity',
+    '    PG_LIST --> PG_DUMP[Dump Each DB\\nbounded concurrency]:::activity',
+    '    PG_DUMP --> PG_DB_S3{Upload Each\\nto S3?}:::decision',
+    '    PG_DB_S3 -->|non-fatal| JOIN',
+    '    JOIN[Join Legs]:::workflow --> LOCAL_CLEAN[Cleanup Old\\nLocal Backups]:::activity',
     '    LOCAL_CLEAN --> S3_CLEAN[Cleanup Old\\nS3 Backups]:::activity',
     '    S3_CLEAN --> DONE([Workflow\\nComplete]):::workflow',
     '',
@@ -81,12 +80,12 @@ Sequential backup orchestration showing the snapshot, upload, and retention clea
     START: {
       title: 'Backup Workflow',
       badge: 'workflow', badgeText: 'workflow entry',
-      body: '<p>Pure orchestration workflow &mdash; all I/O happens in activities. Receives <code>RetentionConfig</code> with <code>LocalDays</code> and <code>S3Days</code> from the trigger binary.</p><p>Returns <code>BackupResult</code> with all snapshot paths, S3 keys, timestamp, and success status.</p>'
+      body: '<p>Pure orchestration workflow &mdash; all I/O happens in activities. Receives <code>BackupConfig</code> with <code>LocalDays</code>, <code>S3Days</code>, and <code>DumpConcurrency</code> from the schedule input.</p><p>Returns <code>BackupResult</code> with snapshot paths, the per-database list, S3 keys, timestamp, and success status.</p>'
     },
     DEFAULTS: {
-      title: 'Apply Retention Defaults',
+      title: 'Apply Config Defaults',
       badge: 'workflow', badgeText: 'workflow logic',
-      body: '<p>Applies default retention values if not provided:</p><p><code>LocalDays</code>: 7 (local NFS backups)<br><code>S3Days</code>: 30 (offsite S3 backups)</p><p>Configurable via <code>LOCAL_RETENTION_DAYS</code> and <code>S3_RETENTION_DAYS</code> environment variables on the trigger job.</p>'
+      body: '<p>Applies defaults for any unset config value:</p><p><code>LocalDays</code>: 7 (local NFS backups)<br><code>S3Days</code>: 30 (offsite S3 backups)<br><code>DumpConcurrency</code>: 4 (parallel per-database dumps)</p><p>Configurable via <code>LOCAL_RETENTION_DAYS</code>, <code>S3_RETENTION_DAYS</code>, and <code>PG_DUMP_CONCURRENCY</code> on the trigger job. The three legs below then fan out and run concurrently.</p>'
     },
     NOMAD_SNAP: {
       title: 'Take Nomad Snapshot',
@@ -98,60 +97,60 @@ Sequential backup orchestration showing the snapshot, upload, and retention clea
       badge: 'decision', badgeText: 'non-fatal',
       body: '<p>Uploads the Nomad snapshot to S3 under <code>backups/nomad/</code> prefix.</p><p><b>Non-fatal:</b> if the upload fails, a warning is logged and the workflow continues. Local backup is preserved regardless.</p><p>Smart quota handling: on <code>QuotaExceeded</code>, evicts the oldest object and retries up to 3 times.</p>'
     },
-    WARN1: {
-      title: 'S3 Upload Warning',
-      badge: 'decision', badgeText: 'fallback',
-      body: '<p>S3 upload failed but the workflow continues. The Nomad snapshot is safe on local NFS storage.</p><p>Warning logged with the error details for operator review.</p>'
-    },
     CONSUL_SNAP: {
       title: 'Take Consul Snapshot',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Executes <code>consul snapshot save</code> to capture Consul Raft state.</p><p>Output stored on NFS mount with a timestamped filename. Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p><p>Failure terminates the workflow.</p>'
+      body: '<p>Executes <code>consul snapshot save</code> to capture Consul Raft state (includes Vault data).</p><p>Output stored on NFS mount with a timestamped filename. Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p><p>Failure terminates the workflow.</p>'
     },
     CONSUL_S3: {
       title: 'Upload Consul Snapshot to S3',
       badge: 'decision', badgeText: 'non-fatal',
       body: '<p>Uploads the Consul snapshot to S3 under <code>backups/consul/</code> prefix.</p><p><b>Non-fatal:</b> same behavior as Nomad S3 upload. Warning on failure, workflow continues.</p>'
     },
-    WARN2: {
-      title: 'S3 Upload Warning',
-      badge: 'decision', badgeText: 'fallback',
-      body: '<p>Consul S3 upload failed. Local snapshot preserved on NFS.</p>'
+    PG_GLOBALS: {
+      title: 'Dump Postgres Globals',
+      badge: 'activity', badgeText: 'activity',
+      body: '<p>Executes <code>pg_dumpall --globals-only | gzip</code> to capture cluster-wide roles, tablespaces, and grants &mdash; objects a per-database <code>pg_dump</code> omits.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close. Failure terminates the PostgreSQL leg.</p>'
+    },
+    PG_GLOBALS_S3: {
+      title: 'Upload Globals to S3',
+      badge: 'decision', badgeText: 'non-fatal',
+      body: '<p>Uploads the globals dump to S3 under <code>backups/postgres/</code> prefix.</p><p><b>Non-fatal:</b> warning on failure, the leg continues to database enumeration.</p>'
+    },
+    PG_LIST: {
+      title: 'List Databases',
+      badge: 'activity', badgeText: 'activity',
+      body: '<p>Enumerates the cluster\'s user databases. Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p><p>Failure terminates the PostgreSQL leg.</p>'
     },
     PG_DUMP: {
-      title: 'Take PostgreSQL Backup',
-      badge: 'activity', badgeText: 'activity',
-      body: '<p>Executes <code>pg_dumpall | gzip</code> for a full compressed database backup.</p><p>Long timeout: 30 min start-to-close, 60 min schedule-to-close &mdash; PostgreSQL dumps can be large.</p><p>Output stored on NFS mount. Failure terminates the workflow.</p>'
+      title: 'Dump Each Database',
+      badge: 'activity', badgeText: 'fan-out',
+      body: '<p>Dumps each database to its own gzipped file via <code>pg_dump</code>, fanning out with bounded concurrency (<code>DumpConcurrency</code>, default 4).</p><p>Long timeout: 30 min start-to-close, 60 min schedule-to-close, heartbeating every 2 min &mdash; large databases can run long.</p><p>A dump failure fails the leg <i>after</i> every database has been attempted.</p>'
     },
-    PG_S3: {
-      title: 'Upload PostgreSQL Backup to S3',
+    PG_DB_S3: {
+      title: 'Upload Each Database to S3',
       badge: 'decision', badgeText: 'non-fatal',
-      body: '<p>Uploads the compressed PostgreSQL dump to S3 under <code>backups/postgres/</code> prefix.</p><p><b>Non-fatal:</b> same pattern. Local backup preserved on failure.</p>'
+      body: '<p>Uploads each database dump to S3 under <code>backups/postgres/</code> prefix as part of the same bounded-concurrency fan-out.</p><p><b>Non-fatal:</b> a failed upload is logged; the local dump is preserved and the leg continues.</p>'
     },
-    WARN3: {
-      title: 'S3 Upload Warning',
-      badge: 'decision', badgeText: 'fallback',
-      body: '<p>PostgreSQL S3 upload failed. Local dump preserved on NFS.</p>'
-    },
-    REG_SNAP: {
-      title: 'Take Registry Backup',
-      badge: 'activity', badgeText: 'activity',
-      body: '<p>Creates a compressed tar archive (<code>tar -czf</code>) of the container registry data directory.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close. Failure terminates the workflow.</p>'
+    JOIN: {
+      title: 'Join Legs',
+      badge: 'workflow', badgeText: 'workflow logic',
+      body: '<p>Waits for all three legs to finish. Any leg returning a fatal error terminates the workflow before cleanup.</p><p>S3 upload failures are not fatal and do not block the join.</p>'
     },
     LOCAL_CLEAN: {
       title: 'Cleanup Old Local Backups',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Removes local backup files older than <code>LocalDays</code> (default: 7) from the NFS mount.</p><p>Scans the backup directory, checks file modification time, and deletes expired files.</p>'
+      body: '<p>Removes local backup files older than <code>LocalDays</code> (default: 7) from the NFS mount.</p><p>Scans the backup directory, checks file modification time, and deletes expired files. Non-fatal: warning on failure.</p>'
     },
     S3_CLEAN: {
       title: 'Cleanup Old S3 Backups',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Lists and deletes S3 objects older than <code>S3Days</code> (default: 30) from all backup prefixes.</p><p>Uses the S3 ListObjects API with the backup prefix, checks each object\'s LastModified timestamp.</p>'
+      body: '<p>Lists and deletes S3 objects older than <code>S3Days</code> (default: 30) from all backup prefixes.</p><p>Uses the S3 ListObjects API with the backup prefix, checks each object\'s LastModified timestamp. Non-fatal: warning on failure.</p>'
     },
     DONE: {
       title: 'Workflow Complete',
       badge: 'workflow', badgeText: 'result',
-      body: '<p>Returns <code>BackupResult</code> containing:</p><p>All snapshot file paths (Nomad, Consul, PostgreSQL, Registry), S3 keys for successful uploads, timestamp, and success boolean.</p><p>The trigger binary logs the result and exits.</p>'
+      body: '<p>Returns <code>BackupResult</code> containing:</p><p>Nomad and Consul snapshot paths, the Postgres globals path, the per-database list (each with local path and S3 key), S3 keys for successful uploads, timestamp, and success boolean.</p>'
     }
   };
 

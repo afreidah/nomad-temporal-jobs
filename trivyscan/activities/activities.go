@@ -142,6 +142,21 @@ type ScanResult struct {
 	ScannedAt       time.Time       `json:"scanned_at"`
 }
 
+// ScanConfig holds workflow-level configuration passed as input so values
+// are deterministic across replays.
+type ScanConfig struct {
+	// Concurrency bounds how many images scan in parallel so the burst
+	// doesn't overwhelm the Trivy server. Default 10.
+	Concurrency int `json:"concurrency"`
+}
+
+// ApplyDefaults fills any unset field with its fleet-wide default.
+func (c *ScanConfig) ApplyDefaults() {
+	if c.Concurrency <= 0 {
+		c.Concurrency = 10
+	}
+}
+
 // -------------------------------------------------------------------------
 // ACTIVITIES
 // -------------------------------------------------------------------------

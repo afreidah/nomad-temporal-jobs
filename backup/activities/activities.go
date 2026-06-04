@@ -13,6 +13,7 @@
 package activities
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -28,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"go.opentelemetry.io/otel/attribute"
 	"go.temporal.io/sdk/activity"
 )
 
@@ -47,6 +49,9 @@ type Config struct {
 	PostgresBackupDir string // default: /mnt/gdrive/postgres-backups
 	RegistryBackupDir string // default: /mnt/gdrive/registry-backups
 	RegistryDataDir   string // default: /mnt/gdrive/munchbox-data/registry
+
+	PostgresHost string // default: postgres-primary.service.consul
+	PostgresUser string // default: postgres
 }
 
 // Validate checks that required S3 fields are present and applies defaults
@@ -79,6 +84,12 @@ func (c *Config) Validate() error {
 	}
 	if c.RegistryDataDir == "" {
 		c.RegistryDataDir = "/mnt/gdrive/munchbox-data/registry"
+	}
+	if c.PostgresHost == "" {
+		c.PostgresHost = "postgres-primary.service.consul"
+	}
+	if c.PostgresUser == "" {
+		c.PostgresUser = "postgres"
 	}
 	return nil
 }
@@ -117,25 +128,57 @@ func New(cfg Config) (*Activities, error) {
 // TYPES
 // -------------------------------------------------------------------------
 
-// BackupResult contains the outcome of a backup workflow execution.
-type BackupResult struct {
-	NomadSnapshot  string    `json:"nomad_snapshot"`
-	ConsulSnapshot string    `json:"consul_snapshot"`
-	PostgresBackup string    `json:"postgres_backup"`
-	RegistryBackup string    `json:"registry_backup"`
-	NomadS3Key     string    `json:"nomad_s3_key"`
-	ConsulS3Key    string    `json:"consul_s3_key"`
-	PostgresS3Key  string    `json:"postgres_s3_key"`
-	Timestamp      time.Time `json:"timestamp"`
-	Success        bool      `json:"success"`
-	Error          string    `json:"error,omitempty"`
+// DatabaseBackup records the outcome of backing up a single PostgreSQL
+// database: the local dump path and, if the upload succeeded, its S3 key.
+type DatabaseBackup struct {
+	Database  string `json:"database"`
+	LocalPath string `json:"local_path"`
+	S3Key     string `json:"s3_key,omitempty"`
 }
 
-// RetentionConfig holds retention settings passed as workflow input so
-// values are deterministic across replays.
-type RetentionConfig struct {
+// BackupResult contains the outcome of a backup workflow execution. The
+// PostgreSQL leg now produces one dump per database (plus a globals dump)
+// rather than a single cluster-wide file.
+type BackupResult struct {
+	NomadSnapshot  string `json:"nomad_snapshot"`
+	ConsulSnapshot string `json:"consul_snapshot"`
+	NomadS3Key     string `json:"nomad_s3_key"`
+	ConsulS3Key    string `json:"consul_s3_key"`
+
+	PostgresGlobals      string           `json:"postgres_globals"`
+	PostgresGlobalsS3Key string           `json:"postgres_globals_s3_key,omitempty"`
+	PostgresDatabases    []DatabaseBackup `json:"postgres_databases"`
+
+	Timestamp time.Time `json:"timestamp"`
+	Success   bool      `json:"success"`
+	Error     string    `json:"error,omitempty"`
+}
+
+// BackupConfig holds workflow-level configuration passed as input so values
+// are deterministic across replays.
+type BackupConfig struct {
+	// LocalDays is the local-backup retention window. Default 7.
 	LocalDays int `json:"local_days"`
-	S3Days    int `json:"s3_days"`
+	// S3Days is the S3-backup retention window. Default 30.
+	S3Days int `json:"s3_days"`
+	// DumpConcurrency bounds how many per-database pg_dump activities run
+	// at once so the parallel dumps don't overwhelm the primary. Default 4.
+	DumpConcurrency int `json:"dump_concurrency"`
+}
+
+// ApplyDefaults fills in unset fields with their defaults. Called by the
+// workflow before any activities run so the values are deterministic across
+// replay.
+func (c *BackupConfig) ApplyDefaults() {
+	if c.LocalDays <= 0 {
+		c.LocalDays = 7
+	}
+	if c.S3Days <= 0 {
+		c.S3Days = 30
+	}
+	if c.DumpConcurrency <= 0 {
+		c.DumpConcurrency = 4
+	}
 }
 
 // -------------------------------------------------------------------------
@@ -208,15 +251,53 @@ func (a *Activities) TakeConsulSnapshot(ctx context.Context) (string, error) {
 	return filename, nil
 }
 
-// TakePostgresBackup creates a full dump of all PostgreSQL databases
-// compressed with gzip. Uses pg_dumpall so every database, role, and
-// permission set in the cluster is captured. Requires PGPASSWORD in the
-// environment.
-func (a *Activities) TakePostgresBackup(ctx context.Context) (string, error) {
+// ListPostgresDatabases returns the names of all non-template, connectable
+// databases in the cluster. The workflow fans these out into per-database
+// dumps. Requires PGPASSWORD in the environment.
+func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error) {
 	logger := activity.GetLogger(ctx)
 
 	// Client span for postgres edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "postgres.backup",
+	ctx, span := shared.StartClientSpan(ctx, "postgres.list_databases",
+		shared.PeerServiceAttr("postgres-primary"),
+	)
+	defer span.End()
+
+	const query = `SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn = true ORDER BY datname`
+	cmd := exec.CommandContext(ctx, "psql",
+		"-h", a.config.PostgresHost,
+		"-U", a.config.PostgresUser,
+		"-d", "postgres",
+		"-tAc", query)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+os.Getenv("PGPASSWORD"))
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("list databases failed: %w, output: %s", err, stderr.String())
+	}
+
+	var dbs []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			dbs = append(dbs, name)
+		}
+	}
+
+	logger.Info("Discovered PostgreSQL databases", "count", len(dbs))
+	return dbs, nil
+}
+
+// BackupPostgresGlobals dumps cluster-wide objects (roles, tablespaces, and
+// grants) that per-database pg_dump does not capture. Without this, a
+// full-cluster restore would come up with no roles or permissions. Requires
+// PGPASSWORD in the environment.
+func (a *Activities) BackupPostgresGlobals(ctx context.Context) (string, error) {
+	logger := activity.GetLogger(ctx)
+
+	// Client span for postgres edge in service graph
+	ctx, span := shared.StartClientSpan(ctx, "postgres.backup_globals",
 		shared.PeerServiceAttr("postgres-primary"),
 	)
 	defer span.End()
@@ -226,20 +307,63 @@ func (a *Activities) TakePostgresBackup(ctx context.Context) (string, error) {
 	}
 
 	timestamp := time.Now().Format("20060102150405")
-	filename := filepath.Join(a.config.PostgresBackupDir, fmt.Sprintf("postgres-%s.sql.gz", timestamp))
+	filename := filepath.Join(a.config.PostgresBackupDir, fmt.Sprintf("postgres-globals-%s.sql.gz", timestamp))
 
-	// pipefail ensures pg_dumpall failures propagate through the gzip pipe
-	cmd := exec.CommandContext(ctx, "bash", "-c",
-		fmt.Sprintf("set -o pipefail; pg_dumpall -h postgres-primary.service.consul -U postgres | gzip > %s", filename))
+	// Positional args ($1..$3) avoid shell-injection from host/user/path.
+	// pipefail ensures pg_dumpall failures propagate through the gzip pipe.
+	const script = `set -o pipefail; pg_dumpall -h "$1" -U "$2" --globals-only | gzip > "$3"`
+	cmd := exec.CommandContext(ctx, "bash", "-c", script,
+		"bash", a.config.PostgresHost, a.config.PostgresUser, filename)
 	cmd.Env = append(os.Environ(), "PGPASSWORD="+os.Getenv("PGPASSWORD"))
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("postgres backup failed: %w, output: %s", err, output)
+		return "", fmt.Errorf("postgres globals dump failed: %w, output: %s", err, output)
 	}
 
 	if info, statErr := os.Stat(filename); statErr == nil {
-		logger.Info("PostgreSQL backup saved", "path", filename, "size_bytes", info.Size())
+		logger.Info("PostgreSQL globals saved", "path", filename, "size_bytes", info.Size())
+	}
+
+	return filename, nil
+}
+
+// BackupPostgresDatabase dumps a single database to its own gzipped file.
+// Smaller per-database files restore faster and spread across storage more
+// evenly than one cluster-wide dump. Long-running for large databases, so it
+// heartbeats while the dump runs. Requires PGPASSWORD in the environment.
+func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string) (string, error) {
+	logger := activity.GetLogger(ctx)
+
+	// Client span for postgres edge in service graph
+	ctx, span := shared.StartClientSpan(ctx, "postgres.backup_database",
+		attribute.String("postgres.database", database),
+		shared.PeerServiceAttr("postgres-primary"),
+	)
+	defer span.End()
+
+	safe := SanitizeDBName(database)
+	dbDir := filepath.Join(a.config.PostgresBackupDir, safe)
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		return "", fmt.Errorf("create backup dir: %w", err)
+	}
+
+	timestamp := time.Now().Format("20060102150405")
+	filename := filepath.Join(dbDir, fmt.Sprintf("postgres-%s-%s.sql.gz", safe, timestamp))
+
+	// Positional args ($1..$4) avoid shell-injection from the database name.
+	// pipefail ensures pg_dump failures propagate through the gzip pipe.
+	const script = `set -o pipefail; pg_dump -h "$1" -U "$2" -d "$3" | gzip > "$4"`
+	cmd := exec.CommandContext(ctx, "bash", "-c", script,
+		"bash", a.config.PostgresHost, a.config.PostgresUser, database, filename)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+os.Getenv("PGPASSWORD"))
+
+	if err := runCommandWithHeartbeat(ctx, cmd, 30*time.Second); err != nil {
+		return "", fmt.Errorf("postgres dump of %q failed: %w", database, err)
+	}
+
+	if info, statErr := os.Stat(filename); statErr == nil {
+		logger.Info("PostgreSQL database saved", "database", database, "path", filename, "size_bytes", info.Size())
 	}
 
 	return filename, nil
@@ -432,6 +556,59 @@ func isQuotaError(err error) bool {
 	return strings.Contains(err.Error(), "InsufficientStorage") || strings.Contains(err.Error(), "507")
 }
 
+// SanitizeDBName makes a database name safe for use in a backup path (the
+// per-database subdirectory and filename, and the matching S3 prefix) by
+// replacing any character outside [A-Za-z0-9._-] with an underscore.
+func SanitizeDBName(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+			return r
+		default:
+			return '_'
+		}
+	}, s)
+}
+
+// runCommandWithHeartbeat starts cmd and records an activity heartbeat every
+// interval until it finishes, so a long-running dump that stalls trips the
+// activity's HeartbeatTimeout. On context cancellation the process is killed.
+func runCommandWithHeartbeat(ctx context.Context, cmd *exec.Cmd, interval time.Duration) error {
+	var combined bytes.Buffer
+	cmd.Stdout = &combined
+	cmd.Stderr = &combined
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start command: %w", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	ticks := 0
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("%w (output: %s)", err, combined.String())
+			}
+			return nil
+		case <-ticker.C:
+			ticks++
+			activity.RecordHeartbeat(ctx, ticks)
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			return ctx.Err()
+		}
+	}
+}
+
 // deleteOldestObject finds and removes the oldest S3 object under the
 // given prefix, skipping the key currently being uploaded. Used to free
 // quota when an upload fails with 507.
@@ -486,37 +663,39 @@ func cleanupDirectory(dir string, cutoff time.Time, logger interface {
 	Info(string, ...interface{})
 	Warn(string, ...interface{})
 }) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
 			logger.Info("Backup directory does not exist, skipping", "dir", dir)
 			return nil
 		}
-		return fmt.Errorf("read dir %s: %w", dir, err)
+		return fmt.Errorf("stat dir %s: %w", dir, err)
 	}
 
+	// WalkDir recurses so per-database subdirectories are cleaned too.
 	deleted := 0
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
 		}
 
-		name := entry.Name()
+		name := d.Name()
 		isBackup := filepath.Ext(name) == ".snap" ||
 			strings.HasSuffix(name, ".sql.gz") ||
 			strings.HasSuffix(name, ".tar.gz")
 		if !isBackup {
-			continue
+			return nil
 		}
 
-		info, err := entry.Info()
+		info, err := d.Info()
 		if err != nil {
 			logger.Warn("Failed to stat file", "file", name, "error", err)
-			continue
+			return nil
 		}
 
 		if info.ModTime().Before(cutoff) {
-			path := filepath.Join(dir, name)
 			if err := os.Remove(path); err != nil {
 				logger.Warn("Failed to remove old backup", "path", path, "error", err)
 			} else {
@@ -525,6 +704,10 @@ func cleanupDirectory(dir string, cutoff time.Time, logger interface {
 				deleted++
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk dir %s: %w", dir, err)
 	}
 
 	logger.Info("Cleanup complete", "dir", dir, "deleted_count", deleted)

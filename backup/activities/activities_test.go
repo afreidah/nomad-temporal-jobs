@@ -55,6 +55,12 @@ func TestConfig_Validate_AppliesDefaults(t *testing.T) {
 	if cfg.RegistryDataDir != "/mnt/gdrive/munchbox-data/registry" {
 		t.Errorf("RegistryDataDir = %q, want default", cfg.RegistryDataDir)
 	}
+	if cfg.PostgresHost != "postgres-primary.service.consul" {
+		t.Errorf("PostgresHost = %q, want default", cfg.PostgresHost)
+	}
+	if cfg.PostgresUser != "postgres" {
+		t.Errorf("PostgresUser = %q, want default", cfg.PostgresUser)
+	}
 }
 
 func TestConfig_Validate_PreservesCustomDirs(t *testing.T) {
@@ -145,14 +151,56 @@ func TestBackupResult_ZeroValue(t *testing.T) {
 	if r.Success {
 		t.Error("Expected Success=false for zero value")
 	}
-	if r.NomadSnapshot != "" || r.ConsulSnapshot != "" || r.PostgresBackup != "" {
+	if r.NomadSnapshot != "" || r.ConsulSnapshot != "" || r.PostgresGlobals != "" {
 		t.Error("Expected empty paths for zero value")
+	}
+	if len(r.PostgresDatabases) != 0 {
+		t.Error("Expected no databases for zero value")
 	}
 }
 
-func TestRetentionConfig_ZeroValue(t *testing.T) {
-	var r RetentionConfig
-	if r.LocalDays != 0 || r.S3Days != 0 {
-		t.Error("Expected zero retention days for zero value")
+// -------------------------------------------------------------------------
+// BACKUP CONFIG DEFAULTS
+// -------------------------------------------------------------------------
+
+func TestBackupConfig_ApplyDefaults(t *testing.T) {
+	var c BackupConfig
+	c.ApplyDefaults()
+	if c.LocalDays != 7 {
+		t.Errorf("LocalDays = %d, want 7", c.LocalDays)
+	}
+	if c.S3Days != 30 {
+		t.Errorf("S3Days = %d, want 30", c.S3Days)
+	}
+	if c.DumpConcurrency != 4 {
+		t.Errorf("DumpConcurrency = %d, want 4", c.DumpConcurrency)
+	}
+}
+
+func TestBackupConfig_ApplyDefaults_PreservesValues(t *testing.T) {
+	c := BackupConfig{LocalDays: 3, S3Days: 14, DumpConcurrency: 8}
+	c.ApplyDefaults()
+	if c.LocalDays != 3 || c.S3Days != 14 || c.DumpConcurrency != 8 {
+		t.Errorf("ApplyDefaults overwrote set values: %+v", c)
+	}
+}
+
+// -------------------------------------------------------------------------
+// HELPERS
+// -------------------------------------------------------------------------
+
+func TestSanitizeDBName(t *testing.T) {
+	cases := map[string]string{
+		"app":            "app",
+		"my_db-1":        "my_db-1",
+		"weird name":     "weird_name",
+		"drop;table":     "drop_table",
+		"a/b\\c":         "a_b_c",
+		"backups.legacy": "backups.legacy",
+	}
+	for in, want := range cases {
+		if got := SanitizeDBName(in); got != want {
+			t.Errorf("SanitizeDBName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

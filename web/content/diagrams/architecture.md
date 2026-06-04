@@ -4,7 +4,7 @@ linkTitle: "Architecture"
 weight: -1
 ---
 
-High-level architecture of the Temporal workers showing the trigger flow, worker domains, external services, and observability stack. **Hover over any component** for implementation details.
+High-level architecture of the Temporal workers showing the schedule flow, worker domains, external services, and observability stack. **Hover over any component** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -47,8 +47,7 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
 (function() {
   var diagramSrc = [
     'flowchart TD',
-    '    CRON([Nomad Periodic\\nJobs]):::entry --> TRIGGER[Workflow\\nTrigger Binary]:::entry',
-    '    TRIGGER --> TEMPORAL[Temporal\\nServer]:::middleware',
+    '    SCHED([Temporal Schedules\\nTerraform-managed]):::entry --> TEMPORAL[Temporal\\nServer]:::middleware',
     '',
     '    TEMPORAL --> BTQ[backup\\ntask-queue]:::middleware',
     '    TEMPORAL --> TTQ[trivy\\ntask-queue]:::middleware',
@@ -76,7 +75,6 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
     '    TWORKER --> PROM',
     '    CWORKER --> TEMPO',
     '    CWORKER --> PROM',
-    '    TRIGGER --> TEMPO',
     '',
     '    BWORKER --> LOKI[Loki\\nLogging]:::observability',
     '    TWORKER --> LOKI',
@@ -101,15 +99,10 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
   });
 
   var nodeInfo = {
-    CRON: {
-      title: 'Nomad Periodic Jobs',
+    SCHED: {
+      title: 'Temporal Schedules',
       badge: 'entry', badgeText: 'scheduler',
-      body: '<p>Nomad periodic batch jobs trigger the workflows on schedule &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC).</p><p>Each job runs the shared trigger binary with <code>WORKFLOW_NAME</code> set to the target workflow.</p>'
-    },
-    TRIGGER: {
-      title: 'Workflow Trigger Binary',
-      badge: 'entry', badgeText: 'dispatcher',
-      body: '<p>Single Go binary (<code>cmd/trigger/main.go</code>) that dispatches all workflows. Initializes OTel tracing, connects to Temporal, and starts the workflow selected by <code>WORKFLOW_NAME</code> env var.</p><p>Supports: <code>backup</code>, <code>trivy</code>, <code>cleanup</code>, <code>registry-gc</code>. Passes configuration via environment variables (<code>LOCAL_RETENTION_DAYS</code>, <code>S3_RETENTION_DAYS</code>, <code>GRACE_DAYS</code>, <code>DRY_RUN</code>, <code>DELETE_UNTAGGED</code>, etc.).</p><p>Waits for completion and logs the result before exiting.</p>'
+      body: '<p>Temporal Schedules start each workflow on cron &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
     },
     TEMPORAL: {
       title: 'Temporal Server',
@@ -139,7 +132,7 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
     TWORKER: {
       title: 'Trivy Scan Worker',
       badge: 'handler', badgeText: 'worker',
-      body: '<p>Discovers all running Docker images from Nomad allocations and scans them in parallel batches of 10 using a Trivy server.</p><p>Errors are classified: <b>transient</b> (connection refused, timeout) trigger retries; <b>permanent</b> (manifest unknown, not found) are logged and skipped.</p><p>Results saved individually to PostgreSQL to stay under the 2MB Temporal payload limit. Aggregate CVE counts logged at completion.</p><p><a href="../trivyscan-workflow/">Trivy scan workflow diagram &rarr;</a></p>'
+      body: '<p>Discovers all running Docker images from Nomad allocations and scans them with bounded concurrency using a Trivy server.</p><p>Errors are classified: <b>transient</b> (connection refused, timeout) trigger retries; <b>permanent</b> (manifest unknown, not found) are logged and skipped.</p><p>Results saved individually to PostgreSQL to stay under the 2MB Temporal payload limit. Aggregate CVE counts logged at completion.</p><p><a href="../trivyscan-workflow/">Trivy scan workflow diagram &rarr;</a></p>'
     },
     CWORKER: {
       title: 'Cleanup Worker',
@@ -179,7 +172,7 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
     TEMPO: {
       title: 'Tempo (Tracing)',
       badge: 'observability', badgeText: 'observability',
-      body: '<p>Distributed tracing backend. All workers export spans via OTLP gRPC (default: <code>tempo.service.consul:4317</code>).</p><p>Client spans with <code>peer.service</code> attributes produce service graph edges in Grafana for every external call. The trigger binary also traces its workflow dispatch call.</p>'
+      body: '<p>Distributed tracing backend. All workers export spans via OTLP gRPC (default: <code>tempo.service.consul:4317</code>).</p><p>Client spans with <code>peer.service</code> attributes produce service graph edges in Grafana for every external call.</p>'
     },
     PROM: {
       title: 'Prometheus (Metrics)',
@@ -316,7 +309,7 @@ High-level architecture of the Temporal workers showing the trigger flow, worker
 
 | Color | Meaning |
 |-------|---------|
-| <span style="color:#34d399">**Emerald**</span> | Entry points (schedulers, triggers) |
+| <span style="color:#34d399">**Emerald**</span> | Entry points (schedules) |
 | <span style="color:#14b8a6">**Teal**</span> | Middleware (Temporal, task queues) |
 | <span style="color:#a78bfa">**Purple**</span> | Workers |
 | <span style="color:#3fb950">**Green**</span> | External data stores & services |

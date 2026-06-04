@@ -4,8 +4,8 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Tests workflow orchestration using the Temporal test suite. Activities are
-// mocked to verify the workflow calls them in the correct order with the
-// correct arguments, without requiring Trivy, Nomad, or PostgreSQL.
+// mocked to verify the bounded-concurrency scan fan-out, graceful scan-failure
+// handling, and config defaults, without requiring Trivy, Nomad, or PostgreSQL.
 // -------------------------------------------------------------------------------
 
 package workflows
@@ -14,14 +14,14 @@ import (
 	"testing"
 	"time"
 
-	"go.temporal.io/sdk/testsuite"
 	"github.com/stretchr/testify/mock"
+	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/trivyscan/activities"
 )
 
-// TestScan_Success verifies the happy path: discover images, scan in batch,
-// save results.
+// TestScan_Success verifies the happy path: discover images, scan with
+// bounded concurrency, save each result.
 func TestScan_Success(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
@@ -46,7 +46,7 @@ func TestScan_Success(t *testing.T) {
 	env.OnActivity(a.SaveScanResult, mock.Anything, scanResult).Return(nil)
 	env.OnActivity(a.SaveScanResult, mock.Anything, scanResult2).Return(nil)
 
-	env.ExecuteWorkflow(Scan)
+	env.ExecuteWorkflow(Scan, activities.ScanConfig{Concurrency: 2})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
@@ -64,7 +64,7 @@ func TestScan_NoImages(t *testing.T) {
 
 	env.OnActivity(a.GetRunningImages, mock.Anything).Return([]string{}, nil)
 
-	env.ExecuteWorkflow(Scan)
+	env.ExecuteWorkflow(Scan, activities.ScanConfig{Concurrency: 2})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
@@ -83,7 +83,7 @@ func TestScan_GetImagesFailure(t *testing.T) {
 	env.OnActivity(a.GetRunningImages, mock.Anything).
 		Return(nil, testsuite.ErrMockStartChildWorkflowFailed)
 
-	env.ExecuteWorkflow(Scan)
+	env.ExecuteWorkflow(Scan, activities.ScanConfig{Concurrency: 2})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
@@ -115,12 +115,36 @@ func TestScan_ScanFailureContinues(t *testing.T) {
 	env.OnActivity(a.SaveScanResult, mock.Anything, goodResult).Return(nil)
 	env.OnActivity(a.SaveScanResult, mock.Anything, mock.Anything).Return(nil)
 
-	env.ExecuteWorkflow(Scan)
+	env.ExecuteWorkflow(Scan, activities.ScanConfig{Concurrency: 2})
 
 	if !env.IsWorkflowCompleted() {
 		t.Fatal("Workflow did not complete")
 	}
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("Workflow should succeed even with scan failures: %v", err)
+	}
+}
+
+// TestScan_Defaults verifies a zero-value config gets a positive concurrency
+// default; a zero would size the semaphore at 0 and deadlock the fan-out, so
+// a clean completion proves ApplyDefaults ran.
+func TestScan_Defaults(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	images := []string{"nginx:latest"}
+	result := activities.ScanResult{Image: "nginx:latest", Status: "success", ScannedAt: time.Now()}
+
+	env.OnActivity(a.GetRunningImages, mock.Anything).Return(images, nil)
+	env.OnActivity(a.ScanImage, mock.Anything, "nginx:latest").Return(result, nil)
+	env.OnActivity(a.SaveScanResult, mock.Anything, mock.Anything).Return(nil)
+
+	env.ExecuteWorkflow(Scan, activities.ScanConfig{})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("Workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("Workflow failed: %v", err)
 	}
 }

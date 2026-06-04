@@ -143,12 +143,12 @@ Parallel image scanning orchestration showing discovery, batched scans, error cl
     SUMMARY: {
       title: 'Log Aggregate CVE Counts',
       badge: 'workflow', badgeText: 'summary',
-      body: '<p>Aggregates vulnerability counts across all scanned images and logs totals by severity level.</p><p>Emits a warning if any critical or high severity CVEs were found. The counts are returned as part of the workflow result for the trigger binary to log.</p>'
+      body: '<p>Aggregates vulnerability counts across all scanned images and logs totals by severity level.</p><p>Emits a warning if any critical or high severity CVEs were found. The counts are returned as part of the workflow result.</p>'
     },
     DONE: {
       title: 'Workflow Complete',
       badge: 'workflow', badgeText: 'result',
-      body: '<p>Returns the aggregate scan results. The trigger binary logs the outcome and exits.</p>'
+      body: '<p>Returns the aggregate scan results.</p>'
     }
   };
 

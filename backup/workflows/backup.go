@@ -3,16 +3,19 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// Orchestrates sequential snapshots of Nomad, Consul (includes Vault),
-// PostgreSQL, and the container registry. Each snapshot is uploaded to S3
-// for off-site redundancy, followed by retention-based cleanup of both
-// local and S3 backups. Pure orchestration logic -- all I/O happens in
-// activities.
+// Snapshots Nomad Raft state, Consul Raft state (includes Vault), and
+// PostgreSQL. The three legs are independent and run concurrently, joining
+// before retention cleanup. The PostgreSQL leg dumps each database to its own
+// file plus a globals dump for cluster-wide roles/grants, fanning the
+// per-database dumps out with bounded concurrency. Pure orchestration --
+// all I/O happens in activities.
 // -------------------------------------------------------------------------------
 
 package workflows
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -24,115 +27,84 @@ import (
 // --- Nil-typed activity stub for compile-time method references ---
 var a *activities.Activities
 
-// Backup orchestrates the full infrastructure backup sequence. Snapshots
-// execute sequentially since each depends on cluster stability; S3 uploads
-// are non-fatal. Retention config is passed as workflow input to avoid
-// non-deterministic environment reads during replay.
-func Backup(ctx workflow.Context, retention activities.RetentionConfig) (*activities.BackupResult, error) {
+var retryStandard = &temporal.RetryPolicy{
+	InitialInterval:    time.Second,
+	BackoffCoefficient: 2.0,
+	MaximumInterval:    time.Minute,
+	MaximumAttempts:    3,
+}
+
+// quickOpts covers fast operations: snapshots, database listing, the globals
+// dump, S3 uploads, and retention cleanup.
+var quickOpts = workflow.ActivityOptions{
+	StartToCloseTimeout:    5 * time.Minute,
+	ScheduleToCloseTimeout: 15 * time.Minute,
+	RetryPolicy:            retryStandard,
+}
+
+// longOpts covers per-database pg_dump, which can run long for large
+// databases and therefore heartbeats.
+var longOpts = workflow.ActivityOptions{
+	StartToCloseTimeout:    30 * time.Minute,
+	ScheduleToCloseTimeout: 60 * time.Minute,
+	HeartbeatTimeout:       2 * time.Minute,
+	RetryPolicy:            retryStandard,
+}
+
+const (
+	s3PrefixNomad    = "backups/nomad"
+	s3PrefixConsul   = "backups/consul"
+	s3PrefixPostgres = "backups/postgres"
+)
+
+// Backup runs the three snapshot legs concurrently, then retention cleanup
+// once they all finish.
+func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.BackupResult, error) {
 	logger := workflow.GetLogger(ctx)
-	logger.Info("Starting backup workflow")
-
-	// --- Apply retention defaults ---
-	if retention.LocalDays <= 0 {
-		retention.LocalDays = 7
-	}
-	if retention.S3Days <= 0 {
-		retention.S3Days = 30
-	}
-
-	// --- Activity options for quick snapshots (Nomad, Consul) ---
-	quickOpts := workflow.ActivityOptions{
-		StartToCloseTimeout:    5 * time.Minute,
-		ScheduleToCloseTimeout: 15 * time.Minute,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    time.Second,
-			BackoffCoefficient: 2.0,
-			MaximumInterval:    time.Minute,
-			MaximumAttempts:    3,
-		},
-	}
-
-	// --- Activity options for large backups (PostgreSQL, Registry) ---
-	longOpts := workflow.ActivityOptions{
-		StartToCloseTimeout:    30 * time.Minute,
-		ScheduleToCloseTimeout: 60 * time.Minute,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    time.Second,
-			BackoffCoefficient: 2.0,
-			MaximumInterval:    time.Minute,
-			MaximumAttempts:    3,
-		},
-	}
-
-	quickCtx := workflow.WithActivityOptions(ctx, quickOpts)
-	longCtx := workflow.WithActivityOptions(ctx, longOpts)
+	config.ApplyDefaults()
+	logger.Info("Starting backup workflow",
+		"local_days", config.LocalDays,
+		"s3_days", config.S3Days,
+		"dump_concurrency", config.DumpConcurrency)
 
 	result := &activities.BackupResult{
 		Timestamp: workflow.Now(ctx),
 	}
 
-	// --- Nomad snapshot ---
-	logger.Info("Taking Nomad snapshot")
-	var nomadPath string
-	if err := workflow.ExecuteActivity(quickCtx, a.TakeNomadSnapshot).Get(ctx, &nomadPath); err != nil {
-		result.Error = "Nomad backup failed: " + err.Error()
+	var nomadErr, consulErr, pgErr error
+	wg := workflow.NewWaitGroup(ctx)
+	wg.Add(3)
+
+	workflow.Go(ctx, func(gctx workflow.Context) {
+		defer wg.Done()
+		nomadErr = snapshotLeg(gctx, a.TakeNomadSnapshot, s3PrefixNomad, &result.NomadSnapshot, &result.NomadS3Key)
+	})
+	workflow.Go(ctx, func(gctx workflow.Context) {
+		defer wg.Done()
+		consulErr = snapshotLeg(gctx, a.TakeConsulSnapshot, s3PrefixConsul, &result.ConsulSnapshot, &result.ConsulS3Key)
+	})
+	workflow.Go(ctx, func(gctx workflow.Context) {
+		defer wg.Done()
+		pgErr = postgresLeg(gctx, config, result)
+	})
+
+	wg.Wait(ctx)
+
+	// Snapshot failures are fatal; uploads and cleanup are not.
+	if err := errors.Join(nomadErr, consulErr, pgErr); err != nil {
+		result.Error = err.Error()
 		return result, err
 	}
-	result.NomadSnapshot = nomadPath
 
-	// S3 upload (non-fatal)
-	var nomadS3Key string
-	if err := workflow.ExecuteActivity(quickCtx, a.UploadToS3, nomadPath, "backups/nomad").Get(ctx, &nomadS3Key); err != nil {
-		logger.Warn("Nomad S3 upload failed", "error", err)
-	} else {
-		result.NomadS3Key = nomadS3Key
-	}
+	quickCtx := workflow.WithActivityOptions(ctx, quickOpts)
 
-	// --- Consul snapshot (includes Vault data) ---
-	logger.Info("Taking Consul snapshot")
-	var consulPath string
-	if err := workflow.ExecuteActivity(quickCtx, a.TakeConsulSnapshot).Get(ctx, &consulPath); err != nil {
-		result.Error = "Consul backup failed: " + err.Error()
-		return result, err
-	}
-	result.ConsulSnapshot = consulPath
-
-	var consulS3Key string
-	if err := workflow.ExecuteActivity(quickCtx, a.UploadToS3, consulPath, "backups/consul").Get(ctx, &consulS3Key); err != nil {
-		logger.Warn("Consul S3 upload failed", "error", err)
-	} else {
-		result.ConsulS3Key = consulS3Key
-	}
-
-	// --- PostgreSQL backup ---
-	logger.Info("Taking PostgreSQL backup")
-	var pgPath string
-	if err := workflow.ExecuteActivity(longCtx, a.TakePostgresBackup).Get(ctx, &pgPath); err != nil {
-		result.Error = "PostgreSQL backup failed: " + err.Error()
-		return result, err
-	}
-	result.PostgresBackup = pgPath
-
-	var pgS3Key string
-	if err := workflow.ExecuteActivity(longCtx, a.UploadToS3, pgPath, "backups/postgres").Get(ctx, &pgS3Key); err != nil {
-		logger.Warn("PostgreSQL S3 upload failed", "error", err)
-	} else {
-		result.PostgresS3Key = pgS3Key
-	}
-
-	// Registry backup disabled -- 48GB of Docker layers, too large for
-	// local storage and S3. Container images are already stored in the
-	// registry and can be rebuilt from source.
-
-	// --- Cleanup old local backups ---
-	logger.Info("Cleaning up old local backups", "retention_days", retention.LocalDays)
-	if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldBackups, retention.LocalDays).Get(ctx, nil); err != nil {
+	logger.Info("Cleaning up old local backups", "retention_days", config.LocalDays)
+	if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldBackups, config.LocalDays).Get(ctx, nil); err != nil {
 		logger.Warn("Local cleanup failed", "error", err)
 	}
 
-	// --- Cleanup old S3 backups ---
-	logger.Info("Cleaning up old S3 backups", "retention_days", retention.S3Days)
-	if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldS3Backups, retention.S3Days).Get(ctx, nil); err != nil {
+	logger.Info("Cleaning up old S3 backups", "retention_days", config.S3Days)
+	if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldS3Backups, config.S3Days).Get(ctx, nil); err != nil {
 		logger.Warn("S3 cleanup failed", "error", err)
 	}
 
@@ -140,8 +112,100 @@ func Backup(ctx workflow.Context, retention activities.RetentionConfig) (*activi
 	logger.Info("Backup workflow complete",
 		"nomad", result.NomadSnapshot,
 		"consul", result.ConsulSnapshot,
-		"postgres", result.PostgresBackup,
-		"registry", result.RegistryBackup)
+		"postgres_globals", result.PostgresGlobals,
+		"postgres_databases", len(result.PostgresDatabases))
 
 	return result, nil
+}
+
+// snapshotLeg takes one snapshot and uploads it. The snapshot is fatal; the
+// upload is non-fatal. pathOut/keyOut are written in place.
+func snapshotLeg(ctx workflow.Context, snapshotFn any, s3Prefix string, pathOut, keyOut *string) error {
+	logger := workflow.GetLogger(ctx)
+	cctx := workflow.WithActivityOptions(ctx, quickOpts)
+
+	var path string
+	if err := workflow.ExecuteActivity(cctx, snapshotFn).Get(cctx, &path); err != nil {
+		return fmt.Errorf("%s snapshot: %w", s3Prefix, err)
+	}
+	*pathOut = path
+
+	var key string
+	if err := workflow.ExecuteActivity(cctx, a.UploadToS3, path, s3Prefix).Get(cctx, &key); err != nil {
+		logger.Warn("S3 upload failed", "prefix", s3Prefix, "error", err)
+	} else {
+		*keyOut = key
+	}
+	return nil
+}
+
+// postgresLeg dumps cluster globals, lists the databases, and dumps + uploads
+// each one with bounded concurrency. Globals and the listing are fatal;
+// uploads are not; a database dump failure fails the leg after every database
+// has been attempted.
+func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *activities.BackupResult) error {
+	logger := workflow.GetLogger(ctx)
+	quickCtx := workflow.WithActivityOptions(ctx, quickOpts)
+
+	var globalsPath string
+	if err := workflow.ExecuteActivity(quickCtx, a.BackupPostgresGlobals).Get(quickCtx, &globalsPath); err != nil {
+		return fmt.Errorf("postgres globals: %w", err)
+	}
+	result.PostgresGlobals = globalsPath
+
+	var globalsKey string
+	if err := workflow.ExecuteActivity(quickCtx, a.UploadToS3, globalsPath, s3PrefixPostgres).Get(quickCtx, &globalsKey); err != nil {
+		logger.Warn("Postgres globals S3 upload failed", "error", err)
+	} else {
+		result.PostgresGlobalsS3Key = globalsKey
+	}
+
+	var dbs []string
+	if err := workflow.ExecuteActivity(quickCtx, a.ListPostgresDatabases).Get(quickCtx, &dbs); err != nil {
+		return fmt.Errorf("list postgres databases: %w", err)
+	}
+	logger.Info("Backing up databases", "count", len(dbs), "concurrency", config.DumpConcurrency)
+
+	backups := make([]activities.DatabaseBackup, len(dbs))
+	dumpErrs := make([]error, len(dbs))
+
+	sem := workflow.NewBufferedChannel(ctx, config.DumpConcurrency)
+	inner := workflow.NewWaitGroup(ctx)
+	for i, db := range dbs {
+		inner.Add(1)
+		workflow.Go(ctx, func(gctx workflow.Context) {
+			defer inner.Done()
+			sem.Send(gctx, nil) // acquire a slot
+			defer sem.Receive(gctx, nil)
+
+			qCtx := workflow.WithActivityOptions(gctx, quickOpts)
+			lCtx := workflow.WithActivityOptions(gctx, longOpts)
+
+			entry := activities.DatabaseBackup{Database: db}
+			var path string
+			if err := workflow.ExecuteActivity(lCtx, a.BackupPostgresDatabase, db).Get(lCtx, &path); err != nil {
+				dumpErrs[i] = fmt.Errorf("dump %q: %w", db, err)
+				backups[i] = entry
+				return
+			}
+			entry.LocalPath = path
+
+			// Each database uploads under its own subdir: backups/postgres/<db>/.
+			dbPrefix := s3PrefixPostgres + "/" + activities.SanitizeDBName(db)
+			var key string
+			if err := workflow.ExecuteActivity(qCtx, a.UploadToS3, path, dbPrefix).Get(qCtx, &key); err != nil {
+				logger.Warn("Postgres database S3 upload failed", "database", db, "error", err)
+			} else {
+				entry.S3Key = key
+			}
+			backups[i] = entry
+		})
+	}
+	inner.Wait(ctx)
+	result.PostgresDatabases = backups
+
+	if err := errors.Join(dumpErrs...); err != nil {
+		return fmt.Errorf("one or more database dumps failed: %w", err)
+	}
+	return nil
 }

@@ -87,7 +87,7 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
     START: {
       title: 'RegistryGC Workflow',
       badge: 'workflow', badgeText: 'workflow entry',
-      body: '<p>Orchestrates a saga that garbage-collects the Docker registry while guaranteeing it never stays offline.</p><p>Receives <code>RegistryGCConfig</code> with <code>JobName</code>, <code>GroupName</code>, <code>RegistryDataDir</code>, <code>RegistryImage</code>, <code>DryRun</code>, and <code>DeleteUntagged</code> from the trigger binary. Runs on the cleanup worker / <code>cleanup-task-queue</code>.</p>'
+      body: '<p>Orchestrates a saga that garbage-collects the Docker registry while guaranteeing it never stays offline.</p><p>Receives <code>RegistryGCConfig</code> with <code>JobName</code>, <code>GroupName</code>, <code>RegistryDataDir</code>, <code>RegistryImage</code>, <code>DryRun</code>, and <code>DeleteUntagged</code> from the schedule input. Runs on the cleanup worker / <code>cleanup-task-queue</code>.</p>'
     },
     DEFAULTS: {
       title: 'Apply Config Defaults',
@@ -142,7 +142,7 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
     REPORT: {
       title: 'Compute Bytes Reclaimed',
       badge: 'workflow', badgeText: 'summary',
-      body: '<p>Folds the activity results into <code>RegistryGCResult</code>: node name/address, blobs deleted, before/after sizes, and bytes reclaimed. The trigger binary logs the outcome.</p>'
+      body: '<p>Folds the activity results into <code>RegistryGCResult</code>: node name/address, blobs deleted, before/after sizes, and bytes reclaimed.</p>'
     },
     COMP: {
       title: 'Compensation: Scale Back to 1',

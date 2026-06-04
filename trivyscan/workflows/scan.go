@@ -3,10 +3,10 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// Orchestrates vulnerability scanning of all running container images in the
-// Nomad cluster. Discovers images, scans them in parallel batches via Trivy
-// server, and persists CVE results to PostgreSQL. Pure orchestration logic
-// with no side effects -- all I/O happens in activities.
+// Discovers running container images across the Nomad cluster, scans them
+// through the Trivy server with bounded concurrency, and persists each CVE
+// result to PostgreSQL. Scan failures are recorded with error status and do
+// not block the run. Pure orchestration -- all I/O happens in activities.
 // -------------------------------------------------------------------------------
 
 package workflows
@@ -21,114 +21,71 @@ import (
 	"munchbox/temporal-workers/trivyscan/activities"
 )
 
-const batchSize = 10
-
 // --- Nil-typed activity stub for compile-time method references ---
 var a *activities.Activities
 
-// Scan orchestrates image vulnerability scanning across the cluster.
-// Images are scanned in parallel batches; results are saved as a single
-// batch to PostgreSQL. Transient scan failures (trivy server down) are
-// retried by Temporal. Permanent failures (image not found) are recorded
-// with error status and do not block the workflow.
-func Scan(ctx workflow.Context) error {
+var retryStandard = &temporal.RetryPolicy{
+	InitialInterval:    time.Second,
+	BackoffCoefficient: 2.0,
+	MaximumInterval:    time.Minute,
+	MaximumAttempts:    3,
+}
+
+// quickOpts covers fast operations: image discovery and result saves.
+var quickOpts = workflow.ActivityOptions{
+	StartToCloseTimeout:    5 * time.Minute,
+	ScheduleToCloseTimeout: 15 * time.Minute,
+	RetryPolicy:            retryStandard,
+}
+
+// scanOpts covers per-image Trivy scans, which run longer.
+var scanOpts = workflow.ActivityOptions{
+	StartToCloseTimeout:    30 * time.Minute,
+	ScheduleToCloseTimeout: 60 * time.Minute,
+	RetryPolicy:            retryStandard,
+}
+
+// Scan discovers running images and scans them with bounded concurrency,
+// saving each result individually to stay under Temporal's payload limit.
+func Scan(ctx workflow.Context, config activities.ScanConfig) error {
 	logger := workflow.GetLogger(ctx)
-	logger.Info("Starting trivy scan workflow")
+	config.ApplyDefaults()
+	logger.Info("Starting trivy scan workflow", "concurrency", config.Concurrency)
 
-	// --- Activity options for quick operations (discovery, saving) ---
-	defaultOpts := workflow.ActivityOptions{
-		StartToCloseTimeout:    5 * time.Minute,
-		ScheduleToCloseTimeout: 15 * time.Minute,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    time.Second,
-			BackoffCoefficient: 2.0,
-			MaximumInterval:    time.Minute,
-			MaximumAttempts:    3,
-		},
-	}
-
-	// --- Activity options for scanning (longer timeout, no heartbeat) ---
-	scanOpts := workflow.ActivityOptions{
-		StartToCloseTimeout:    30 * time.Minute,
-		ScheduleToCloseTimeout: 60 * time.Minute,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    time.Second,
-			BackoffCoefficient: 2.0,
-			MaximumInterval:    time.Minute,
-			MaximumAttempts:    3,
-		},
-	}
-
-	defaultCtx := workflow.WithActivityOptions(ctx, defaultOpts)
+	quickCtx := workflow.WithActivityOptions(ctx, quickOpts)
 
 	// --- Discover running images ---
 	var images []string
-	err := workflow.ExecuteActivity(defaultCtx, a.GetRunningImages).Get(ctx, &images)
-	if err != nil {
-		return fmt.Errorf("failed to get running images: %w", err)
+	if err := workflow.ExecuteActivity(quickCtx, a.GetRunningImages).Get(quickCtx, &images); err != nil {
+		return fmt.Errorf("get running images: %w", err)
 	}
 	logger.Info("Found images to scan", "count", len(images))
 
-	// --- Scan in batches ---
-	var totalCritical, totalHigh, totalScans int
+	// --- Bounded-concurrency scan + save per image ---
+	results := make([]activities.ScanResult, len(images))
 
-	for i := 0; i < len(images); i += batchSize {
-		end := min(i+batchSize, len(images))
-		batch := images[i:end]
-		logger.Info("Processing batch", "batch", i/batchSize+1, "images", len(batch))
+	sem := workflow.NewBufferedChannel(ctx, config.Concurrency)
+	wg := workflow.NewWaitGroup(ctx)
+	for i, img := range images {
+		wg.Add(1)
+		workflow.Go(ctx, func(gctx workflow.Context) {
+			defer wg.Done()
+			sem.Send(gctx, nil) // acquire a slot
+			defer sem.Receive(gctx, nil)
 
-		// --- Launch parallel scans for this batch ---
-		type scanFuture struct {
-			image  string
-			future workflow.Future
-		}
-		futures := make([]scanFuture, len(batch))
-		for j, img := range batch {
-			scanCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-				ActivityID:             fmt.Sprintf("ScanImage:%s", img),
-				StartToCloseTimeout:    scanOpts.StartToCloseTimeout,
-				ScheduleToCloseTimeout: scanOpts.ScheduleToCloseTimeout,
-				RetryPolicy:            scanOpts.RetryPolicy,
-			})
-			futures[j] = scanFuture{
-				image:  img,
-				future: workflow.ExecuteActivity(scanCtx, a.ScanImage, img),
-			}
-		}
+			results[i] = scanImage(gctx, img)
+		})
+	}
+	wg.Wait(ctx)
 
-		// --- Collect results and save individually ---
-		for _, sf := range futures {
-			var result activities.ScanResult
-			err := sf.future.Get(ctx, &result)
-			if err != nil {
-				logger.Warn("Scan activity error", "image", sf.image, "error", err)
-				result = activities.ScanResult{
-					Image:     sf.image,
-					Status:    "error",
-					Error:     err.Error(),
-					ScannedAt: workflow.Now(ctx),
-				}
-			}
-
-			// Save each result individually to stay under Temporal's 2MB payload limit
-			saveCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-				ActivityID:             fmt.Sprintf("SaveScan:%s", sf.image),
-				StartToCloseTimeout:    defaultOpts.StartToCloseTimeout,
-				ScheduleToCloseTimeout: defaultOpts.ScheduleToCloseTimeout,
-				RetryPolicy:            defaultOpts.RetryPolicy,
-			})
-			if saveErr := workflow.ExecuteActivity(saveCtx, a.SaveScanResult, result).Get(ctx, nil); saveErr != nil {
-				logger.Error("Failed to save scan result", "image", sf.image, "error", saveErr)
-			}
-
-			totalCritical += result.CriticalCount
-			totalHigh += result.HighCount
-			totalScans++
-		}
+	var totalCritical, totalHigh int
+	for _, r := range results {
+		totalCritical += r.CriticalCount
+		totalHigh += r.HighCount
 	}
 
 	logger.Info("Trivy scan complete",
-		"images", totalScans,
+		"images", len(results),
 		"critical", totalCritical,
 		"high", totalHigh)
 
@@ -137,4 +94,36 @@ func Scan(ctx workflow.Context) error {
 	}
 
 	return nil
+}
+
+// scanImage scans one image and saves the result. A scan failure is recorded
+// as an error-status result rather than propagated; a save failure is logged.
+// Both activities run with a stable per-image ActivityID for dedup/traceability.
+func scanImage(ctx workflow.Context, image string) activities.ScanResult {
+	logger := workflow.GetLogger(ctx)
+
+	scanCtx := workflow.WithActivityOptions(ctx, withActivityID(scanOpts, "ScanImage:"+image))
+	var result activities.ScanResult
+	if err := workflow.ExecuteActivity(scanCtx, a.ScanImage, image).Get(scanCtx, &result); err != nil {
+		logger.Warn("Scan activity error", "image", image, "error", err)
+		result = activities.ScanResult{
+			Image:     image,
+			Status:    "error",
+			Error:     err.Error(),
+			ScannedAt: workflow.Now(ctx),
+		}
+	}
+
+	saveCtx := workflow.WithActivityOptions(ctx, withActivityID(quickOpts, "SaveScan:"+image))
+	if err := workflow.ExecuteActivity(saveCtx, a.SaveScanResult, result).Get(saveCtx, nil); err != nil {
+		logger.Error("Failed to save scan result", "image", image, "error", err)
+	}
+
+	return result
+}
+
+// withActivityID returns a copy of opts with a stable ActivityID set.
+func withActivityID(opts workflow.ActivityOptions, id string) workflow.ActivityOptions {
+	opts.ActivityID = id
+	return opts
 }
