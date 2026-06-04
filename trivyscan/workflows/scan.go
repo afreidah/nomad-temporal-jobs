@@ -79,9 +79,9 @@ func Scan(ctx workflow.Context, config activities.ScanConfig) error {
 	wg.Wait(ctx)
 
 	var totalCritical, totalHigh int
-	for _, r := range results {
-		totalCritical += r.CriticalCount
-		totalHigh += r.HighCount
+	for i := range results {
+		totalCritical += results[i].CriticalCount
+		totalHigh += results[i].HighCount
 	}
 
 	logger.Info("Trivy scan complete",
