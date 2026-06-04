@@ -39,18 +39,18 @@ func TestRegistryGC_HappyPath(t *testing.T) {
 		ID: "node-1", Name: "stabler", Address: "192.168.68.61",
 	}
 
-	env.OnActivity(a.FindRegistryNode, mock.Anything, expandedCfg.JobName).Return(node, nil)
-	env.OnActivity(a.MeasureRegistryDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
+	env.OnActivity(a.FindJobNode, mock.Anything, expandedCfg.JobName).Return(node, nil)
+	env.OnActivity(a.MeasureDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
 		Return(int64(10*1024*1024*1024), nil).Once() // 10 GiB before
-	env.OnActivity(a.ScaleRegistry, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).Return(nil)
-	env.OnActivity(a.WaitRegistryAllocsDrained, mock.Anything, expandedCfg.JobName).Return(nil)
+	env.OnActivity(a.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).Return(nil)
+	env.OnActivity(a.WaitJobDrained, mock.Anything, expandedCfg.JobName).Return(nil)
 	env.OnActivity(a.RunRegistryGarbageCollect, mock.Anything, node, expandedCfg).
 		Return(activities.RegistryGCRunResult{BlobsDeleted: 7}, nil)
-	env.OnActivity(a.MeasureRegistryDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
+	env.OnActivity(a.MeasureDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
 		Return(int64(7*1024*1024*1024), nil).Once() // 7 GiB after
 	// Deferred scale-back: ALWAYS fires (even on happy path).
-	env.OnActivity(a.ScaleRegistry, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).Return(nil)
-	env.OnActivity(a.WaitRegistryAllocRunning, mock.Anything, expandedCfg.JobName).Return(nil)
+	env.OnActivity(a.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).Return(nil)
+	env.OnActivity(a.WaitJobRunning, mock.Anything, expandedCfg.JobName).Return(nil)
 
 	env.ExecuteWorkflow(RegistryGC, cfgIn)
 
@@ -95,20 +95,20 @@ func TestRegistryGC_GCFailureStillScalesBack(t *testing.T) {
 	expandedCfg.ApplyDefaults()
 	node := activities.NodeInfo{ID: "node-1", Name: "stabler", Address: "192.168.68.61"}
 
-	env.OnActivity(a.FindRegistryNode, mock.Anything, expandedCfg.JobName).Return(node, nil)
-	env.OnActivity(a.MeasureRegistryDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
+	env.OnActivity(a.FindJobNode, mock.Anything, expandedCfg.JobName).Return(node, nil)
+	env.OnActivity(a.MeasureDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
 		Return(int64(10*1024*1024*1024), nil).Once()
-	env.OnActivity(a.ScaleRegistry, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).Return(nil)
-	env.OnActivity(a.WaitRegistryAllocsDrained, mock.Anything, expandedCfg.JobName).Return(nil)
+	env.OnActivity(a.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).Return(nil)
+	env.OnActivity(a.WaitJobDrained, mock.Anything, expandedCfg.JobName).Return(nil)
 	// GC fails — workflow should error out, BUT compensation still runs.
 	env.OnActivity(a.RunRegistryGarbageCollect, mock.Anything, node, expandedCfg).
 		Return(activities.RegistryGCRunResult{}, errors.New("docker run failed: exit 1"))
 	// Compensation MUST fire:
 	scaleBackCalled := false
-	env.OnActivity(a.ScaleRegistry, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).
+	env.OnActivity(a.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).
 		Run(func(args mock.Arguments) { scaleBackCalled = true }).
 		Return(nil)
-	env.OnActivity(a.WaitRegistryAllocRunning, mock.Anything, expandedCfg.JobName).Return(nil)
+	env.OnActivity(a.WaitJobRunning, mock.Anything, expandedCfg.JobName).Return(nil)
 
 	env.ExecuteWorkflow(RegistryGC, cfgIn)
 
@@ -136,15 +136,15 @@ func TestRegistryGC_ScaleDownFailureSkipsCompensation(t *testing.T) {
 	expandedCfg.ApplyDefaults()
 	node := activities.NodeInfo{ID: "node-1", Name: "stabler", Address: "192.168.68.61"}
 
-	env.OnActivity(a.FindRegistryNode, mock.Anything, expandedCfg.JobName).Return(node, nil)
-	env.OnActivity(a.MeasureRegistryDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
+	env.OnActivity(a.FindJobNode, mock.Anything, expandedCfg.JobName).Return(node, nil)
+	env.OnActivity(a.MeasureDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
 		Return(int64(10*1024*1024*1024), nil).Once()
 	// Scale-down fails before compensation can be registered.
-	env.OnActivity(a.ScaleRegistry, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).
+	env.OnActivity(a.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).
 		Return(errors.New("nomad api 500"))
 
 	scaleBackCalled := false
-	env.OnActivity(a.ScaleRegistry, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).
+	env.OnActivity(a.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).
 		Run(func(args mock.Arguments) { scaleBackCalled = true }).
 		Return(nil).Maybe() // Maybe — assert it does NOT run below.
 
