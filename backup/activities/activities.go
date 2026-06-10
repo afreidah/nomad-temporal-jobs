@@ -27,6 +27,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"go.opentelemetry.io/otel/attribute"
@@ -402,9 +403,17 @@ func (a *Activities) TakeRegistryBackup(ctx context.Context) (string, error) {
 // S3 UPLOAD ACTIVITIES
 // -------------------------------------------------------------------------
 
-// UploadToS3 uploads a local backup file to S3 storage. The S3 key is
-// constructed from the prefix and the original filename. If the upload
-// fails with a 507 quota error, the oldest backup under the same prefix
+// Multipart upload tuning: large dumps (hundreds of MB) upload as parallel
+// chunks instead of one slow stream that would blow the activity timeout.
+const (
+	uploadPartSize          = 16 * 1024 * 1024 // 16 MB parts
+	uploadConcurrency       = 4                // parallel part uploads
+	uploadHeartbeatInterval = 30 * time.Second
+)
+
+// UploadToS3 uploads a local backup file to S3 storage using multipart upload.
+// The S3 key is constructed from the prefix and the original filename. If the
+// upload fails with a 507 quota error, the oldest backup under the same prefix
 // is evicted and the upload is retried up to 3 times.
 func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix string) (string, error) {
 	logger := activity.GetLogger(ctx)
@@ -423,6 +432,11 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 	key := keyPrefix + "/" + filepath.Base(localPath)
 	bucket := a.config.S3Bucket
 
+	uploader := manager.NewUploader(a.s3Client, func(u *manager.Uploader) {
+		u.PartSize = uploadPartSize
+		u.Concurrency = uploadConcurrency
+	})
+
 	const maxEvictions = 3
 	for attempt := range maxEvictions + 1 {
 		file, err := os.Open(localPath)
@@ -432,11 +446,10 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 
 		logger.Info("Uploading to S3", "key", key, "size_bytes", info.Size(), "bucket", bucket)
 
-		_, err = a.s3Client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        &bucket,
-			Key:           &key,
-			Body:          file,
-			ContentLength: aws.Int64(info.Size()),
+		err = uploadWithHeartbeat(ctx, uploader, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &key,
+			Body:   file,
 		})
 		_ = file.Close()
 
@@ -605,6 +618,34 @@ func runCommandWithHeartbeat(ctx context.Context, cmd *exec.Cmd, interval time.D
 				_ = cmd.Process.Kill()
 			}
 			return ctx.Err()
+		}
+	}
+}
+
+// uploadWithHeartbeat runs a multipart upload and records an activity
+// heartbeat every uploadHeartbeatInterval until it finishes, so a stalled
+// upload trips the activity's HeartbeatTimeout instead of silently running
+// to the StartToClose timeout. The uploader respects ctx cancellation, so on
+// timeout it returns promptly and the goroutine unblocks before the caller
+// closes the file.
+func uploadWithHeartbeat(ctx context.Context, uploader *manager.Uploader, input *s3.PutObjectInput) error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := uploader.Upload(ctx, input)
+		done <- err
+	}()
+
+	ticker := time.NewTicker(uploadHeartbeatInterval)
+	defer ticker.Stop()
+
+	ticks := 0
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-ticker.C:
+			ticks++
+			activity.RecordHeartbeat(ctx, ticks)
 		}
 	}
 }
