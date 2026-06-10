@@ -51,6 +51,17 @@ var longOpts = workflow.ActivityOptions{
 	RetryPolicy:            retryStandard,
 }
 
+// uploadOpts covers S3 uploads. The largest dumps run hundreds of MB and take
+// many minutes even over multipart, so uploads get a generous window and
+// heartbeat rather than the quick profile, which was killing big uploads at
+// the 5-minute StartToClose timeout.
+var uploadOpts = workflow.ActivityOptions{
+	StartToCloseTimeout:    30 * time.Minute,
+	ScheduleToCloseTimeout: 90 * time.Minute,
+	HeartbeatTimeout:       2 * time.Minute,
+	RetryPolicy:            retryStandard,
+}
+
 const (
 	s3PrefixNomad    = "backups/nomad"
 	s3PrefixConsul   = "backups/consul"
@@ -123,6 +134,7 @@ func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.B
 func snapshotLeg(ctx workflow.Context, snapshotFn any, s3Prefix string, pathOut, keyOut *string) error {
 	logger := workflow.GetLogger(ctx)
 	cctx := workflow.WithActivityOptions(ctx, quickOpts)
+	uctx := workflow.WithActivityOptions(ctx, uploadOpts)
 
 	var path string
 	if err := workflow.ExecuteActivity(cctx, snapshotFn).Get(cctx, &path); err != nil {
@@ -131,7 +143,7 @@ func snapshotLeg(ctx workflow.Context, snapshotFn any, s3Prefix string, pathOut,
 	*pathOut = path
 
 	var key string
-	if err := workflow.ExecuteActivity(cctx, a.UploadToS3, path, s3Prefix).Get(cctx, &key); err != nil {
+	if err := workflow.ExecuteActivity(uctx, a.UploadToS3, path, s3Prefix).Get(uctx, &key); err != nil {
 		logger.Warn("S3 upload failed", "prefix", s3Prefix, "error", err)
 	} else {
 		*keyOut = key
@@ -146,6 +158,7 @@ func snapshotLeg(ctx workflow.Context, snapshotFn any, s3Prefix string, pathOut,
 func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *activities.BackupResult) error {
 	logger := workflow.GetLogger(ctx)
 	quickCtx := workflow.WithActivityOptions(ctx, quickOpts)
+	uploadCtx := workflow.WithActivityOptions(ctx, uploadOpts)
 
 	var globalsPath string
 	if err := workflow.ExecuteActivity(quickCtx, a.BackupPostgresGlobals).Get(quickCtx, &globalsPath); err != nil {
@@ -154,7 +167,7 @@ func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *a
 	result.PostgresGlobals = globalsPath
 
 	var globalsKey string
-	if err := workflow.ExecuteActivity(quickCtx, a.UploadToS3, globalsPath, s3PrefixPostgres).Get(quickCtx, &globalsKey); err != nil {
+	if err := workflow.ExecuteActivity(uploadCtx, a.UploadToS3, globalsPath, s3PrefixPostgres).Get(uploadCtx, &globalsKey); err != nil {
 		logger.Warn("Postgres globals S3 upload failed", "error", err)
 	} else {
 		result.PostgresGlobalsS3Key = globalsKey
@@ -178,8 +191,8 @@ func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *a
 			sem.Send(gctx, nil) // acquire a slot
 			defer sem.Receive(gctx, nil)
 
-			qCtx := workflow.WithActivityOptions(gctx, quickOpts)
 			lCtx := workflow.WithActivityOptions(gctx, longOpts)
+			uCtx := workflow.WithActivityOptions(gctx, uploadOpts)
 
 			entry := activities.DatabaseBackup{Database: db}
 			var path string
@@ -193,7 +206,7 @@ func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *a
 			// Each database uploads under its own subdir: backups/postgres/<db>/.
 			dbPrefix := s3PrefixPostgres + "/" + activities.SanitizeDBName(db)
 			var key string
-			if err := workflow.ExecuteActivity(qCtx, a.UploadToS3, path, dbPrefix).Get(qCtx, &key); err != nil {
+			if err := workflow.ExecuteActivity(uCtx, a.UploadToS3, path, dbPrefix).Get(uCtx, &key); err != nil {
 				logger.Warn("Postgres database S3 upload failed", "database", db, "error", err)
 			} else {
 				entry.S3Key = key
