@@ -3,100 +3,49 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// Starts a Temporal worker listening on the backup-task-queue. Registers the
-// backup workflow and activity struct, initializes tracing, structured logging,
-// and Prometheus metrics.
+// Starts a Temporal worker on the backup-task-queue. The shared runtime owns
+// tracing, logging, metrics, and the Temporal client; this file only builds
+// the backup activities and registers the workflow.
 // -------------------------------------------------------------------------------
 
 package main
 
 import (
+	"cmp"
 	"context"
 	"log"
+	"log/slog"
 	"os"
 
 	"munchbox/temporal-workers/backup/activities"
 	"munchbox/temporal-workers/backup/workflows"
 	"munchbox/temporal-workers/shared"
 
-	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/contrib/opentelemetry"
-	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 )
 
-const taskQueue = "backup-task-queue"
-
 func main() {
-	ctx := context.Background()
-
-	// --- Tracing ---
-	shutdownTracer := shared.InitTracer(ctx, "backup-worker")
-	defer func() { _ = shutdownTracer(ctx) }()
-
-	// --- Structured logging ---
-	temporalLogger, slogger := shared.NewLogger("backup-worker")
-
-	// --- Metrics ---
-	metricsAddr := envOrDefault("METRICS_LISTEN", ":9090")
-	metricsHandler := shared.NewMetricsHandler(metricsAddr)
-
-	// --- Temporal client ---
-	temporalAddr := envOrDefault("TEMPORAL_ADDRESS", "localhost:7233")
-
-	tracingInterceptor, err := opentelemetry.NewTracingInterceptor(opentelemetry.TracerOptions{})
-	if err != nil {
-		slogger.Warn("Failed to create tracing interceptor", "error", err)
-	}
-
-	clientOpts := client.Options{
-		HostPort:       temporalAddr,
-		Logger:         temporalLogger,
-		MetricsHandler: metricsHandler,
-	}
-	if tracingInterceptor != nil {
-		clientOpts.Interceptors = []interceptor.ClientInterceptor{tracingInterceptor}
-	}
-
-	c, err := client.Dial(clientOpts)
-	if err != nil {
-		log.Fatalln("Unable to create Temporal client:", err)
-	}
-	defer c.Close()
-
-	// --- Activity dependencies ---
-	acts, err := activities.New(activities.Config{
-		S3Endpoint:   envOrDefault("S3_ENDPOINT", "http://s3-orchestrator.service.consul:9000"),
-		S3Bucket:     envOrDefault("S3_BUCKET", "unified"),
-		S3AccessKey:  os.Getenv("S3_ACCESS_KEY"),
-		S3SecretKey:  os.Getenv("S3_SECRET_KEY"),
-		PostgresHost: envOrDefault("PG_HOST", "postgres-primary.service.consul"),
-		PostgresUser: envOrDefault("PG_USER", "postgres"),
+	err := shared.RunWorker(context.Background(), shared.WorkerSpec{
+		Service:   "backup-worker",
+		TaskQueue: "backup-task-queue",
+		Register: func(_ context.Context, _ *slog.Logger, w worker.Worker) (func(), error) {
+			acts, err := activities.New(activities.Config{
+				S3Endpoint:   cmp.Or(os.Getenv("S3_ENDPOINT"), "http://s3-orchestrator.service.consul:9000"),
+				S3Bucket:     cmp.Or(os.Getenv("S3_BUCKET"), "unified"),
+				S3AccessKey:  os.Getenv("S3_ACCESS_KEY"),
+				S3SecretKey:  os.Getenv("S3_SECRET_KEY"),
+				PostgresHost: cmp.Or(os.Getenv("PG_HOST"), "postgres-primary.service.consul"),
+				PostgresUser: cmp.Or(os.Getenv("PG_USER"), "postgres"),
+			})
+			if err != nil {
+				return nil, err
+			}
+			w.RegisterWorkflow(workflows.Backup)
+			w.RegisterActivity(acts)
+			return nil, nil
+		},
 	})
 	if err != nil {
-		log.Fatalln("Failed to initialize activities:", err)
+		log.Fatalln(err)
 	}
-
-	// --- Worker registration ---
-	w := worker.New(c, taskQueue, worker.Options{})
-
-	w.RegisterWorkflow(workflows.Backup)
-	w.RegisterActivity(acts)
-
-	slogger.Info("Backup worker starting",
-		"temporal", temporalAddr,
-		"queue", taskQueue,
-		"metrics", metricsAddr)
-
-	if err := w.Run(worker.InterruptCh()); err != nil {
-		log.Fatalln("Worker failed:", err)
-	}
-}
-
-// envOrDefault reads an environment variable, returning fallback if unset or empty.
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

@@ -3,106 +3,56 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// Starts a Temporal worker listening on the cleanup-task-queue. Registers
-// the cleanup workflow and activity struct, initializes tracing, structured
-// logging, and Prometheus metrics. Requires SSH key access to Nomad client
-// nodes for remote cleanup execution.
+// Starts a Temporal worker on the cleanup-task-queue. The shared runtime owns
+// tracing, logging, metrics, and the Temporal client; this file only builds
+// the cleanup activities and registers the cleanup, registry-GC, postgres-
+// maintenance, and aptly-cleanup workflows. Requires SSH key access to Nomad
+// client nodes for remote cleanup execution.
 // -------------------------------------------------------------------------------
 
 package main
 
 import (
+	"cmp"
 	"context"
 	"log"
+	"log/slog"
 	"os"
 
 	"munchbox/temporal-workers/nodecleanup/activities"
 	"munchbox/temporal-workers/nodecleanup/workflows"
 	"munchbox/temporal-workers/shared"
 
-	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/contrib/opentelemetry"
-	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 )
 
-const taskQueue = "cleanup-task-queue"
-
 func main() {
-	ctx := context.Background()
+	err := shared.RunWorker(context.Background(), shared.WorkerSpec{
+		Service:   "cleanup-worker",
+		TaskQueue: "cleanup-task-queue",
+		Register: func(_ context.Context, _ *slog.Logger, w worker.Worker) (func(), error) {
+			acts := activities.New(activities.Config{
+				SSHKeyPath:    cmp.Or(os.Getenv("SSH_KEY_PATH"), "/root/.ssh/id_ed25519"),
+				SSHCertPath:   cmp.Or(os.Getenv("SSH_CERT_PATH"), "/root/.ssh/id_ed25519-cert.pub"),
+				SSHHostCAPath: cmp.Or(os.Getenv("SSH_HOST_CA_PATH"), "/root/.ssh/ssh-host-ca.pub"),
 
-	// --- Tracing ---
-	shutdownTracer := shared.InitTracer(ctx, "cleanup-worker")
-	defer func() { _ = shutdownTracer(ctx) }()
+				PostgresHost:        cmp.Or(os.Getenv("PG_HOST"), "postgres-primary.service.consul"),
+				PostgresPort:        cmp.Or(os.Getenv("PG_PORT"), "5432"),
+				PostgresUser:        cmp.Or(os.Getenv("PG_USER"), "postgres"),
+				PostgresPassword:    os.Getenv("PGPASSWORD"),
+				PostgresSSLMode:     cmp.Or(os.Getenv("PG_SSLMODE"), "prefer"),
+				PostgresSSLRootCert: os.Getenv("PG_SSLROOTCERT"),
+			})
 
-	// --- Structured logging ---
-	temporalLogger, slogger := shared.NewLogger("cleanup-worker")
-
-	// --- Metrics ---
-	metricsAddr := envOrDefault("METRICS_LISTEN", ":9090")
-	metricsHandler := shared.NewMetricsHandler(metricsAddr)
-
-	// --- Temporal client ---
-	temporalAddr := envOrDefault("TEMPORAL_ADDRESS", "localhost:7233")
-
-	tracingInterceptor, err := opentelemetry.NewTracingInterceptor(opentelemetry.TracerOptions{})
-	if err != nil {
-		slogger.Warn("Failed to create tracing interceptor", "error", err)
-	}
-
-	clientOpts := client.Options{
-		HostPort:       temporalAddr,
-		Logger:         temporalLogger,
-		MetricsHandler: metricsHandler,
-	}
-	if tracingInterceptor != nil {
-		clientOpts.Interceptors = []interceptor.ClientInterceptor{tracingInterceptor}
-	}
-
-	c, err := client.Dial(clientOpts)
-	if err != nil {
-		log.Fatalln("Unable to create Temporal client:", err)
-	}
-	defer c.Close()
-
-	// --- Activity dependencies ---
-	acts := activities.New(activities.Config{
-		SSHKeyPath:    envOrDefault("SSH_KEY_PATH", "/root/.ssh/id_ed25519"),
-		SSHCertPath:   envOrDefault("SSH_CERT_PATH", "/root/.ssh/id_ed25519-cert.pub"),
-		SSHHostCAPath: envOrDefault("SSH_HOST_CA_PATH", "/root/.ssh/ssh-host-ca.pub"),
-
-		PostgresHost:        envOrDefault("PG_HOST", "postgres-primary.service.consul"),
-		PostgresPort:        envOrDefault("PG_PORT", "5432"),
-		PostgresUser:        envOrDefault("PG_USER", "postgres"),
-		PostgresPassword:    os.Getenv("PGPASSWORD"),
-		PostgresSSLMode:     envOrDefault("PG_SSLMODE", "prefer"),
-		PostgresSSLRootCert: os.Getenv("PG_SSLROOTCERT"),
+			w.RegisterWorkflow(workflows.Cleanup)
+			w.RegisterWorkflow(workflows.RegistryGC)
+			w.RegisterWorkflow(workflows.PostgresMaintenance)
+			w.RegisterWorkflow(workflows.AptlyCleanup)
+			w.RegisterActivity(acts)
+			return nil, nil
+		},
 	})
-
-	// --- Worker registration ---
-	w := worker.New(c, taskQueue, worker.Options{})
-
-	w.RegisterWorkflow(workflows.Cleanup)
-	w.RegisterWorkflow(workflows.RegistryGC)
-	w.RegisterWorkflow(workflows.PostgresMaintenance)
-	w.RegisterWorkflow(workflows.AptlyCleanup)
-	w.RegisterActivity(acts)
-
-	slogger.Info("Cleanup worker starting",
-		"temporal", temporalAddr,
-		"queue", taskQueue,
-		"metrics", metricsAddr)
-
-	if err := w.Run(worker.InterruptCh()); err != nil {
-		log.Fatalln("Worker failed:", err)
+	if err != nil {
+		log.Fatalln(err)
 	}
-}
-
-// envOrDefault reads an environment variable, returning fallback if unset
-// or empty.
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
