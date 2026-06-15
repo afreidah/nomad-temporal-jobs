@@ -11,7 +11,7 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup) runs as an independent worker with its own container image, task queue, and Nomad service job. The cleanup worker hosts two workflows — orphaned-data cleanup and Docker registry garbage collection — on a shared task queue. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
+Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup, certificate acquisition) runs as an independent worker with its own container image, task queue, and Nomad service job. The cleanup worker hosts several infrastructure workflows on a shared task queue; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
 
 ```
   Temporal Schedules            Temporal Server
@@ -30,11 +30,15 @@ Temporal workflow workers for automated infrastructure operations. Each domain (
                             | cleanup-task-queue     |
                             | (cleanup + registry-gc)|
                             +------------------------+
+                            | cert-acquirer-worker   |
+                            | cert-task-queue        |
+                            +------------------------+
                                         |
                                         v
                               Nomad, Consul, S3,
                               PostgreSQL, Trivy,
-                              SSH (client nodes)
+                              SSH (client nodes),
+                              Vault, ACME, Cloudflare
 ```
 
 Each worker is a long-running Temporal worker process that polls its dedicated task queue. Workflows are pure orchestration; all I/O happens in activities. Activities are registered as struct methods, sharing pooled connections (DB, S3) across invocations.
@@ -90,6 +94,15 @@ Reclaims disk space from the Docker registry by running the registry's `garbage-
 **Image:** `cleanup-worker`
 **Dependencies:** SSH access to the registry host, Nomad API (job scaling), Docker on the registry host
 
+### Cert Acquirer
+
+Issues the `*.munchbox.cc` wildcard certificate via ACME DNS-01 (Cloudflare) using the `go-acme/lego` library, and publishes the result to Vault for Traefik to read. The ACME account is persisted to Vault so registration happens once rather than on every run. Issuance and publish are separate activities: the issued cert+key are written to a staging Vault path so a publish failure never re-runs ACME issuance (Let's Encrypt rate-limits duplicate issuance), and the private key never transits Temporal workflow history. The worker authenticates to Vault with its Nomad Workload Identity and pulls the Cloudflare token through that client; no static secrets are templated into the job.
+
+**Task queue:** `cert-task-queue`
+**Workflow:** `CertAcquirer`
+**Image:** `cert-acquirer-worker`
+**Dependencies:** Vault (Workload Identity), Cloudflare DNS API, Let's Encrypt
+
 ## Registry GC Saga
 
 The registry GC workflow is structured as a saga so the registry is never left stranded offline. The sequence decomposes into per-step activities, each with its own retry policy:
@@ -137,6 +150,7 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 | `trivy-daily` | `Scan` | `trivy-task-queue` | `0 3 * * *` | `ScanConfig` (scan concurrency) |
 | `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, dry-run, docker prune) |
 | `registry-gc-weekly` | `RegistryGC` | `cleanup-task-queue` | `0 2 * * 0` | `RegistryGCConfig` (job/dir/image, dry-run, delete-untagged) |
+| `cert-acquirer-weekly` | `CertAcquirer` | `cert-task-queue` | `0 4 * * 1` | `IssueRequest` (domains, email) |
 
 ## Retry and Error Handling
 
@@ -234,7 +248,19 @@ All configuration is via environment variables, injected by Nomad job templates 
 
 ### Registry GC
 
-Registry GC runs on the cleanup worker, so it inherits the SSH and `NOMAD_TOKEN` settings above (the Nomad token additionally needs job-scale permission). Its workflow config (job name, data dir, image, dry-run, delete-untagged) comes from the `registry-gc-weekly` schedule input — see the `RegistryGCConfig` table under [Registry Garbage Collection](#registry-garbage-collection).
+Registry GC runs on the cleanup worker, so it inherits the SSH and `NOMAD_TOKEN` settings above (the Nomad token additionally needs job-scale permission). Its workflow config (job name, data dir, image, dry-run, delete-untagged) comes from the `registry-gc-weekly` schedule input -- see the `RegistryGCConfig` table under [Registry Garbage Collection](#registry-garbage-collection).
+
+### Cert Acquirer Worker
+
+The cert worker carries no static service tokens: it reads its Vault token from the Workload Identity file Nomad provides and pulls the Cloudflare token through it.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VAULT_ADDR` | `https://vault.service.consul:8200` | Vault endpoint |
+| `VAULT_TOKEN_FILE` | -- | Path to the WI Vault token (`${NOMAD_SECRETS_DIR}/vault_token`) |
+| `VAULT_CACERT` | -- | CA cert path so the client trusts Vault's TLS |
+| `VAULT_KV_MOUNT` | `secret` | KV v2 mount holding the Cloudflare token, ACME account, and wildcard paths |
+| `ACME_CA_DIR_URL` | Let's Encrypt production | ACME directory endpoint (point at staging for testing) |
 
 ## Observability
 
@@ -245,6 +271,7 @@ All workers initialize OpenTelemetry with OTLP gRPC export. The Temporal SDK tra
 - `backup-worker` -> nomad, consul, postgres-primary, s3-orchestrator
 - `trivy-scan-worker` -> nomad, trivy-server, postgres (via otelsql)
 - `cleanup-worker` -> nomad
+- `cert-acquirer-worker` -> vault, acme, cloudflare
 
 ### Metrics
 
@@ -293,6 +320,7 @@ Each domain also has its own `Makefile` in its subdirectory for independent buil
 cd backup && make help
 cd trivyscan && make help
 cd nodecleanup && make help
+cd certacquirer && make help
 ```
 
 ### Versioning
@@ -304,6 +332,7 @@ A `.version` file holds the tag for the artifact built from its directory, and e
 | `backup/.version` | `backup-worker` image | the backup worker changes |
 | `trivyscan/.version` | `trivy-scan-worker` image | the trivy worker changes |
 | `nodecleanup/.version` | `cleanup-worker` image | the cleanup worker changes |
+| `certacquirer/.version` | `cert-acquirer-worker` image | the cert worker changes |
 | `./.version` (root) | git release tag + `temporal-workers-web` image | cutting a repo release |
 
 `make push-backup` (and `push-all`) read each worker's own `.version` — the root version is never used for worker images. The worker tags drift apart on purpose: rebuild only what changed, and an image tag tells you exactly which worker code it holds.
@@ -319,6 +348,7 @@ Each domain is deployed as a separate Nomad service job. Workflows are started o
 | `backup-worker` | service | `backup-worker` | `backup-task-queue` |
 | `trivy-scan-worker` | service | `trivy-scan-worker` | `trivy-task-queue` |
 | `cleanup-worker` | service | `cleanup-worker` | `cleanup-task-queue` |
+| `cert-acquirer-worker` | service | `cert-acquirer-worker` | `cert-task-queue` |
 
 ### Manual Runs
 
@@ -344,6 +374,11 @@ temporal workflow start --task-queue cleanup-task-queue --type Cleanup \
 temporal workflow start --task-queue cleanup-task-queue --type RegistryGC \
   --address temporal-server.service.consul:7233 \
   --input '{"job_name":"registry","registry_data_dir":"/mnt/gdrive/munchbox-data/registry","registry_image":"registry:3","dry_run":true,"delete_untagged":true}'
+
+# Wildcard certificate acquisition
+temporal workflow start --task-queue cert-task-queue --type CertAcquirer \
+  --address temporal-server.service.consul:7233 \
+  --input '{"domains":["*.munchbox.cc"],"email":"ops@munchbox.cc"}'
 ```
 
 ## Project Structure
@@ -360,11 +395,15 @@ nomad-temporal-jobs/
   README.md                          This file
   go.mod                             Module definition
   go.sum                             Dependency lock file
+  _common.mk                         Shared worker build rules (each domain Makefile includes it)
   shared/
     telemetry.go                     OTel tracer init, span helpers, peer.service attributes
     logging.go                       JSON slog logger with Temporal SDK adapter
     metrics.go                       Prometheus metrics handler via Tally bridge
     nomad.go                         OTel-instrumented Nomad API client factory
+    postgres.go                      OTel-instrumented PostgreSQL connection factory
+    vault.go                         Self-authenticating Vault client (Workload Identity + KV)
+    consul.go                        OTel-instrumented Consul client, token sourced from Vault
   backup/
     .version                         Image version tag
     Dockerfile                       Multi-stage build (Debian, Nomad/Consul/PG18 CLI)
@@ -397,6 +436,16 @@ nomad-temporal-jobs/
       registry_gc.go                 Saga orchestration with deferred scale-back compensation
     worker/
       main.go                       Worker entry point (registers Cleanup + RegistryGC workflows)
+  certacquirer/
+    .version                         Image version tag
+    Dockerfile                       Multi-stage build (Alpine, ca-certificates only)
+    Makefile                         Sets IMAGE/PKG, includes ../_common.mk
+    activities/
+      activities.go                  Activity struct: ACME issuance (lego), account + publish to Vault
+    workflows/
+      cert_acquirer.go               Issue-then-publish orchestration with split retry policies
+    worker/
+      main.go                       Worker entry point (builds the shared Vault client)
 ```
 
 ## License

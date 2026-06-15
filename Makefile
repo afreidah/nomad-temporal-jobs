@@ -44,7 +44,10 @@ push-trivy: ## Build and push trivy-scan-worker image
 push-cleanup: ## Build and push cleanup-worker image
 	cd nodecleanup && $(MAKE) push
 
-push-all: push-backup push-trivy push-cleanup ## Build and push all images
+push-cert: ## Build and push cert-acquirer-worker image
+	cd certacquirer && $(MAKE) push
+
+push-all: push-backup push-trivy push-cleanup push-cert ## Build and push all images
 
 changelog: ## Generate CHANGELOG.md from git history
 	git cliff -o CHANGELOG.md
@@ -68,7 +71,9 @@ GODOC_PKGS := shared:./shared \
               trivyscan-activities:./trivyscan/activities \
               trivyscan-workflows:./trivyscan/workflows \
               nodecleanup-activities:./nodecleanup/activities \
-              nodecleanup-workflows:./nodecleanup/workflows
+              nodecleanup-workflows:./nodecleanup/workflows \
+              certacquirer-activities:./certacquirer/activities \
+              certacquirer-workflows:./certacquirer/workflows
 
 web-tools: ## Install Hugo and gomarkdoc for local website development
 	go install github.com/gohugoio/hugo@latest
@@ -107,5 +112,5 @@ web-push: builder ## Build and push multi-arch website image to registry
 	  --output type=image,push=true \
 	  .
 
-.PHONY: help builder build test vet lint govulncheck push-backup push-trivy push-cleanup push-all changelog release web-tools web-godoc web-serve web-build web-docker web-push
+.PHONY: help builder build test vet lint govulncheck push-backup push-trivy push-cleanup push-cert push-all changelog release web-tools web-godoc web-serve web-build web-docker web-push
 .DEFAULT_GOAL := help
