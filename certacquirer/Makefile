@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------
-# Node Cleanup Worker - Build and Push
+# Cert Acquirer Worker - Build and Push
 #
 # Project: Nomad Temporal Jobs / Author: Alex Freidah
 #
@@ -7,7 +7,7 @@
 # rules in ../_common.mk.
 # -------------------------------------------------------------------------------
 
-IMAGE := cleanup-worker
-PKG   := nodecleanup
+IMAGE := cert-acquirer-worker
+PKG   := certacquirer
 
 include ../_common.mk
