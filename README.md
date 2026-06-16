@@ -65,7 +65,7 @@ Snapshots Nomad Raft state, Consul Raft state (includes Vault data), and Postgre
 **Task queue:** `backup-task-queue`
 **Schedule:** Nomad periodic job
 **Image:** `backup-worker`
-**Dependencies:** Nomad CLI, Consul CLI, pg_dump/pg_dumpall, S3-compatible storage
+**Dependencies:** pg_dump/pg_dumpall (PostgreSQL 18 client), S3-compatible storage. Nomad and Consul snapshots are taken through their native Go APIs, so no Nomad/Consul CLI is bundled.
 
 ### Trivy Scan
 
@@ -78,7 +78,7 @@ Discovers all running Docker images from the Nomad API, scans them through the T
 
 ### Node Cleanup
 
-SSHes to each Nomad client node, identifies job data directories that no longer correspond to running allocations, and removes those older than the grace period. Optionally prunes unused Docker images. Supports dry-run mode for safe previewing.
+Removes Nomad job data directories that no longer correspond to a running allocation. The set of running jobs comes from the central Nomad API; the per-node directory work is done over SSH purely as native operations — directories are enumerated and deleted over **SFTP**, never a remote shell script. Removes only directories older than the grace period; optionally prunes unused Docker images through the Docker API (tunneled over SSH). Supports dry-run mode for safe previewing.
 
 **Task queue:** `cleanup-task-queue`
 **Schedule:** Nomad periodic job
@@ -87,7 +87,7 @@ SSHes to each Nomad client node, identifies job data directories that no longer 
 
 ### Registry Garbage Collection
 
-Reclaims disk space from the Docker registry by running the registry's `garbage-collect` against its bind-mounted storage. Because the registry tool requires the registry to be offline, the workflow scales the registry Nomad job to 0, waits for its allocations to drain, runs GC over SSH, then scales it back to 1. It reports blobs deleted and bytes reclaimed (before/after sizes). Runs on the cleanup worker, sharing its SSH and Nomad-client infrastructure. See [Registry GC Saga](#registry-gc-saga) for the compensation guarantees.
+Reclaims disk space from the Docker registry by running the registry's `garbage-collect` against its bind-mounted storage. Because the registry tool requires the registry to be offline, the workflow scales the registry Nomad job to 0, waits for its allocations to drain, runs the `garbage-collect` as a one-shot container through the Docker API (tunneled over SSH), then scales it back to 1. It reports blobs deleted and bytes reclaimed (before/after sizes). Runs on the cleanup worker, sharing its SSH and Nomad-client infrastructure. See [Registry GC Saga](#registry-gc-saga) for the compensation guarantees.
 
 **Task queue:** `cleanup-task-queue` (shared with node cleanup)
 **Workflow:** `RegistryGC`
@@ -133,12 +133,22 @@ The `shared/` package provides common functionality used by all workers:
 
 | File | Purpose |
 |------|---------|
-| `telemetry.go` | OpenTelemetry tracer initialization with OTLP gRPC export to Tempo |
+| `runtime.go` | `RunWorker` — the common worker bootstrap (tracing, logging, metrics, Temporal client + interceptor, workflow/activity registration, run-until-interrupt). Each worker `main.go` is ~15 lines. |
+| `telemetry.go` | OpenTelemetry tracer init, span helpers, `peer.service` attributes |
 | `logging.go` | JSON slog logger wrapped for Temporal SDK compatibility |
 | `metrics.go` | Prometheus metrics handler for Temporal SDK metrics (Tally bridge) |
-| `nomad.go` | OTel-instrumented Nomad API client factory |
+| `temporal.go` | Shared retry-policy and activity-option presets (`StandardRetry`, `NoRetry`, `QuickActivityOptions`, `LongActivityOptions`) |
+| `heartbeat.go` | `WithHeartbeat` — run a function while emitting activity heartbeats |
+| `nomad.go` | OTel-instrumented Nomad API client factory + idempotent job scaling / alloc-count polling |
+| `postgres.go` | OTel-instrumented PostgreSQL connection factory + database enumeration |
+| `vault.go` | Self-authenticating Vault client (Workload Identity + KV) |
+| `consul.go` | OTel-instrumented Consul client, token sourced from Vault |
+| `ssh.go` | Certificate-authenticated SSH client with SFTP file operations (`ReadDir`/`RemoveAll`/`DirSize`) — no remote shell |
+| `docker.go` | Remote Docker daemon driven through the Docker API, tunneled over the SSH connection to `/var/run/docker.sock` (one-shot containers + prune) |
 
-All workers use `StartClientSpan` with `PeerServiceAttr` to produce service graph edges in Tempo/Grafana for every external call (Nomad, Consul, PostgreSQL, S3, Trivy server).
+All workers use `StartClientSpan` with `PeerServiceAttr` to produce service graph edges in Tempo/Grafana for every external call (Nomad, Consul, PostgreSQL, S3, Trivy server, Vault, ACME, Cloudflare).
+
+**No remote shell.** Workers operate remote infrastructure through native Go APIs end-to-end — Nomad/Consul snapshots and job control via their APIs, the remote Docker daemon over an SSH socket tunnel, and remote files over SFTP. The cleanup worker connects as `root` everywhere (the Vault SSH CA issues a root principal the Oracle hosts accept), so no per-node user/sudo handling is needed. The only remaining subprocesses are `pg_dump`/`pg_dumpall`, which have no Go-native equivalent and whose output is gzipped in-process.
 
 ## Scheduling
 
@@ -397,16 +407,21 @@ nomad-temporal-jobs/
   go.sum                             Dependency lock file
   _common.mk                         Shared worker build rules (each domain Makefile includes it)
   shared/
+    runtime.go                       RunWorker: common worker bootstrap (each main.go is ~15 lines)
     telemetry.go                     OTel tracer init, span helpers, peer.service attributes
     logging.go                       JSON slog logger with Temporal SDK adapter
     metrics.go                       Prometheus metrics handler via Tally bridge
-    nomad.go                         OTel-instrumented Nomad API client factory
-    postgres.go                      OTel-instrumented PostgreSQL connection factory
+    temporal.go                      Shared retry-policy + activity-option presets
+    heartbeat.go                     WithHeartbeat: run a func while emitting activity heartbeats
+    nomad.go                         OTel-instrumented Nomad API client factory + scaling helpers
+    postgres.go                      OTel-instrumented PostgreSQL connection factory + DB listing
     vault.go                         Self-authenticating Vault client (Workload Identity + KV)
     consul.go                        OTel-instrumented Consul client, token sourced from Vault
+    ssh.go                           Cert-auth SSH client with SFTP file ops (no remote shell)
+    docker.go                        Docker API over an SSH socket tunnel (one-shot runs + prune)
   backup/
     .version                         Image version tag
-    Dockerfile                       Multi-stage build (Debian, Nomad/Consul/PG18 CLI)
+    Dockerfile                       Multi-stage build (trimmed Debian, PG18 client only)
     Makefile                         Build and push targets
     activities/
       activities.go                  Activity struct: snapshots, S3 upload, retention cleanup
@@ -426,7 +441,7 @@ nomad-temporal-jobs/
       main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   nodecleanup/
     .version                         Image version tag
-    Dockerfile                       Multi-stage build (Alpine, SSH only)
+    Dockerfile                       Multi-stage build (distroless static, pure Go)
     Makefile                         Build and push targets
     activities/
       activities.go                  Activity struct: node discovery, SSH cleanup, script gen

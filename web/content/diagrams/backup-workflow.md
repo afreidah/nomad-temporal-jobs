@@ -90,7 +90,7 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     NOMAD_SNAP: {
       title: 'Take Nomad Snapshot',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Executes <code>nomad operator snapshot save</code> to capture Nomad Raft state.</p><p>Output stored on NFS mount at the configured backup directory with a timestamped filename.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close. Failure terminates the workflow.</p>'
+      body: '<p>Captures Nomad Raft state via the <b>native Go API</b> (<code>Operator().Snapshot()</code> through the shared instrumented client), streamed straight to disk &mdash; no <code>nomad</code> CLI is bundled.</p><p>Output stored on NFS mount at the configured backup directory with a timestamped filename.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close. Failure terminates the workflow.</p>'
     },
     NOMAD_S3: {
       title: 'Upload Nomad Snapshot to S3',
@@ -100,7 +100,7 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     CONSUL_SNAP: {
       title: 'Take Consul Snapshot',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Executes <code>consul snapshot save</code> to capture Consul Raft state (includes Vault data).</p><p>Output stored on NFS mount with a timestamped filename. Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p><p>Failure terminates the workflow.</p>'
+      body: '<p>Captures Consul Raft state (includes Vault data) via the <b>native Go API</b> (<code>Snapshot().Save()</code>), streamed straight to disk &mdash; no <code>consul</code> CLI is bundled.</p><p>Output stored on NFS mount with a timestamped filename. Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p><p>Failure terminates the workflow.</p>'
     },
     CONSUL_S3: {
       title: 'Upload Consul Snapshot to S3',
@@ -110,7 +110,7 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     PG_GLOBALS: {
       title: 'Dump Postgres Globals',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Executes <code>pg_dumpall --globals-only | gzip</code> to capture cluster-wide roles, tablespaces, and grants &mdash; objects a per-database <code>pg_dump</code> omits.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close. Failure terminates the PostgreSQL leg.</p>'
+      body: '<p>Runs <code>pg_dumpall --globals-only</code> to capture cluster-wide roles, tablespaces, and grants &mdash; objects a per-database <code>pg_dump</code> omits. The subprocess output is gzipped <b>in-process</b> (Go <code>compress/gzip</code>), so there is no <code>| gzip</code> shell pipe or bash.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close. Failure terminates the PostgreSQL leg.</p>'
     },
     PG_GLOBALS_S3: {
       title: 'Upload Globals to S3',
@@ -120,12 +120,12 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     PG_LIST: {
       title: 'List Databases',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Enumerates the cluster\'s user databases. Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p><p>Failure terminates the PostgreSQL leg.</p>'
+      body: '<p>Enumerates the cluster\'s user databases by querying the catalog directly through the shared instrumented client (<code>database/sql</code>) &mdash; not the <code>psql</code> CLI. Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p><p>Failure terminates the PostgreSQL leg.</p>'
     },
     PG_DUMP: {
       title: 'Dump Each Database',
       badge: 'activity', badgeText: 'fan-out',
-      body: '<p>Dumps each database to its own gzipped file via <code>pg_dump</code>, fanning out with bounded concurrency (<code>DumpConcurrency</code>, default 4).</p><p>Long timeout: 30 min start-to-close, 60 min schedule-to-close, heartbeating every 2 min &mdash; large databases can run long.</p><p>A dump failure fails the leg <i>after</i> every database has been attempted.</p>'
+      body: '<p>Dumps each database to its own file via a <code>pg_dump</code> subprocess whose output is gzipped <b>in-process</b> (no shell pipe), fanning out with bounded concurrency (<code>DumpConcurrency</code>, default 4).</p><p>Long timeout: 30 min start-to-close, 60 min schedule-to-close, heartbeating every 2 min &mdash; large databases can run long.</p><p>A dump failure fails the leg <i>after</i> every database has been attempted.</p>'
     },
     PG_DB_S3: {
       title: 'Upload Each Database to S3',

@@ -4,7 +4,7 @@ linkTitle: "Trivy Scan"
 weight: 20
 ---
 
-Parallel image scanning orchestration showing discovery, batched scans, error classification, and result persistence. **Hover over any step** for implementation details.
+Parallel image scanning orchestration showing deterministic image discovery, batched scans, error classification, and per-image result persistence. **Hover over any step** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -88,7 +88,7 @@ Parallel image scanning orchestration showing discovery, batched scans, error cl
     DISCOVER: {
       title: 'Get Running Images',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Queries the Nomad API (<code>/v1/allocations</code>) to discover all running allocations, then extracts unique Docker image names from task configurations.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p>'
+      body: '<p>Queries the Nomad API (via the pooled OTel-instrumented client) to discover all running allocations, then extracts the unique Docker image names from task configurations and returns them in <b>deterministic sorted order</b> so scan order is stable run-to-run.</p><p>Quick timeout: 5 min start-to-close, 15 min schedule-to-close.</p>'
     },
     EMPTY: {
       title: 'Images Found?',

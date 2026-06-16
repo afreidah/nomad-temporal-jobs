@@ -19,7 +19,7 @@ weight: 20
 <a class="landing-card" href="backup-workflow/">
 <div>
 <strong>Backup Workflow</strong>
-<p>Sequential snapshot and upload flow with non-fatal S3 uploads.</p>
+<p>Concurrent snapshot legs with a per-database PostgreSQL fan-out and non-fatal S3 uploads.</p>
 </div>
 </a>
 
@@ -33,7 +33,7 @@ weight: 20
 <a class="landing-card" href="nodecleanup-workflow/">
 <div>
 <strong>Node Cleanup Workflow</strong>
-<p>Node discovery, SSH-based cleanup with dry-run and grace period safety.</p>
+<p>Nomad-API job discovery and SFTP-based directory cleanup with dry-run and grace-period safety.</p>
 </div>
 </a>
 

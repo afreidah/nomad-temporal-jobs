@@ -14,6 +14,7 @@ archetype: "home"
 {{% badge style="red" title=" " icon="fas fa-shield-alt" %}}Trivy Scanning{{% /badge %}}
 {{% badge style="green" icon="fas fa-broom" %}}Node Cleanup{{% /badge %}}
 {{% badge style="green" title=" " icon="fas fa-recycle" %}}Registry GC{{% /badge %}}
+{{% badge style="info" title=" " icon="fas fa-certificate" %}}Cert Renewal{{% /badge %}}
 {{% badge style="warning" title=" " icon="fas fa-fire" %}}Prometheus Metrics{{% /badge %}}
 {{% badge style="primary" icon="fas fa-project-diagram" %}}OpenTelemetry{{% /badge %}}
 
@@ -32,15 +33,16 @@ archetype: "home"
 <h2 style="text-align: center; color: #34d399;">Temporal workflow workers for infrastructure automation</h2>
 
 <p style="text-align: center; max-width: 700px; margin: 0 auto; color: #94a3b8; font-size: 1.1rem;">
-Three independent Temporal workers handle backup orchestration, container vulnerability scanning, and orphaned data cleanup across Nomad client nodes &mdash; with the cleanup worker also reclaiming Docker registry storage via a saga-style garbage-collect.
+Four independent Temporal workers handle backup orchestration, container vulnerability scanning, orphaned data cleanup across Nomad client nodes, and ACME wildcard-certificate renewal &mdash; with the cleanup worker also reclaiming Docker registry storage via a saga-style garbage-collect. Every remote operation runs through a native Go API or library &mdash; no remote shell commands.
 </p>
 
 <div class="hero-bullets">
 
 - Automated nightly backups of Nomad, Consul, and PostgreSQL with S3 offsite replication and configurable retention
 - Vulnerability scanning of all running container images with parallel batched Trivy scans and CVE persistence
-- Orphaned data directory cleanup across Nomad nodes with dry-run safety and grace period filtering
+- Orphaned data directory cleanup across Nomad nodes (Nomad API + SFTP) with dry-run safety and grace period filtering
 - Docker registry garbage collection that scales the registry offline, runs GC, and always scales it back via saga compensation
+- ACME DNS-01 wildcard certificate renewal published to Vault, self-authenticating via Nomad Workload Identity
 
 </div>
 
@@ -69,8 +71,8 @@ Three independent Temporal workers handle backup orchestration, container vulner
 <div class="feature-item">
 <div>
 <strong>Node Cleanup</strong>
-<p>SSH to each Nomad client node, identify orphaned directories, and remove stale data safely.</p>
-<div class="feature-detail">Connects to every Nomad client node via SSH. Enumerates job data directories, cross-references against running jobs, and removes orphaned entries older than the grace period. Optional Docker image pruning. Dry-run mode enabled by default for safe preview.</div>
+<p>Identify orphaned directories on each Nomad client node and remove stale data safely.</p>
+<div class="feature-detail">Gets each node's running jobs from the Nomad API, then enumerates and deletes orphaned job data directories over SFTP &mdash; no remote shell. Removes only entries older than the grace period. Optional Docker image pruning via the Docker API. Dry-run mode enabled by default for safe preview.</div>
 </div>
 </div>
 
@@ -78,7 +80,15 @@ Three independent Temporal workers handle backup orchestration, container vulner
 <div>
 <strong>Registry Garbage Collection</strong>
 <p>Reclaim Docker registry storage with a saga that never leaves the registry offline.</p>
-<div class="feature-detail">Scales the registry Nomad job to 0, waits for allocations to drain, runs <code>garbage-collect</code> over SSH, then scales back to 1. The scale-back is a deferred compensation on a disconnected context &mdash; it always fires, even if GC fails or the workflow is cancelled. Reports blobs deleted and bytes reclaimed.</div>
+<div class="feature-detail">Scales the registry Nomad job to 0, waits for allocations to drain, runs <code>garbage-collect</code> as a one-shot container through the Docker API (tunneled over SSH), then scales back to 1. The scale-back is a deferred compensation on a disconnected context &mdash; it always fires, even if GC fails or the workflow is cancelled. Reports blobs deleted and bytes reclaimed.</div>
+</div>
+</div>
+
+<div class="feature-item">
+<div>
+<strong>Certificate Acquisition</strong>
+<p>Renew the <code>*.munchbox.cc</code> wildcard via ACME DNS-01 and publish it to Vault.</p>
+<div class="feature-detail">Issues the wildcard via Let's Encrypt DNS-01 (Cloudflare, go-acme/lego), persisting the ACME account to Vault so registration happens once. Issue and publish are split so a publish retry never re-runs ACME (rate limits), and the private key never transits workflow history. Self-authenticates with its Nomad Workload Identity &mdash; no static secrets.</div>
 </div>
 </div>
 
@@ -86,7 +96,7 @@ Three independent Temporal workers handle backup orchestration, container vulner
 <div>
 <strong>OpenTelemetry Tracing</strong>
 <p>Every activity traced end-to-end with Tempo export and service graph edges.</p>
-<div class="feature-detail">All workers initialize an OTLP gRPC exporter to Tempo. Client spans with peer.service attributes produce service graph edges in Grafana for every external call &mdash; Nomad, Consul, PostgreSQL, S3, and Trivy.</div>
+<div class="feature-detail">All workers initialize an OTLP gRPC exporter to Tempo. Client spans with peer.service attributes produce service graph edges in Grafana for every external call &mdash; Nomad, Consul, PostgreSQL, S3, Trivy, Vault, ACME, and Cloudflare.</div>
 </div>
 </div>
 
