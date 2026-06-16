@@ -15,7 +15,6 @@ package activities
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -42,11 +41,7 @@ func (a *Activities) FindJobNode(ctx context.Context, jobName string) (NodeInfo,
 	)
 	defer span.End()
 
-	client, err := shared.NewNomadClient()
-	if err != nil {
-		return NodeInfo{}, fmt.Errorf("create Nomad client: %w", err)
-	}
-
+	client := a.nomad
 	allocs, _, err := client.Jobs().Allocations(jobName, false, nil)
 	if err != nil {
 		return NodeInfo{}, fmt.Errorf("list allocs for %q: %w", jobName, err)
@@ -87,24 +82,16 @@ func (a *Activities) FindJobNode(ctx context.Context, jobName string) (NodeInfo,
 // MEASURE DATA DIR
 // -------------------------------------------------------------------------
 
-// MeasureDataDir returns the size in bytes of a directory on the given node.
-// Used for before/after reporting. SSH-only because the path is host-side
-// (e.g. /mnt/gdrive); the Nomad API doesn't expose disk usage.
+// MeasureDataDir returns the total size in bytes of a directory on the given
+// node, walked over SFTP. Used for before/after reporting; the path is
+// host-side (e.g. /mnt/gdrive) and the Nomad API doesn't expose disk usage.
 func (a *Activities) MeasureDataDir(ctx context.Context, node NodeInfo, dataDir string) (int64, error) {
 	logger := activity.GetLogger(ctx)
 	logger.Info("Measuring data dir", "node", node.Name, "path", dataDir)
 
-	sudoPrefix := ""
-	if node.IsOracle {
-		sudoPrefix = "sudo "
-	}
-	out, err := a.runSSHCommand(node, fmt.Sprintf("%sdu -sb %s | cut -f1", sudoPrefix, shellQuote(dataDir)))
+	n, err := a.ssh.DirSize(ctx, sshTarget(node), dataDir)
 	if err != nil {
-		return 0, fmt.Errorf("du on %s: %w", node.Name, err)
-	}
-	n, parseErr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-	if parseErr != nil {
-		return 0, fmt.Errorf("parse du output %q: %w", out, parseErr)
+		return 0, fmt.Errorf("measure %s on %s: %w", dataDir, node.Name, err)
 	}
 	return n, nil
 }
@@ -128,10 +115,7 @@ func (a *Activities) ScaleJob(ctx context.Context, jobName, groupName string, co
 	)
 	defer span.End()
 
-	client, err := shared.NewNomadClient()
-	if err != nil {
-		return fmt.Errorf("create Nomad client: %w", err)
-	}
+	client := a.nomad
 	reason := fmt.Sprintf("temporal workflow: scale to %d", count)
 	if err := shared.ScaleNomadJob(client, jobName, groupName, count, reason); err != nil {
 		if strings.Contains(err.Error(), "job not found") || strings.Contains(err.Error(), "404") {
@@ -166,10 +150,7 @@ func (a *Activities) WaitJobRunning(ctx context.Context, jobName string) error {
 // is at least target.
 func (a *Activities) waitAllocCount(ctx context.Context, jobName string, target int, interval time.Duration, label string) error {
 	logger := activity.GetLogger(ctx)
-	client, err := shared.NewNomadClient()
-	if err != nil {
-		return fmt.Errorf("create Nomad client: %w", err)
-	}
+	client := a.nomad
 	return shared.WaitNomadAllocCount(ctx, client, jobName, target, interval, func(running int) {
 		activity.RecordHeartbeat(ctx, running)
 		logger.Info("Waiting", "job", jobName, "label", label, "running", running, "target", target)

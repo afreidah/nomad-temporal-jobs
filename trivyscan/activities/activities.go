@@ -17,10 +17,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
+	nomadapi "github.com/hashicorp/nomad/api"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.temporal.io/sdk/activity"
@@ -72,12 +75,20 @@ func (c Config) Validate() error {
 type Activities struct {
 	config Config
 	db     *sql.DB
+	nomad  *nomadapi.Client
 }
 
-// New creates an Activities instance with a pooled database connection.
+// New creates an Activities instance with a pooled database connection and a
+// shared Nomad client (reused across activity invocations rather than rebuilt
+// per call).
 func New(cfg Config) (*Activities, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	nomad, err := shared.NewNomadClient()
+	if err != nil {
+		return nil, fmt.Errorf("create nomad client: %w", err)
 	}
 
 	db, err := shared.NewPostgresDB(shared.PostgresConfig{
@@ -93,7 +104,7 @@ func New(cfg Config) (*Activities, error) {
 		return nil, err
 	}
 
-	return &Activities{config: cfg, db: db}, nil
+	return &Activities{config: cfg, db: db, nomad: nomad}, nil
 }
 
 // Close shuts down the database connection pool.
@@ -161,17 +172,13 @@ func (a *Activities) GetRunningImages(ctx context.Context) ([]string, error) {
 	)
 	defer span.End()
 
-	client, err := shared.NewNomadClient()
-	if err != nil {
-		return nil, fmt.Errorf("create Nomad client: %w", err)
-	}
-
+	client := a.nomad
 	allocs, _, err := client.Allocations().List(nil)
 	if err != nil {
 		return nil, fmt.Errorf("list allocations: %w", err)
 	}
 
-	imageMap := make(map[string]bool)
+	imageSet := make(map[string]struct{})
 	for _, stub := range allocs {
 		if stub.ClientStatus != "running" {
 			continue
@@ -194,17 +201,15 @@ func (a *Activities) GetRunningImages(ctx context.Context) ([]string, error) {
 				}
 				if img, ok := task.Config["image"]; ok {
 					if imgStr, ok := img.(string); ok && imgStr != "" {
-						imageMap[imgStr] = true
+						imageSet[imgStr] = struct{}{}
 					}
 				}
 			}
 		}
 	}
 
-	images := make([]string, 0, len(imageMap))
-	for img := range imageMap {
-		images = append(images, img)
-	}
+	// Sorted so the scan order is deterministic run-to-run.
+	images := slices.Sorted(maps.Keys(imageSet))
 
 	logger.Info("Found unique images", "count", len(images))
 	return images, nil
@@ -301,13 +306,13 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 	}
 
 	// --- Collect and deduplicate vulnerabilities ---
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{})
 	for _, res := range trivyOutput.Results {
 		for _, vuln := range res.Vulnerabilities {
-			if seen[vuln.VulnerabilityID] {
+			if _, ok := seen[vuln.VulnerabilityID]; ok {
 				continue
 			}
-			seen[vuln.VulnerabilityID] = true
+			seen[vuln.VulnerabilityID] = struct{}{}
 
 			desc := vuln.Description
 			if len(desc) > 1000 {

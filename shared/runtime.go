@@ -22,6 +22,7 @@ import (
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/opentelemetry"
+	"go.temporal.io/sdk/contrib/sysinfo"
 	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 )
@@ -83,9 +84,13 @@ func RunWorker(ctx context.Context, spec WorkerSpec) error {
 	defer c.Close()
 
 	// --- Worker + domain registration ---
-	// worker.Options is intentionally left at defaults; this is the central
-	// place to tune concurrency or graceful-stop behavior for every worker.
-	w := worker.New(c, spec.TaskQueue, worker.Options{})
+	// One place to tune worker behavior for every domain. SysInfoProvider makes
+	// worker heartbeats carry host CPU/memory so the Temporal UI's per-worker
+	// usage panel populates -- unset, heartbeats report 0 and the UI shows
+	// "no usage data". gopsutil-backed (go.temporal.io/sdk/contrib/sysinfo).
+	w := worker.New(c, spec.TaskQueue, worker.Options{
+		SysInfoProvider: sysinfo.SysInfoProvider(),
+	})
 
 	cleanup, err := spec.Register(ctx, slogger, w)
 	if err != nil {

@@ -15,34 +15,25 @@ import (
 	"fmt"
 	"time"
 
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
+	"munchbox/temporal-workers/shared"
 	"munchbox/temporal-workers/trivyscan/activities"
 )
 
 // --- Nil-typed activity stub for compile-time method references ---
 var a *activities.Activities
 
-var retryStandard = &temporal.RetryPolicy{
-	InitialInterval:    time.Second,
-	BackoffCoefficient: 2.0,
-	MaximumInterval:    time.Minute,
-	MaximumAttempts:    3,
-}
-
 // quickOpts covers fast operations: image discovery and result saves.
-var quickOpts = workflow.ActivityOptions{
-	StartToCloseTimeout:    5 * time.Minute,
-	ScheduleToCloseTimeout: 15 * time.Minute,
-	RetryPolicy:            retryStandard,
-}
+var quickOpts = shared.QuickActivityOptions()
 
-// scanOpts covers per-image Trivy scans, which run longer.
+// scanOpts covers per-image Trivy scans, which run longer. Unlike the shared
+// long profile these don't heartbeat -- a Trivy scan is a single CLI call, not
+// a streaming operation.
 var scanOpts = workflow.ActivityOptions{
 	StartToCloseTimeout:    30 * time.Minute,
 	ScheduleToCloseTimeout: 60 * time.Minute,
-	RetryPolicy:            retryStandard,
+	RetryPolicy:            shared.StandardRetry(),
 }
 
 // Scan discovers running images and scans them with bounded concurrency,

@@ -16,10 +16,10 @@ import (
 	"fmt"
 	"time"
 
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"munchbox/temporal-workers/nodecleanup/activities"
+	"munchbox/temporal-workers/shared"
 )
 
 // PostgresMaintenance vacuums every database with bounded concurrency.
@@ -28,21 +28,11 @@ func PostgresMaintenance(ctx workflow.Context, config activities.PostgresMainten
 	config.ApplyDefaults()
 	logger.Info("Starting postgres maintenance", "concurrency", config.Concurrency)
 
-	retry := &temporal.RetryPolicy{
-		InitialInterval:    time.Second,
-		BackoffCoefficient: 2.0,
-		MaximumInterval:    time.Minute,
-		MaximumAttempts:    3,
-	}
-	quickCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout:    5 * time.Minute,
-		ScheduleToCloseTimeout: 15 * time.Minute,
-		RetryPolicy:            retry,
-	})
+	quickCtx := workflow.WithActivityOptions(ctx, shared.QuickActivityOptions())
 	vacuumOpts := workflow.ActivityOptions{
 		StartToCloseTimeout:    30 * time.Minute,
 		ScheduleToCloseTimeout: 60 * time.Minute,
-		RetryPolicy:            retry,
+		RetryPolicy:            shared.StandardRetry(),
 	}
 
 	var dbs []string

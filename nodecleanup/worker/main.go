@@ -31,7 +31,7 @@ func main() {
 		Service:   "cleanup-worker",
 		TaskQueue: "cleanup-task-queue",
 		Register: func(_ context.Context, _ *slog.Logger, w worker.Worker) (func(), error) {
-			acts := activities.New(activities.Config{
+			acts, err := activities.New(activities.Config{
 				SSHKeyPath:    cmp.Or(os.Getenv("SSH_KEY_PATH"), "/root/.ssh/id_ed25519"),
 				SSHCertPath:   cmp.Or(os.Getenv("SSH_CERT_PATH"), "/root/.ssh/id_ed25519-cert.pub"),
 				SSHHostCAPath: cmp.Or(os.Getenv("SSH_HOST_CA_PATH"), "/root/.ssh/ssh-host-ca.pub"),
@@ -43,6 +43,9 @@ func main() {
 				PostgresSSLMode:     cmp.Or(os.Getenv("PG_SSLMODE"), "prefer"),
 				PostgresSSLRootCert: os.Getenv("PG_SSLROOTCERT"),
 			})
+			if err != nil {
+				return nil, err
+			}
 
 			w.RegisterWorkflow(workflows.Cleanup)
 			w.RegisterWorkflow(workflows.RegistryGC)
