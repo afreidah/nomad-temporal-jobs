@@ -29,27 +29,21 @@ import (
 	"fmt"
 	"time"
 
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"munchbox/temporal-workers/nodecleanup/activities"
+	"munchbox/temporal-workers/shared"
 )
 
-// retryAlwaysRetryable is the standard Nomad-API-blip retry policy used by
-// the short, idempotent activities.
-var retryAlwaysRetryable = &temporal.RetryPolicy{
-	InitialInterval:    time.Second,
-	BackoffCoefficient: 2.0,
-	MaximumInterval:    time.Minute,
-	MaximumAttempts:    3,
-}
-
-// retryNeverRetryable is used by the long-running GC activity. A partial GC
-// shouldn't be retried — the deferred scale-back is what guarantees the
-// registry comes back online.
-var retryNeverRetryable = &temporal.RetryPolicy{
-	MaximumAttempts: 1,
-}
+// retryAlwaysRetryable is the standard Nomad-API-blip retry policy used by the
+// short, idempotent activities. retryNeverRetryable is used by the long-running
+// GC activity: a partial GC shouldn't be retried — the deferred scale-back is
+// what guarantees the registry comes back online. Both are shared with the
+// aptly-cleanup saga in this package.
+var (
+	retryAlwaysRetryable = shared.StandardRetry()
+	retryNeverRetryable  = shared.NoRetry()
+)
 
 // RegistryGC orchestrates the saga. The named return value `err` is what
 // the deferred scale-back compensation inspects to decide whether to log

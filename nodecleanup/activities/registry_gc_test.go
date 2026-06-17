@@ -112,24 +112,6 @@ func TestHumanBytes(t *testing.T) {
 	}
 }
 
-// -------------------------------------------------------------------------
-// SHELL QUOTE
-// -------------------------------------------------------------------------
-
-func TestShellQuote(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"plain", `'plain'`},
-		{"/path/with spaces", `'/path/with spaces'`},
-		{"it's quoted", `'it'\''s quoted'`},
-		{"", `''`},
-	}
-	for _, c := range cases {
-		got := shellQuote(c.in)
-		if got != c.want {
-			t.Errorf("shellQuote(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
 
 // -------------------------------------------------------------------------
 // SANITY: package compiles with all the types declared

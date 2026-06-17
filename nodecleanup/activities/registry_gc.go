@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"go.temporal.io/sdk/activity"
 )
 
@@ -104,37 +105,27 @@ func (a *Activities) RunRegistryGarbageCollect(ctx context.Context, node NodeInf
 		"node", node.Name, "image", config.RegistryImage,
 		"dry_run", config.DryRun, "delete_untagged", config.DeleteUntagged)
 
-	sudoPrefix := ""
-	if node.IsOracle {
-		sudoPrefix = "sudo "
-	}
-
-	dryRunFlag := ""
+	// garbage-collect [--dry-run] [--delete-untagged] /etc/distribution/config.yml
+	//
+	// The registry image embeds /etc/distribution/config.yml as the default
+	// config its binary reads. The garbage-collect subcommand only needs the
+	// storage rootdirectory from that config, which the embedded default points
+	// at /var/lib/registry — the same path as the live container's bind mount.
+	cmd := []string{"garbage-collect"}
 	if config.DryRun {
-		dryRunFlag = "--dry-run"
+		cmd = append(cmd, "--dry-run")
 	}
-	deleteUntaggedFlag := ""
 	if config.DeleteUntagged {
-		deleteUntaggedFlag = "--delete-untagged"
+		cmd = append(cmd, "--delete-untagged")
 	}
+	cmd = append(cmd, "/etc/distribution/config.yml")
 
-	// The registry image embeds /etc/distribution/config.yml as the
-	// default config its binary reads. The garbage-collect subcommand
-	// only needs the storage rootdirectory from that config, which the
-	// embedded default points at /var/lib/registry — same path as the
-	// live container's bind mount.
-	cmd := fmt.Sprintf(
-		`%sdocker run --rm -v %s:/var/lib/registry %s garbage-collect %s %s /etc/distribution/config.yml`,
-		sudoPrefix,
-		shellQuote(config.RegistryDataDir),
-		shellQuote(config.RegistryImage),
-		dryRunFlag,
-		deleteUntaggedFlag,
-	)
-
-	out, err := a.runSSHCommandWithHeartbeat(ctx, node, cmd, 30*time.Second)
+	out, err := a.ssh.RunContainer(ctx, sshTarget(node), &container.Config{
+		Image: config.RegistryImage,
+		Cmd:   cmd,
+	}, []string{config.RegistryDataDir + ":/var/lib/registry"}, 30*time.Second)
 	if err != nil {
-		return RegistryGCRunResult{Output: out}, fmt.Errorf("docker run garbage-collect on %s: %w", node.Name, err)
+		return RegistryGCRunResult{Output: out}, fmt.Errorf("registry garbage-collect on %s: %w", node.Name, err)
 	}
 
 	return RegistryGCRunResult{
@@ -147,7 +138,7 @@ func (a *Activities) RunRegistryGarbageCollect(ctx context.Context, node NodeInf
 // registry garbage-collect tool.
 func parseBlobsDeleted(output string) int {
 	count := 0
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		if strings.Contains(line, "blob eligible for deletion:") {
 			count++
 		}

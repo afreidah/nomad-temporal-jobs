@@ -18,48 +18,32 @@ import (
 	"fmt"
 	"time"
 
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"munchbox/temporal-workers/backup/activities"
+	"munchbox/temporal-workers/shared"
 )
 
 // --- Nil-typed activity stub for compile-time method references ---
 var a *activities.Activities
 
-var retryStandard = &temporal.RetryPolicy{
-	InitialInterval:    time.Second,
-	BackoffCoefficient: 2.0,
-	MaximumInterval:    time.Minute,
-	MaximumAttempts:    3,
-}
-
 // quickOpts covers fast operations: snapshots, database listing, the globals
-// dump, S3 uploads, and retention cleanup.
-var quickOpts = workflow.ActivityOptions{
-	StartToCloseTimeout:    5 * time.Minute,
-	ScheduleToCloseTimeout: 15 * time.Minute,
-	RetryPolicy:            retryStandard,
-}
-
-// longOpts covers per-database pg_dump, which can run long for large
-// databases and therefore heartbeats.
-var longOpts = workflow.ActivityOptions{
-	StartToCloseTimeout:    30 * time.Minute,
-	ScheduleToCloseTimeout: 60 * time.Minute,
-	HeartbeatTimeout:       2 * time.Minute,
-	RetryPolicy:            retryStandard,
-}
+// dump, and retention cleanup. longOpts covers per-database pg_dump, which can
+// run long for large databases and therefore heartbeats.
+var (
+	quickOpts = shared.QuickActivityOptions()
+	longOpts  = shared.LongActivityOptions()
+)
 
 // uploadOpts covers S3 uploads. The largest dumps run hundreds of MB and take
-// many minutes even over multipart, so uploads get a generous window and
-// heartbeat rather than the quick profile, which was killing big uploads at
-// the 5-minute StartToClose timeout.
+// many minutes even over multipart, so uploads get a more generous total
+// window than the long profile -- the quick profile was killing big uploads
+// at the 5-minute StartToClose timeout.
 var uploadOpts = workflow.ActivityOptions{
 	StartToCloseTimeout:    30 * time.Minute,
 	ScheduleToCloseTimeout: 90 * time.Minute,
 	HeartbeatTimeout:       2 * time.Minute,
-	RetryPolicy:            retryStandard,
+	RetryPolicy:            shared.StandardRetry(),
 }
 
 const (

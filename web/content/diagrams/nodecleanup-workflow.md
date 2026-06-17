@@ -4,7 +4,7 @@ linkTitle: "Node Cleanup"
 weight: 30
 ---
 
-Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and safety features. **Hover over any step** for implementation details.
+Per-node cleanup orchestration: discover nodes via the Nomad API, read each node's running jobs from the API, then enumerate and remove orphaned directories over SFTP &mdash; with dry-run and grace-period safety. **Hover over any step** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -45,27 +45,30 @@ Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and 
   var diagramSrc = [
     'flowchart TD',
     '    START([Cleanup\\nWorkflow]):::workflow --> DEFAULTS[Apply Config\\nDefaults]:::workflow',
-    '    DEFAULTS --> DISCOVER[Get All Nomad\\nClient Nodes]:::activity',
+    '    DEFAULTS --> DISCOVER[Get Nomad\\nClient Nodes]:::activity',
     '    DISCOVER --> EMPTY{Nodes\\nFound?}:::decision',
     '    EMPTY -->|none| DONE',
     '    EMPTY -->|yes| LOOP[Process\\nNext Node]:::workflow',
-    '    LOOP --> SSH[Cleanup Node\\nvia SSH]:::activity',
-    '    SSH --> SCRIPT[Execute Cleanup\\nScript]:::activity',
-    '    SCRIPT --> ENUM[Enumerate Job\\nDirectories]:::activity',
-    '    ENUM --> RUNNING[Check Against\\nRunning Jobs]:::activity',
-    '    RUNNING --> GRACE{Older Than\\nGrace Period?}:::decision',
+    '    LOOP --> RUNJOBS[Get Running Jobs\\nNomad API]:::activity',
+    '    RUNJOBS --> CONNECT[Open SSH/SFTP\\nto Node]:::activity',
+    '    CONNECT --> LIST[List Dirs\\nvia SFTP]:::activity',
+    '    LIST --> EXCLUDE{System\\nDir?}:::decision',
+    '    EXCLUDE -->|yes| SKIP_DIR[Skip\\nDirectory]:::workflow',
+    '    EXCLUDE -->|no| RUNNING{Matches\\nRunning Job?}:::decision',
+    '    RUNNING -->|active| MORE',
+    '    RUNNING -->|no| GRACE{Older Than\\nGrace Period?}:::decision',
+    '    GRACE -->|no| SKIP_DIR',
     '    GRACE -->|yes| DRYRUN{Dry Run\\nMode?}:::decision',
-    '    GRACE -->|no| SKIP_DIR[Skip\\nDirectory]:::workflow',
     '    DRYRUN -->|dry run| LOG_ONLY[Log Would\\nDelete]:::workflow',
-    '    DRYRUN -->|live| DELETE[Remove\\nDirectory]:::activity',
-    '    SKIP_DIR --> MORE',
+    '    DRYRUN -->|live| DELETE[Remove Dir\\nvia SFTP]:::activity',
+    '    SKIP_DIR --> MORE{More\\nDirs?}:::decision',
     '    LOG_ONLY --> MORE',
     '    DELETE --> MORE',
-    '    MORE --> DOCKER{Docker\\nPrune?}:::decision',
-    '    DOCKER -->|yes| PRUNE[Docker System\\nPrune]:::activity',
-    '    DOCKER -->|no| RESULT',
-    '    PRUNE --> RESULT[Parse Cleanup\\nOutput]:::workflow',
-    '    RESULT --> TRACK{Node\\nFailed?}:::decision',
+    '    MORE -->|yes| EXCLUDE',
+    '    MORE -->|no| DOCKER{Docker\\nPrune?}:::decision',
+    '    DOCKER -->|yes| PRUNE[Docker Prune\\nDocker API]:::activity',
+    '    DOCKER -->|no| TRACK',
+    '    PRUNE --> TRACK{Node\\nFailed?}:::decision',
     '    TRACK -->|yes| FAIL[Track Failed\\nNode]:::error',
     '    TRACK -->|no| NEXT',
     '    FAIL --> NEXT{More\\nNodes?}:::decision',
@@ -102,9 +105,9 @@ Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and 
       body: '<p>Applies default configuration values if not provided:</p><p><code>DataDir</code>: <code>/opt/nomad/data</code><br><code>GraceDays</code>: 7<br><code>DryRun</code>: true (safe by default)<br><code>DockerPrune</code>: false</p><p>Configurable via environment variables on the trigger job.</p>'
     },
     DISCOVER: {
-      title: 'Get All Nomad Client Nodes',
+      title: 'Get Nomad Client Nodes',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Queries the Nomad API to list all client nodes with <code>ready</code> status. Extracts IP address or HTTPAddr for SSH connection.</p><p>Detects Oracle nodes by name prefix &mdash; these use <code>ubuntu</code> user with <code>sudo</code> instead of direct <code>root</code> access.</p><p>Returns <code>[]NodeInfo</code> with ID, Name, Address, and IsOracle flag.</p>'
+      body: '<p>Queries the Nomad API to list all client nodes with <code>ready</code> status, extracting each node\'s IP address for the SSH connection.</p><p>Returns <code>[]NodeInfo</code>. The worker connects as <code>root</code> on every node, so no per-node user or sudo handling is needed.</p>'
     },
     EMPTY: {
       title: 'Nodes Found?',
@@ -116,25 +119,30 @@ Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and 
       badge: 'workflow', badgeText: 'sequential loop',
       body: '<p>Nodes are processed one at a time (not in parallel) to avoid overwhelming SSH connections and to make cleanup output easier to follow.</p><p>Activity timeout: 10 min start-to-close, 30 min schedule-to-close per node.</p>'
     },
-    SSH: {
-      title: 'Cleanup Node via SSH',
+    RUNJOBS: {
+      title: 'Get Running Jobs (Nomad API)',
       badge: 'activity', badgeText: 'activity',
-      body: '<p>Establishes an SSH connection to the target node using certificate-based authentication.</p><p>SSH config: configurable key path, cert path, and host CA path with sensible defaults. Oracle nodes use <code>ubuntu</code> user; all others use <code>root</code>.</p>'
+      body: '<p>Reads the node\'s running allocations from the <b>central Nomad API</b> (<code>Nodes().Allocations(node.ID)</code>) and builds the running-job set in Go.</p><p>No script runs on the node and no <code>NOMAD_TOKEN</code> is shipped to it.</p>'
     },
-    SCRIPT: {
-      title: 'Execute Cleanup Script',
-      badge: 'activity', badgeText: 'generated script',
-      body: '<p>A bash script is generated dynamically by <code>buildCleanupScript()</code> and executed over the SSH session.</p><p>The script runs on the remote node and handles all directory enumeration, job checking, and deletion logic locally.</p>'
+    CONNECT: {
+      title: 'Open SSH/SFTP to Node',
+      badge: 'activity', badgeText: 'activity',
+      body: '<p>Opens one SSH connection (certificate auth with host-CA verification) and an SFTP session over it. The worker connects as <code>root</code> on every node &mdash; the Vault SSH CA issues a root principal the Oracle hosts accept too &mdash; so there is no per-node user or sudo handling.</p>'
     },
-    ENUM: {
-      title: 'Enumerate Job Directories',
-      badge: 'activity', badgeText: 'remote execution',
-      body: '<p>Scans the configured data directory (default: <code>/opt/nomad/data</code>) for job data directories.</p><p>Excludes system directories: <code>alloc</code>, <code>plugins</code>, <code>tmp</code>, <code>server</code>, <code>client</code>.</p>'
+    LIST: {
+      title: 'List Dirs via SFTP',
+      badge: 'activity', badgeText: 'SFTP',
+      body: '<p>Lists the immediate subdirectories of the data directory (default: <code>/opt/nomad/data</code>) and their modification times over <b>SFTP</b> (<code>ReadDir</code>) &mdash; no remote shell. The per-directory decisions below all run in Go.</p>'
+    },
+    EXCLUDE: {
+      title: 'System Dir?',
+      badge: 'decision', badgeText: 'safety filter',
+      body: '<p>System directories are never cleanup candidates and are skipped: <code>alloc</code>, <code>plugins</code>, <code>tmp</code>, <code>server</code>, <code>client</code>.</p>'
     },
     RUNNING: {
-      title: 'Check Against Running Jobs',
-      badge: 'activity', badgeText: 'remote execution',
-      body: '<p>Queries the local Nomad agent API on the node to get the list of currently running jobs. Directories matching running job names are never removed.</p>'
+      title: 'Matches Running Job?',
+      badge: 'decision', badgeText: 'safety filter',
+      body: '<p>Checks the directory name (and its task-group-index-stripped form) against the running-job set from the Nomad API. A directory belonging to a running job is kept (active) and never removed.</p>'
     },
     GRACE: {
       title: 'Grace Period Check',
@@ -159,7 +167,7 @@ Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and 
     DELETE: {
       title: 'Remove Directory',
       badge: 'activity', badgeText: 'destructive',
-      body: '<p>Removes the orphaned job data directory from the node. This is the only destructive operation in the workflow.</p><p>Only runs when <code>DryRun=false</code> and the directory is older than the grace period.</p>'
+      body: '<p>Removes the orphaned job data directory and its contents over <b>SFTP</b> (<code>RemoveAll</code>) &mdash; the only destructive operation in the workflow.</p><p>Only runs when <code>DryRun=false</code> and the directory is older than the grace period.</p>'
     },
     MORE: {
       title: 'More Directories?',
@@ -172,19 +180,14 @@ Sequential node cleanup orchestration showing discovery, SSH-based cleanup, and 
       body: '<p>If <code>DockerPrune=true</code>, runs Docker system prune after directory cleanup. Disabled by default.</p>'
     },
     PRUNE: {
-      title: 'Docker System Prune',
+      title: 'Docker Prune (Docker API)',
       badge: 'activity', badgeText: 'optional activity',
-      body: '<p>Executes <code>docker system prune -af</code> on the node to remove unused images, containers, and build cache.</p><p>Reports the amount of disk space freed in the <code>DockerSpaceFreed</code> field.</p>'
-    },
-    RESULT: {
-      title: 'Parse Cleanup Output',
-      badge: 'workflow', badgeText: 'parsing',
-      body: '<p>Parses the cleanup script output to extract counts. Looks for a <code>RESULT:</code> line with format:</p><p><code>RESULT: scanned=X orphaned=Y deleted=Z skipped=W docker_freed=XXB</code></p><p>Maps to <code>CleanupResult</code> fields: Scanned, Orphaned, Deleted, Skipped, DockerSpaceFreed.</p>'
+      body: '<p>Prunes unused containers, all unused images, networks, and build cache through the <b>Docker API</b> tunneled over the SSH connection (<code>ContainerPrune</code> + <code>ImagePrune</code> + <code>NetworkPrune</code> + <code>BuildCachePrune</code>) &mdash; not a <code>docker system prune</code> shell command.</p><p>Reports the reclaimed bytes (structured <code>SpaceReclaimed</code>) in <code>DockerSpaceFreed</code>.</p>'
     },
     TRACK: {
       title: 'Node Failed?',
       badge: 'decision', badgeText: 'error check',
-      body: '<p>Checks if the SSH session or cleanup script returned an error. Failed nodes are tracked but do not terminate the workflow.</p>'
+      body: '<p>Checks if the node\'s cleanup returned an error (SSH/SFTP failure, or a delete that failed). Failed nodes are tracked but do not terminate the workflow.</p>'
     },
     FAIL: {
       title: 'Track Failed Node',

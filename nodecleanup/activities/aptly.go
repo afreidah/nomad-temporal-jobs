@@ -15,9 +15,9 @@ package activities
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"go.temporal.io/sdk/activity"
 )
 
@@ -64,19 +64,14 @@ func (a *Activities) RunAptlyDBCleanup(ctx context.Context, node NodeInfo, image
 	logger := activity.GetLogger(ctx)
 	logger.Info("Running aptly db cleanup (one-shot)", "node", node.Name, "image", image, "data_dir", dataDir)
 
-	sudo := ""
-	if node.IsOracle {
-		sudo = "sudo "
-	}
-
 	inner := `printf '{"rootDir":"/opt/aptly"}' > /etc/aptly.conf && aptly db cleanup`
-	cmd := fmt.Sprintf(
-		`%sdocker run --rm --entrypoint sh -v %s:/opt/aptly %s -c %s 2>&1`,
-		sudo, shellQuote(dataDir), shellQuote(image), shellQuote(inner))
-
-	out, err := a.runSSHCommandWithHeartbeat(ctx, node, cmd, 30*time.Second)
+	out, err := a.ssh.RunContainer(ctx, sshTarget(node), &container.Config{
+		Image:      image,
+		Entrypoint: []string{"sh"},
+		Cmd:        []string{"-c", inner},
+	}, []string{dataDir + ":/opt/aptly"}, 30*time.Second)
 	if err != nil {
-		return out, fmt.Errorf("aptly db cleanup on %s: %w (output: %s)", node.Name, err, strings.TrimSpace(out))
+		return out, fmt.Errorf("aptly db cleanup on %s: %w", node.Name, err)
 	}
 
 	logger.Info("aptly db cleanup complete", "node", node.Name)
