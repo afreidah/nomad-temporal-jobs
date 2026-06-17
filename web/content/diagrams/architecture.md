@@ -52,10 +52,12 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    TEMPORAL --> BTQ[backup\\ntask-queue]:::middleware',
     '    TEMPORAL --> TTQ[trivy\\ntask-queue]:::middleware',
     '    TEMPORAL --> CTQ[cleanup\\ntask-queue]:::middleware',
+    '    TEMPORAL --> CETQ[cert\\ntask-queue]:::middleware',
     '',
     '    BTQ --> BWORKER[Backup\\nWorker]:::handler',
     '    TTQ --> TWORKER[Trivy Scan\\nWorker]:::handler',
     '    CTQ --> CWORKER[Cleanup\\nWorker]:::handler',
+    '    CETQ --> CEWORKER[Cert Acquirer\\nWorker]:::handler',
     '',
     '    BWORKER --> NOMAD_API[Nomad API]:::data',
     '    BWORKER --> CONSUL_API[Consul API]:::data',
@@ -67,7 +69,11 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    TWORKER --> PG',
     '',
     '    CWORKER --> NOMAD_API',
-    '    CWORKER --> SSH[SSH\\nNomad Nodes]:::data',
+    '    CWORKER --> SSH[SSH / SFTP\\n+ Docker tunnel]:::data',
+    '',
+    '    CEWORKER --> VAULT[Vault]:::data',
+    '    CEWORKER --> ACME[ACME\\nLetsEncrypt]:::data',
+    '    CEWORKER --> CF[Cloudflare\\nDNS]:::data',
     '',
     '    BWORKER --> TEMPO[Tempo\\nTracing]:::observability',
     '    BWORKER --> PROM[Prometheus\\nMetrics]:::observability',
@@ -75,10 +81,13 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    TWORKER --> PROM',
     '    CWORKER --> TEMPO',
     '    CWORKER --> PROM',
+    '    CEWORKER --> TEMPO',
+    '    CEWORKER --> PROM',
     '',
     '    BWORKER --> LOKI[Loki\\nLogging]:::observability',
     '    TWORKER --> LOKI',
     '    CWORKER --> LOKI',
+    '    CEWORKER --> LOKI',
     '',
     '    classDef entry fill:#059669,stroke:#34d399,color:#fff,font-weight:bold',
     '    classDef middleware fill:#0d9488,stroke:#14b8a6,color:#fff',
@@ -124,10 +133,15 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
       badge: 'middleware', badgeText: 'task queue',
       body: '<p>Temporal task queue shared by the node cleanup and registry GC workflows and their activities. Only the cleanup worker polls this queue.</p><p>Retry policy: 1s initial interval, 2.0 backoff, 1m max interval, 3 max attempts (the long-running registry GC step runs with 1 attempt).</p>'
     },
+    CETQ: {
+      title: 'cert-task-queue',
+      badge: 'middleware', badgeText: 'task queue',
+      body: '<p>Temporal task queue for the cert-acquirer workflow and activities. Only the cert-acquirer worker polls this queue.</p><p>Issuance uses few attempts with long backoff (DNS-01 propagation is slow and Let\'s Encrypt rate-limits duplicate issuance); the publish step retries quickly.</p>'
+    },
     BWORKER: {
       title: 'Backup Worker',
       badge: 'handler', badgeText: 'worker',
-      body: '<p>Orchestrates sequential infrastructure backups: Nomad Raft snapshot &rarr; Consul Raft snapshot &rarr; PostgreSQL pg_dumpall &rarr; S3 uploads &rarr; retention cleanup.</p><p>Snapshot failures terminate the workflow. S3 upload failures are logged as warnings but do not block &mdash; local backups always succeed.</p><p>Quick activity timeouts: 5min start-to-close / 15min schedule-to-close. Long timeouts for PostgreSQL: 30min / 60min.</p><p><a href="../backup-workflow/">Backup workflow diagram &rarr;</a></p>'
+      body: '<p>Runs three snapshot legs <b>concurrently</b> &mdash; Nomad Raft, Consul Raft, and PostgreSQL &mdash; joining before retention cleanup. The Postgres leg dumps cluster globals once then fans out a per-database <code>pg_dump</code> with bounded concurrency. Artifacts land on NFS and upload to S3.</p><p>Snapshot/globals/listing failures terminate the workflow. S3 upload failures are logged as warnings but do not block &mdash; local backups always succeed.</p><p>Quick activity timeouts: 5min / 15min. Long timeouts for per-database dumps and uploads: 30min / 60-90min.</p><p><a href="../backup-workflow/">Backup workflow diagram &rarr;</a></p>'
     },
     TWORKER: {
       title: 'Trivy Scan Worker',
@@ -137,22 +151,27 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     CWORKER: {
       title: 'Cleanup Worker',
       badge: 'handler', badgeText: 'worker',
-      body: '<p>Connects to each Nomad client node via SSH and removes orphaned job data directories. Nodes processed sequentially.</p><p>Excludes system dirs (alloc, plugins, tmp, server, client). Grace period filter skips recently modified directories. Optional Docker image prune.</p><p>Dry-run mode enabled by default for safe preview. Activity timeout: 10min start-to-close / 30min schedule-to-close per node.</p><p>This worker also hosts the <b>registry GC saga</b> on the same task queue &mdash; it scales the registry offline, runs <code>garbage-collect</code> over SSH, and always scales it back via deferred compensation.</p><p><a href="../nodecleanup-workflow/">Node cleanup workflow diagram &rarr;</a><br><a href="../registry-gc-workflow/">Registry GC workflow diagram &rarr;</a></p>'
+      body: '<p>Removes orphaned Nomad job data directories. Running jobs come from the central Nomad API; the per-node directory work is done over <b>SFTP</b> (list / measure / delete) &mdash; never a remote shell. Optional Docker prune runs through the Docker API. Nodes are processed sequentially.</p><p>Excludes system dirs (alloc, plugins, tmp, server, client). Grace-period filter skips recently modified directories. Dry-run mode enabled by default.</p><p>This worker also hosts the <b>registry GC</b> and <b>aptly cleanup</b> sagas (scale a job offline, run a one-shot container via the Docker API tunneled over SSH, always scale back via deferred compensation) and a <b>postgres-maintenance</b> workflow, all on the same task queue.</p><p><a href="../nodecleanup-workflow/">Node cleanup workflow diagram &rarr;</a><br><a href="../registry-gc-workflow/">Registry GC workflow diagram &rarr;</a></p>'
+    },
+    CEWORKER: {
+      title: 'Cert Acquirer Worker',
+      badge: 'handler', badgeText: 'worker',
+      body: '<p>Issues the <code>*.munchbox.cc</code> wildcard certificate via ACME DNS-01 (Cloudflare, go-acme/lego) and publishes it to Vault for Traefik to read.</p><p>Issuance and publish are separate activities: the issued cert+key are written to a Vault staging path so a publish retry never re-runs ACME (Let\'s Encrypt rate limits), and the private key never transits workflow history.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the Cloudflare token through Vault &mdash; no static secrets in the job.</p>'
     },
     NOMAD_API: {
       title: 'Nomad API',
       badge: 'data', badgeText: 'external service',
-      body: '<p>HashiCorp Nomad HTTP API. Used by all three workers:</p><p><b>Backup:</b> <code>nomad operator snapshot save</code> for Raft snapshots.<br><b>Trivy:</b> <code>/v1/allocations</code> to discover running Docker images.<br><b>Cleanup:</b> <code>/v1/nodes</code> to list client nodes; local agent API on each node for running job enumeration.</p><p>All calls wrapped with OTel-instrumented HTTP transport via <code>shared.NewNomadClient()</code>. Produces <code>peer.service: nomad</code> service graph edges.</p>'
+      body: '<p>HashiCorp Nomad HTTP API. Used by three workers via the native Go client (no CLI):</p><p><b>Backup:</b> <code>Operator().Snapshot()</code> for the Raft snapshot, streamed to disk.<br><b>Trivy:</b> allocation list to discover running Docker images.<br><b>Cleanup:</b> node list, and each node\'s running allocations (<code>Nodes().Allocations</code>) to decide which data dirs are orphaned &mdash; plus job scaling for the registry/aptly sagas.</p><p>All calls wrapped with OTel-instrumented HTTP transport via <code>shared.NewNomadClient()</code> (pooled on each activity struct). Produces <code>peer.service: nomad</code> service graph edges.</p>'
     },
     CONSUL_API: {
       title: 'Consul API',
       badge: 'data', badgeText: 'external service',
-      body: '<p>HashiCorp Consul HTTP API. Used by the backup worker for <code>consul snapshot save</code> to capture Raft state.</p><p>Snapshot stored locally on NFS mount, then uploaded to S3.</p>'
+      body: '<p>HashiCorp Consul HTTP API. The backup worker captures Raft state (which includes Vault data) via the native Go client <code>Snapshot().Save()</code>, streamed to disk &mdash; no <code>consul</code> CLI.</p><p>Snapshot stored locally on NFS mount, then uploaded to S3.</p>'
     },
     PG: {
       title: 'PostgreSQL',
       badge: 'data', badgeText: 'database',
-      body: '<p>Used by two workers:</p><p><b>Backup:</b> <code>pg_dumpall | gzip</code> for full database backup. Long timeout (30min/60min) for large databases.</p><p><b>Trivy:</b> Stores scan results transactionally &mdash; scan record + individual vulnerabilities. Deduplicates by vuln ID, truncates long descriptions to 1000 chars. Connection wrapped with <code>otelsql</code> for trace propagation.</p>'
+      body: '<p>Used by two workers:</p><p><b>Backup:</b> dumps cluster globals once, lists databases via <code>database/sql</code>, then fans out a per-database <code>pg_dump</code> with bounded concurrency &mdash; each subprocess gzipped in-process (no <code>| gzip</code> shell pipe). Long timeout (30min/60min) for large databases.</p><p><b>Trivy:</b> Stores scan results transactionally &mdash; scan record + individual vulnerabilities. Deduplicates by vuln ID, truncates long descriptions to 1000 chars. Connection wrapped with <code>otelsql</code> for trace propagation.</p>'
     },
     S3: {
       title: 'S3 Storage',
@@ -165,9 +184,24 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
       body: '<p>Aqua Trivy vulnerability scanner in server mode. Scans container images via <code>trivy image --server --format json --timeout 10m</code>.</p><p>Returns JSON results with vulnerability counts by severity (critical, high, medium, low). Error classification: manifest unknown and image not found are permanent; connection errors and timeouts are transient.</p>'
     },
     SSH: {
-      title: 'SSH (Nomad Nodes)',
+      title: 'SSH / SFTP + Docker tunnel',
       badge: 'data', badgeText: 'external service',
-      body: '<p>SSH connections to each Nomad client node for cleanup operations. Uses certificate-based authentication with configurable key, cert, and host CA paths.</p><p>Oracle nodes detected by name prefix &mdash; uses <code>ubuntu</code> user with <code>sudo</code> instead of <code>root</code>.</p><p>Executes a generated bash script that enumerates directories, checks grace periods, and optionally prunes Docker images.</p>'
+      body: '<p>The cleanup worker\'s SSH connection to each Nomad client node (and the registry/aptly hosts). Certificate auth with host-CA verification; the worker connects as <code>root</code> everywhere &mdash; the Vault SSH CA issues a root principal the Oracle hosts accept too, so there is no per-node user or sudo handling.</p><p>The connection carries only native operations: <b>SFTP</b> for file work (list/measure/delete data dirs) and a tunneled <b>Docker API</b> for the registry-GC / aptly one-shot containers and the docker prune. No remote shell commands or generated scripts.</p>'
+    },
+    VAULT: {
+      title: 'Vault',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>HashiCorp Vault. The cert worker authenticates with its Nomad Workload Identity token, reads the Cloudflare DNS token, persists the ACME account, and writes the issued wildcard to the path Traefik reads.</p><p>The newer self-authenticating workers source every other credential through this client, so no static service tokens are templated into the job.</p>'
+    },
+    ACME: {
+      title: 'ACME (Lets Encrypt)',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>The ACME directory (Let\'s Encrypt production by default; point at staging for testing). The cert worker runs the DNS-01 challenge via go-acme/lego. Rate-limit responses are classified non-retryable for the run so it stops hammering the endpoint.</p>'
+    },
+    CF: {
+      title: 'Cloudflare DNS',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>Cloudflare DNS API. The cert worker provisions the <code>_acme-challenge</code> TXT record for the DNS-01 challenge using a scoped API token read from Vault.</p>'
     },
     TEMPO: {
       title: 'Tempo (Tracing)',

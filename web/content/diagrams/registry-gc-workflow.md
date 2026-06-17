@@ -4,7 +4,7 @@ linkTitle: "Registry GC"
 weight: 40
 ---
 
-Saga-style Docker registry garbage collection. The registry is scaled offline, garbage-collected over SSH, and **always** scaled back online via a deferred compensation &mdash; even if GC fails, an activity times out, or the workflow is cancelled. **Hover over any step** for implementation details.
+Saga-style Docker registry garbage collection. The registry is scaled offline, garbage-collected via a one-shot container run through the Docker API (tunneled over SSH), and **always** scaled back online via a deferred compensation &mdash; even if GC fails, an activity times out, or the workflow is cancelled. **Hover over any step** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -53,7 +53,7 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
     '    SGATE -->|no| ABORT[Return Error\\nno compensation]:::error',
     '    SGATE -->|yes| DEFER[Register Deferred\\nScale-Back]:::compensation',
     '    DEFER --> DRAIN[Wait Allocs\\nDrained]:::activity',
-    '    DRAIN --> GC[Run Garbage-\\nCollect via SSH]:::activity',
+    '    DRAIN --> GC[Run Garbage-\\nCollect Docker API]:::activity',
     '    GC --> MEASURE2[Measure Data Dir\\nafter]:::activity',
     '    MEASURE2 --> REPORT[Compute Bytes\\nReclaimed]:::workflow',
     '    REPORT --> COMP',
@@ -102,7 +102,7 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
     MEASURE1: {
       title: 'Measure Data Dir (before)',
       badge: 'activity', badgeText: 'activity',
-      body: '<p><code>MeasureRegistryDataDir</code> runs <code>du -sb</code> over SSH against the registry\'s bind-mounted storage. SSH-only because the path is host-side and the Nomad API does not expose disk usage.</p><p>The result is reported as the "before" size and used to compute bytes reclaimed.</p>'
+      body: '<p><code>MeasureRegistryDataDir</code> measures the registry\'s bind-mounted storage by walking it over <b>SFTP</b> (<code>DirSize</code>) on the registry host &mdash; the path is host-side and the Nomad API does not expose disk usage.</p><p>The result is reported as the "before" size and used to compute bytes reclaimed.</p>'
     },
     SCALE0: {
       title: 'Scale Registry to 0',
@@ -130,9 +130,9 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
       body: '<p><code>WaitRegistryAllocsDrained</code> polls the Nomad API until the registry job has zero running allocations. Heartbeats every poll; bounded by the activity\'s start-to-close timeout.</p>'
     },
     GC: {
-      title: 'Run Garbage-Collect via SSH',
+      title: 'Run Garbage-Collect (Docker API)',
       badge: 'activity', badgeText: 'long-running, 1 attempt',
-      body: '<p><code>RunRegistryGarbageCollect</code> SSHes to the registry host and runs <code>docker run ... registry garbage-collect</code> against the bind-mounted storage, honoring <code>--dry-run</code> and <code>--delete-untagged</code>.</p><p>The long-running step heartbeats periodically. Configured with <b>MaxAttempts=1</b> &mdash; a partial GC is not retried; the deferred scale-back brings the registry back online and the failure surfaces.</p>'
+      body: '<p><code>RunRegistryGarbageCollect</code> runs the one-shot <code>garbage-collect</code> container through the <b>Docker API</b> &mdash; tunneled over the SSH connection to the registry host\'s docker socket (container create &rarr; start &rarr; wait while heartbeating &rarr; read logs &rarr; remove) &mdash; honoring <code>--dry-run</code> and <code>--delete-untagged</code>. No <code>docker run</code> shell command is involved.</p><p>Configured with <b>MaxAttempts=1</b> &mdash; a partial GC is not retried; the deferred scale-back brings the registry back online and the failure surfaces.</p>'
     },
     MEASURE2: {
       title: 'Measure Data Dir (after)',

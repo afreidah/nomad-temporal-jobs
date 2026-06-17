@@ -31,14 +31,14 @@ func TestConfig_Validate_AllRequired(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_AppliesDefaults(t *testing.T) {
+func TestConfig_ApplyDefaults(t *testing.T) {
 	cfg := Config{
 		S3Endpoint:  "http://localhost:9000",
 		S3Bucket:    "test",
 		S3AccessKey: "access",
 		S3SecretKey: "secret",
 	}
-	_ = cfg.Validate()
+	cfg.ApplyDefaults()
 
 	if cfg.NomadBackupDir != "/mnt/gdrive/nomad-snapshots" {
 		t.Errorf("NomadBackupDir = %q, want default", cfg.NomadBackupDir)
@@ -52,9 +52,6 @@ func TestConfig_Validate_AppliesDefaults(t *testing.T) {
 	if cfg.RegistryBackupDir != "/mnt/gdrive/registry-backups" {
 		t.Errorf("RegistryBackupDir = %q, want default", cfg.RegistryBackupDir)
 	}
-	if cfg.RegistryDataDir != "/mnt/gdrive/munchbox-data/registry" {
-		t.Errorf("RegistryDataDir = %q, want default", cfg.RegistryDataDir)
-	}
 	if cfg.PostgresHost != "postgres-primary.service.consul" {
 		t.Errorf("PostgresHost = %q, want default", cfg.PostgresHost)
 	}
@@ -63,7 +60,7 @@ func TestConfig_Validate_AppliesDefaults(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_PreservesCustomDirs(t *testing.T) {
+func TestConfig_ApplyDefaults_PreservesCustomDirs(t *testing.T) {
 	cfg := Config{
 		S3Endpoint:        "http://localhost:9000",
 		S3Bucket:          "test",
@@ -73,9 +70,8 @@ func TestConfig_Validate_PreservesCustomDirs(t *testing.T) {
 		ConsulBackupDir:   "/custom/consul",
 		PostgresBackupDir: "/custom/postgres",
 		RegistryBackupDir: "/custom/registry",
-		RegistryDataDir:   "/custom/data",
 	}
-	_ = cfg.Validate()
+	cfg.ApplyDefaults()
 
 	if cfg.NomadBackupDir != "/custom/nomad" {
 		t.Errorf("NomadBackupDir = %q, want /custom/nomad", cfg.NomadBackupDir)

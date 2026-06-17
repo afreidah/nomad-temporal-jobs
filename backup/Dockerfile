@@ -3,9 +3,10 @@
 #
 # Project: Nomad Temporal Jobs / Author: Alex Freidah
 #
-# Builds the backup-worker binary with HashiCorp CLI tools (nomad, consul)
-# and PostgreSQL 18 client for snapshot operations.
-# Uses Debian for access to the official PostgreSQL apt repo.
+# Builds the backup-worker binary. Nomad and Consul snapshots are taken
+# through their Go APIs, so only the PostgreSQL 18 client (pg_dump/pg_dumpall,
+# which have no Go-native equivalent) is bundled. Uses Debian for access to
+# the official PostgreSQL apt repo.
 # -------------------------------------------------------------------------------
 
 # -------------------------------------------------------------------------
@@ -24,7 +25,7 @@ RUN go mod download
 COPY shared/ shared/
 COPY backup/ backup/
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o backup-worker ./backup/worker
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o backup-worker ./backup/worker
 
 # -------------------------------------------------------------------------
 # STAGE 2: RUNTIME
@@ -32,41 +33,18 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o backup-worker ./backup/worker
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    bash \
-    unzip \
-    procps \
-    tar \
-    gzip \
-    gnupg \
-    lsb-release \
-    && rm -rf /var/lib/apt/lists/*
-
-# --- PostgreSQL 18 client (matches server version) ---
-RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
+# ca-certificates + the PostgreSQL 18 client (matches the server version;
+# pg_dump/pg_dumpall have no Go-native equivalent). curl/gnupg are pulled only
+# to add the pgdg apt repo and purged in the same layer so they don't ship.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client-18 \
+    && apt-get purge -y curl gnupg \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
-
-# --- Install Nomad CLI ---
-ARG NOMAD_VERSION=1.11.1
-ARG TARGETARCH
-RUN curl -fsSL https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_${TARGETARCH}.zip -o nomad.zip \
-    && unzip -o nomad.zip \
-    && mv nomad /usr/local/bin/ \
-    && rm -f nomad.zip LICENSE.txt \
-    && chmod +x /usr/local/bin/nomad
-
-# --- Install Consul CLI ---
-ARG CONSUL_VERSION=1.22.1
-RUN curl -fsSL https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_${TARGETARCH}.zip -o consul.zip \
-    && unzip -o consul.zip \
-    && mv consul /usr/local/bin/ \
-    && rm -f consul.zip LICENSE.txt \
-    && chmod +x /usr/local/bin/consul
 
 COPY --from=builder /build/backup-worker /usr/local/bin/
 
@@ -75,8 +53,5 @@ RUN mkdir -p /mnt/gdrive/nomad-snapshots \
     /mnt/gdrive/consul-snapshots \
     /mnt/gdrive/postgres-backups \
     /mnt/gdrive/registry-backups
-
-# SSH directory for cleanup workflow (key mounted at runtime)
-RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
 ENTRYPOINT ["backup-worker"]

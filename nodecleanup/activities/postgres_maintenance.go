@@ -69,29 +69,9 @@ func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error
 	)
 	defer span.End()
 
-	db, err := shared.NewPostgresDB(a.pgConfig("postgres"))
+	dbs, err := shared.ListDatabaseNames(ctx, a.pgConfig("postgres"))
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	const query = `SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn = true ORDER BY datname`
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("list databases: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var dbs []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("scan database name: %w", err)
-		}
-		dbs = append(dbs, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate databases: %w", err)
+		return nil, err
 	}
 
 	logger.Info("Discovered PostgreSQL databases", "count", len(dbs))

@@ -3,9 +3,12 @@
 #
 # Project: Nomad Temporal Jobs / Author: Alex Freidah
 #
-# Builds the cleanup-worker binary for removing orphaned Nomad data
-# directories via SSH. Lightweight Alpine image with no CLI tools needed
-# since all remote operations execute via SSH on the target nodes.
+# Builds the cleanup-worker binary. Every remote operation is pure Go now --
+# SSH/SFTP via x/crypto + pkg/sftp, Docker via the moby API client, Nomad via
+# its API -- so there are no CLI tools to bundle and the runtime stage is
+# distroless static: no shell, no package manager, minimal attack surface. Runs
+# as root because the worker reads its SSH key/cert from the root-owned mount
+# under /root/.ssh.
 # -------------------------------------------------------------------------------
 
 # -------------------------------------------------------------------------
@@ -24,15 +27,13 @@ RUN go mod download
 COPY shared/ shared/
 COPY nodecleanup/ nodecleanup/
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o cleanup-worker ./nodecleanup/worker
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o cleanup-worker ./nodecleanup/worker
 
 # -------------------------------------------------------------------------
 # STAGE 2: RUNTIME
 # -------------------------------------------------------------------------
 
-FROM alpine:3.21
-
-RUN apk add --no-cache ca-certificates procps
+FROM gcr.io/distroless/static-debian12
 
 COPY --from=builder /build/cleanup-worker /usr/local/bin/
 

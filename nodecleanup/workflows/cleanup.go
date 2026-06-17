@@ -17,10 +17,10 @@ import (
 	"strings"
 	"time"
 
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"munchbox/temporal-workers/nodecleanup/activities"
+	"munchbox/temporal-workers/shared"
 )
 
 // --- Nil-typed activity stub for compile-time method references ---
@@ -49,12 +49,7 @@ func Cleanup(ctx workflow.Context, config activities.CleanupConfig) ([]activitie
 	ao := workflow.ActivityOptions{
 		StartToCloseTimeout:    10 * time.Minute,
 		ScheduleToCloseTimeout: 30 * time.Minute,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    time.Second,
-			BackoffCoefficient: 2.0,
-			MaximumInterval:    time.Minute,
-			MaximumAttempts:    3,
-		},
+		RetryPolicy:            shared.StandardRetry(),
 	}
 	ctx = workflow.WithActivityOptions(ctx, ao)
 

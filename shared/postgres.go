@@ -11,6 +11,7 @@
 package shared
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strconv"
@@ -63,4 +64,37 @@ func NewPostgresDB(cfg PostgresConfig) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+// ListDatabaseNames returns the non-template, connectable databases in the
+// cluster, ordered by name. It opens a short-lived pool from cfg (which should
+// point at a maintenance database such as "postgres") and closes it before
+// returning. Shared by the backup and postgres-maintenance workers so both
+// enumerate databases the same way.
+func ListDatabaseNames(ctx context.Context, cfg PostgresConfig) ([]string, error) {
+	db, err := NewPostgresDB(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const query = `SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn = true ORDER BY datname`
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list databases: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var dbs []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan database name: %w", err)
+		}
+		dbs = append(dbs, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate databases: %w", err)
+	}
+	return dbs, nil
 }

@@ -13,17 +13,17 @@
 package activities
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"munchbox/temporal-workers/shared"
 
+	nomadapi "github.com/hashicorp/nomad/api"
+	"github.com/moby/moby/client"
 	"go.temporal.io/sdk/activity"
-	"golang.org/x/crypto/ssh"
 )
 
 // -------------------------------------------------------------------------
@@ -46,8 +46,8 @@ type Config struct {
 	PostgresSSLRootCert string // optional CA path for verify-ca/verify-full
 }
 
-// Validate applies defaults for optional fields.
-func (c *Config) Validate() {
+// ApplyDefaults fills optional SSH and Postgres fields with their defaults.
+func (c *Config) ApplyDefaults() {
 	if c.SSHKeyPath == "" {
 		c.SSHKeyPath = "/root/.ssh/id_ed25519"
 	}
@@ -80,12 +80,35 @@ func (c *Config) Validate() {
 // activity implementations.
 type Activities struct {
 	config Config
+	nomad  *nomadapi.Client
+	ssh    *shared.SSHClient
 }
 
-// New creates an Activities instance with validated configuration.
-func New(cfg Config) *Activities {
-	cfg.Validate()
-	return &Activities{config: cfg}
+// New creates an Activities instance with defaults applied and shared Nomad and
+// SSH clients reused across activity invocations (rather than rebuilt per call).
+func New(cfg Config) (*Activities, error) {
+	cfg.ApplyDefaults()
+	nomad, err := shared.NewNomadClient()
+	if err != nil {
+		return nil, fmt.Errorf("create nomad client: %w", err)
+	}
+	sshClient, err := shared.NewSSHClient(shared.SSHConfig{
+		KeyPath:    cfg.SSHKeyPath,
+		CertPath:   cfg.SSHCertPath,
+		HostCAPath: cfg.SSHHostCAPath,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create ssh client: %w", err)
+	}
+	return &Activities{config: cfg, nomad: nomad, ssh: sshClient}, nil
+}
+
+// sshTarget builds the SSH target for a node. The worker connects as root
+// everywhere -- the Vault SSH CA issues a root principal the oracle hosts
+// accept too -- so there is no per-node user or sudo handling, and root reaches
+// root-owned data dirs and the docker socket directly.
+func sshTarget(node NodeInfo) shared.SSHTarget {
+	return shared.SSHTarget{Host: node.Address, User: "root"}
 }
 
 // -------------------------------------------------------------------------
@@ -139,11 +162,7 @@ func (a *Activities) GetAllNomadClientNodes(ctx context.Context) ([]NodeInfo, er
 	)
 	defer span.End()
 
-	client, err := shared.NewNomadClient()
-	if err != nil {
-		return nil, fmt.Errorf("create Nomad client: %w", err)
-	}
-
+	client := a.nomad
 	nodeList, _, err := client.Nodes().List(nil)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
@@ -184,292 +203,188 @@ func (a *Activities) GetAllNomadClientNodes(ctx context.Context) ([]NodeInfo, er
 	return nodes, nil
 }
 
-// CleanupNodeViaSSH connects to a node over SSH and executes a cleanup
-// script that identifies and optionally removes orphaned job data
-// directories. Returns detailed results including counts and any errors.
+// CleanupNodeViaSSH removes orphaned Nomad job data directories on a node. The
+// set of running jobs comes from the Nomad API (so no token is shipped to the
+// node); the directory scan and deletions run over SSH because the data lives
+// on the node's disk and Nomad exposes no API for it. Dry-run reports what
+// would be deleted without removing anything.
 func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node NodeInfo, config CleanupConfig) (CleanupResult, error) {
 	logger := activity.GetLogger(ctx)
-	result := CleanupResult{
-		NodeName: node.Name,
-		NodeAddr: node.Address,
-	}
+	result := CleanupResult{NodeName: node.Name, NodeAddr: node.Address, DockerSpaceFreed: "0B"}
 
-	logger.Info("Connecting to node via SSH", "node", node.Name, "address", node.Address)
-
-	sshConfig, err := a.buildSSHConfig(node)
+	// Running jobs on this node, straight from the Nomad API.
+	running, err := a.runningJobs(ctx, node.ID)
 	if err != nil {
 		result.Errors = append(result.Errors, err.Error())
 		return result, err
 	}
 
-	// Connect to the node
-	sshAddr := fmt.Sprintf("%s:22", node.Address)
-	client, err := ssh.Dial("tcp", sshAddr, sshConfig)
+	logger.Info("Connecting to node via SSH", "node", node.Name, "address", node.Address)
+	conn, err := a.ssh.Connect(sshTarget(node))
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("SSH connect failed: %v", err))
+		result.Errors = append(result.Errors, fmt.Sprintf("ssh connect: %v", err))
 		return result, err
 	}
-	defer client.Close()
+	defer func() { _ = conn.Close() }()
 
-	// Build and execute the cleanup script
-	sudoPrefix := ""
-	if node.IsOracle {
-		sudoPrefix = "sudo "
-	}
-	nomadToken := os.Getenv("NOMAD_TOKEN")
-	script := buildCleanupScript(node.ID, node.HTTPAddr, config.DataDir, config.GraceDays, config.DryRun, config.DockerPrune, sudoPrefix, nomadToken)
-
-	session, err := client.NewSession()
+	entries, err := listDataDirs(conn, config.DataDir)
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("SSH session failed: %v", err))
-		return result, err
-	}
-	defer session.Close()
-
-	var stdout, stderr bytes.Buffer
-	session.Stdout = &stdout
-	session.Stderr = &stderr
-
-	logger.Info("Executing cleanup script", "node", node.Name)
-	if err := session.Run(script); err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("script failed: %v, stderr: %s", err, stderr.String()))
+		result.Errors = append(result.Errors, err.Error())
 		return result, err
 	}
 
-	result.Output = stdout.String()
-	parseCleanupOutput(&result, stdout.String())
+	now := time.Now()
+	var out strings.Builder
+	for _, e := range entries {
+		result.Scanned++
+		if _, excluded := orphanExcludes[e.name]; excluded {
+			result.Skipped++
+			continue
+		}
+		if isJobRunning(e.name, running) {
+			fmt.Fprintf(&out, "OK (active): %s\n", e.name)
+			continue
+		}
+		ageDays := int(now.Sub(e.mtime).Hours() / 24)
+		if ageDays < config.GraceDays {
+			fmt.Fprintf(&out, "SKIP (%dd old, grace=%dd): %s\n", ageDays, config.GraceDays, e.name)
+			result.Skipped++
+			continue
+		}
 
+		result.Orphaned++
+		path := strings.TrimRight(config.DataDir, "/") + "/" + e.name
+		if config.DryRun {
+			fmt.Fprintf(&out, "WOULD DELETE (%dd old): %s\n", ageDays, e.name)
+			continue
+		}
+		if derr := conn.RemoveAll(path); derr != nil {
+			logger.Warn("Failed to delete orphan dir", "dir", e.name, "error", derr)
+			result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.name, derr))
+			continue
+		}
+		fmt.Fprintf(&out, "DELETED (%dd old): %s\n", ageDays, e.name)
+		result.Deleted++
+	}
+
+	if config.DockerPrune {
+		freed, dockerOut := a.dockerPrune(ctx, conn, config.DryRun)
+		result.DockerSpaceFreed = freed
+		out.WriteString(dockerOut)
+	}
+
+	result.Output = out.String()
 	logger.Info("Node cleanup complete",
 		"node", node.Name,
 		"scanned", result.Scanned,
 		"orphaned", result.Orphaned,
 		"deleted", result.Deleted,
 		"skipped", result.Skipped)
-
 	return result, nil
 }
 
-// -------------------------------------------------------------------------
-// SSH HELPERS
-// -------------------------------------------------------------------------
+// orphanExcludes are the Nomad data subdirectories that are never cleanup
+// candidates -- they hold live runtime state, not per-job ephemeral data.
+var orphanExcludes = map[string]struct{}{
+	"alloc": {}, "plugins": {}, "tmp": {}, "server": {}, "client": {},
+}
 
-// buildSSHConfig constructs an SSH client configuration with certificate-based
-// auth (preferred) falling back to plain key auth. Host keys are verified
-// against the host CA public key.
-func (a *Activities) buildSSHConfig(node NodeInfo) (*ssh.ClientConfig, error) {
-	sshUser := "root"
-	if node.IsOracle {
-		sshUser = "ubuntu"
-	}
+// indexSuffix matches a trailing "-<digits>" task-group index on a data dir
+// name, so "myjob-2" maps back to the job "myjob".
+var indexSuffix = regexp.MustCompile(`-[0-9]*$`)
 
-	keyData, err := os.ReadFile(a.config.SSHKeyPath)
+// dirEntry is one immediate subdirectory of the data dir with its mtime.
+type dirEntry struct {
+	name  string
+	mtime time.Time
+}
+
+// runningJobs returns the set of job IDs with a running allocation on the node,
+// read from the Nomad API.
+func (a *Activities) runningJobs(ctx context.Context, nodeID string) (map[string]struct{}, error) {
+	_, span := shared.StartClientSpan(ctx, "nomad.node_allocations", shared.PeerServiceAttr("nomad"))
+	defer span.End()
+
+	allocs, _, err := a.nomad.Nodes().Allocations(nodeID, nil)
 	if err != nil {
-		return nil, fmt.Errorf("read SSH key %s: %w", a.config.SSHKeyPath, err)
+		return nil, fmt.Errorf("list allocations for node %s: %w", nodeID, err)
 	}
-
-	signer, err := ssh.ParsePrivateKey(keyData)
-	if err != nil {
-		return nil, fmt.Errorf("parse SSH key: %w", err)
-	}
-
-	// Prefer cert auth, fall back to plain key
-	var authMethods []ssh.AuthMethod
-
-	certData, err := os.ReadFile(a.config.SSHCertPath)
-	if err == nil {
-		pubKey, _, _, _, err := ssh.ParseAuthorizedKey(certData)
-		if err == nil {
-			if cert, ok := pubKey.(*ssh.Certificate); ok {
-				if certSigner, err := ssh.NewCertSigner(cert, signer); err == nil {
-					authMethods = append(authMethods, ssh.PublicKeys(certSigner))
-				}
-			}
+	running := make(map[string]struct{})
+	for _, al := range allocs {
+		if al.ClientStatus == "running" {
+			running[al.JobID] = struct{}{}
 		}
 	}
-	authMethods = append(authMethods, ssh.PublicKeys(signer))
+	return running, nil
+}
 
-	// Verify host keys against host CA
-	hostCAData, err := os.ReadFile(a.config.SSHHostCAPath)
+// listDataDirs returns the immediate subdirectories of dataDir on the remote
+// host with their modification times, over SFTP.
+func listDataDirs(conn *shared.SSHConn, dataDir string) ([]dirEntry, error) {
+	infos, err := conn.ReadDir(dataDir)
 	if err != nil {
-		return nil, fmt.Errorf("read host CA %s: %w", a.config.SSHHostCAPath, err)
+		return nil, fmt.Errorf("list data dirs in %s: %w", dataDir, err)
 	}
 
-	hostCAKey, _, _, _, err := ssh.ParseAuthorizedKey(hostCAData)
-	if err != nil {
-		return nil, fmt.Errorf("parse host CA key: %w", err)
-	}
-
-	certChecker := &ssh.CertChecker{
-		IsHostAuthority: func(auth ssh.PublicKey, address string) bool {
-			return bytes.Equal(auth.Marshal(), hostCAKey.Marshal())
-		},
-	}
-
-	return &ssh.ClientConfig{
-		User:            sshUser,
-		Auth:            authMethods,
-		HostKeyCallback: certChecker.CheckHostKey,
-		Timeout:         30 * time.Second,
-	}, nil
-}
-
-// -------------------------------------------------------------------------
-// SCRIPT GENERATION
-// -------------------------------------------------------------------------
-
-// buildCleanupScript generates a bash script that runs on the remote node
-// to identify and optionally remove orphaned Nomad data directories.
-func buildCleanupScript(nodeID, httpAddr, dataDir string, graceDays int, dryRun, dockerPrune bool, sudoPrefix, nomadToken string) string {
-	dryRunFlag := "true"
-	if !dryRun {
-		dryRunFlag = "false"
-	}
-	dockerPruneFlag := "false"
-	if dockerPrune {
-		dockerPruneFlag = "true"
-	}
-
-	return fmt.Sprintf(`#!/bin/bash
-set -e
-
-DATA_DIR="%s"
-GRACE_DAYS=%d
-DRY_RUN="%s"
-DOCKER_PRUNE="%s"
-NODE_ID="%s"
-NOMAD_TOKEN="%s"
-NOMAD_HTTP_ADDR="%s"
-
-SCANNED=0
-ORPHANED=0
-DELETED=0
-SKIPPED=0
-DOCKER_SPACE_FREED="0B"
-
-EXCLUDE="alloc plugins tmp server client"
-
-NOMAD_CA=""
-for ca in /etc/nomad.d/tls/ca.crt /opt/nomad/tls/vault-intermediate-ca.pem; do
-  if [ -f "$ca" ]; then
-    NOMAD_CA="$ca"
-    break
-  fi
-done
-
-if [ -z "$NOMAD_CA" ]; then
-  echo "ERROR: Could not find Nomad CA certificate"
-  exit 1
-fi
-
-RUNNING_JOBS=$(%scurl -sf --cacert "$NOMAD_CA" \
-  -H "X-Nomad-Token: $NOMAD_TOKEN" \
-  "https://${NOMAD_HTTP_ADDR}/v1/node/${NODE_ID}/allocations" 2>/dev/null | \
-  %sjq -r '.[] | select(.ClientStatus == "running") | .JobID' 2>/dev/null | sort -u || echo "")
-
-if [ -z "$RUNNING_JOBS" ]; then
-  echo "ERROR: Could not get running jobs from local Nomad agent at ${NOMAD_HTTP_ADDR}"
-  exit 1
-fi
-
-echo "Running jobs on this node:"
-echo "$RUNNING_JOBS" | sed 's/^/  - /'
-echo ""
-
-strip_index() {
-  echo "$1" | sed 's/-[0-9]*$//'
-}
-
-is_running() {
-  local dir="$1"
-  local base=$(strip_index "$dir")
-  echo "$RUNNING_JOBS" | grep -qx "$dir" && return 0
-  echo "$RUNNING_JOBS" | grep -qx "$base" && return 0
-  return 1
-}
-
-for dir in "$DATA_DIR"/*/; do
-  [ -d "$dir" ] || continue
-
-  dirname=$(basename "$dir")
-  SCANNED=$((SCANNED + 1))
-
-  if echo "$EXCLUDE" | grep -qw "$dirname"; then
-    echo "SKIP (system): $dirname"
-    SKIPPED=$((SKIPPED + 1))
-    continue
-  fi
-
-  if is_running "$dirname"; then
-    echo "OK (active): $dirname"
-    continue
-  fi
-
-  mtime=$(%sstat -c %%Y "$dir" 2>/dev/null || echo 0)
-  now=$(date +%%s)
-  age_days=$(( (now - mtime) / 86400 ))
-
-  if [ "$age_days" -lt "$GRACE_DAYS" ]; then
-    echo "SKIP (${age_days}d old, grace=${GRACE_DAYS}d): $dirname"
-    SKIPPED=$((SKIPPED + 1))
-    continue
-  fi
-
-  size=$(%sdu -sh "$dir" 2>/dev/null | cut -f1 || echo "?")
-
-  ORPHANED=$((ORPHANED + 1))
-
-  if [ "$DRY_RUN" = "true" ]; then
-    echo "WOULD DELETE (${age_days}d old, $size): $dirname"
-  else
-    echo "DELETING (${age_days}d old, $size): $dirname"
-    %srm -rf "$dir"
-    DELETED=$((DELETED + 1))
-  fi
-done
-
-echo ""
-
-if [ "$DOCKER_PRUNE" = "true" ]; then
-  echo "=== Docker Cleanup ==="
-  if [ "$DRY_RUN" = "true" ]; then
-    echo "Would prune unused Docker images (dry run)"
-    %sdocker system df 2>/dev/null || echo "Docker not available"
-  else
-    PRUNE_OUTPUT=$(%sdocker system prune -af 2>&1 || echo "Docker prune failed")
-    echo "$PRUNE_OUTPUT"
-    DOCKER_SPACE_FREED=$(echo "$PRUNE_OUTPUT" | grep -oP 'Total reclaimed space: \K[0-9.]+[A-Za-z]+' || echo "0B")
-  fi
-fi
-
-echo ""
-echo "RESULT: scanned=$SCANNED orphaned=$ORPHANED deleted=$DELETED skipped=$SKIPPED docker_freed=$DOCKER_SPACE_FREED"
-`, dataDir, graceDays, dryRunFlag, dockerPruneFlag, nodeID, nomadToken, httpAddr, sudoPrefix, sudoPrefix, sudoPrefix, sudoPrefix, sudoPrefix, sudoPrefix, sudoPrefix)
-}
-
-// -------------------------------------------------------------------------
-// OUTPUT PARSING
-// -------------------------------------------------------------------------
-
-// parseCleanupOutput extracts counts from the RESULT line of the cleanup
-// script output and populates the CleanupResult fields.
-func parseCleanupOutput(result *CleanupResult, output string) {
-	for _, line := range strings.Split(output, "\n") {
-		if !strings.HasPrefix(line, "RESULT:") {
-			continue
-		}
-		for _, part := range strings.Fields(line) {
-			switch {
-			case strings.HasPrefix(part, "scanned="):
-				_, _ = fmt.Sscanf(part, "scanned=%d", &result.Scanned)
-			case strings.HasPrefix(part, "orphaned="):
-				_, _ = fmt.Sscanf(part, "orphaned=%d", &result.Orphaned)
-			case strings.HasPrefix(part, "deleted="):
-				_, _ = fmt.Sscanf(part, "deleted=%d", &result.Deleted)
-			case strings.HasPrefix(part, "skipped="):
-				_, _ = fmt.Sscanf(part, "skipped=%d", &result.Skipped)
-			case strings.HasPrefix(part, "docker_freed="):
-				result.DockerSpaceFreed = strings.TrimPrefix(part, "docker_freed=")
-			}
+	var entries []dirEntry
+	for _, fi := range infos {
+		if fi.IsDir() {
+			entries = append(entries, dirEntry{name: fi.Name(), mtime: fi.ModTime()})
 		}
 	}
+	return entries, nil
+}
+
+// isJobRunning reports whether a data dir name (possibly suffixed with a
+// task-group index) corresponds to a currently-running job.
+func isJobRunning(dirName string, running map[string]struct{}) bool {
+	if _, ok := running[dirName]; ok {
+		return true
+	}
+	_, ok := running[indexSuffix.ReplaceAllString(dirName, "")]
+	return ok
+}
+
+// dockerPrune reclaims unused Docker resources on the node through the Docker
+// API (tunneled over conn) -- the equivalent of `docker system prune -af`. In
+// dry-run it does nothing. Returns the reclaimed-space string and a log
+// fragment.
+func (a *Activities) dockerPrune(ctx context.Context, conn *shared.SSHConn, dryRun bool) (string, string) {
+	if dryRun {
+		return "0B", "=== Docker Cleanup (dry run; skipped) ===\n"
+	}
+
+	cli, err := conn.DockerClient()
+	if err != nil {
+		return "0B", "=== Docker Cleanup ===\ndocker client: " + err.Error() + "\n"
+	}
+	defer func() { _ = cli.Close() }()
+
+	var reclaimed uint64
+	var note strings.Builder
+	note.WriteString("=== Docker Cleanup ===\n")
+
+	if cp, perr := cli.ContainerPrune(ctx, client.ContainerPruneOptions{}); perr != nil {
+		fmt.Fprintf(&note, "container prune: %v\n", perr)
+	} else {
+		reclaimed += cp.Report.SpaceReclaimed
+	}
+	// dangling=false prunes all unused images, matching `prune -a`.
+	if ip, perr := cli.ImagePrune(ctx, client.ImagePruneOptions{Filters: client.Filters{}.Add("dangling", "false")}); perr != nil {
+		fmt.Fprintf(&note, "image prune: %v\n", perr)
+	} else {
+		reclaimed += ip.Report.SpaceReclaimed
+	}
+	if _, perr := cli.NetworkPrune(ctx, client.NetworkPruneOptions{}); perr != nil {
+		fmt.Fprintf(&note, "network prune: %v\n", perr)
+	}
+	if bp, perr := cli.BuildCachePrune(ctx, client.BuildCachePruneOptions{All: true}); perr != nil {
+		fmt.Fprintf(&note, "build cache prune: %v\n", perr)
+	} else {
+		reclaimed += bp.Report.SpaceReclaimed
+	}
+
+	freed := HumanBytes(int64(reclaimed))
+	fmt.Fprintf(&note, "reclaimed %s\n", freed)
+	return freed, note.String()
 }

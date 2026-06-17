@@ -14,12 +14,14 @@ package activities
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,6 +32,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	consulapi "github.com/hashicorp/consul/api"
+	nomadapi "github.com/hashicorp/nomad/api"
 	"go.opentelemetry.io/otel/attribute"
 	"go.temporal.io/sdk/activity"
 )
@@ -49,28 +53,14 @@ type Config struct {
 	ConsulBackupDir   string // default: /mnt/gdrive/consul-snapshots
 	PostgresBackupDir string // default: /mnt/gdrive/postgres-backups
 	RegistryBackupDir string // default: /mnt/gdrive/registry-backups
-	RegistryDataDir   string // default: /mnt/gdrive/munchbox-data/registry
 
 	PostgresHost string // default: postgres-primary.service.consul
 	PostgresUser string // default: postgres
 }
 
-// Validate checks that required S3 fields are present and applies defaults
-// for optional directory paths.
-func (c *Config) Validate() error {
-	if c.S3Endpoint == "" {
-		return fmt.Errorf("S3Endpoint is required")
-	}
-	if c.S3Bucket == "" {
-		return fmt.Errorf("S3Bucket is required")
-	}
-	if c.S3AccessKey == "" {
-		return fmt.Errorf("S3AccessKey is required")
-	}
-	if c.S3SecretKey == "" {
-		return fmt.Errorf("S3SecretKey is required")
-	}
-
+// ApplyDefaults fills optional directory paths and Postgres connection
+// settings with their defaults. Mutating; call it before Validate.
+func (c *Config) ApplyDefaults() {
 	if c.NomadBackupDir == "" {
 		c.NomadBackupDir = "/mnt/gdrive/nomad-snapshots"
 	}
@@ -83,14 +73,28 @@ func (c *Config) Validate() error {
 	if c.RegistryBackupDir == "" {
 		c.RegistryBackupDir = "/mnt/gdrive/registry-backups"
 	}
-	if c.RegistryDataDir == "" {
-		c.RegistryDataDir = "/mnt/gdrive/munchbox-data/registry"
-	}
 	if c.PostgresHost == "" {
 		c.PostgresHost = "postgres-primary.service.consul"
 	}
 	if c.PostgresUser == "" {
 		c.PostgresUser = "postgres"
+	}
+}
+
+// Validate checks that the required S3 fields are present. Pure: it does not
+// mutate the config.
+func (c *Config) Validate() error {
+	if c.S3Endpoint == "" {
+		return fmt.Errorf("S3Endpoint is required")
+	}
+	if c.S3Bucket == "" {
+		return fmt.Errorf("S3Bucket is required")
+	}
+	if c.S3AccessKey == "" {
+		return fmt.Errorf("S3AccessKey is required")
+	}
+	if c.S3SecretKey == "" {
+		return fmt.Errorf("S3SecretKey is required")
 	}
 	return nil
 }
@@ -105,13 +109,21 @@ func (c *Config) Validate() error {
 type Activities struct {
 	config   Config
 	s3Client *s3.Client
+	nomad    *nomadapi.Client
 }
 
-// New creates an Activities instance with a pre-configured S3 client.
-// Returns an error if the config is invalid.
+// New creates an Activities instance with a pre-configured S3 client and a
+// shared Nomad client (reused across invocations). Returns an error if the
+// config is invalid.
 func New(cfg Config) (*Activities, error) {
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	nomad, err := shared.NewNomadClient()
+	if err != nil {
+		return nil, fmt.Errorf("create nomad client: %w", err)
 	}
 
 	endpoint := cfg.S3Endpoint
@@ -122,7 +134,7 @@ func New(cfg Config) (*Activities, error) {
 		UsePathStyle: true,
 	})
 
-	return &Activities{config: cfg, s3Client: s3Client}, nil
+	return &Activities{config: cfg, s3Client: s3Client, nomad: nomad}, nil
 }
 
 // -------------------------------------------------------------------------
@@ -187,8 +199,10 @@ func (c *BackupConfig) ApplyDefaults() {
 // -------------------------------------------------------------------------
 
 // TakeNomadSnapshot creates a Raft snapshot of the Nomad cluster state
-// including job specs, allocations, ACLs, and scheduler configuration.
-// Requires NOMAD_TOKEN with snapshot permissions in the environment.
+// including job specs, allocations, ACLs, and scheduler configuration. Streams
+// the snapshot from the Nomad API through the shared OTel-instrumented client
+// (so it appears as a service-graph edge) straight to disk. Requires
+// NOMAD_TOKEN with snapshot permissions in the environment.
 func (a *Activities) TakeNomadSnapshot(ctx context.Context) (string, error) {
 	logger := activity.GetLogger(ctx)
 
@@ -205,24 +219,27 @@ func (a *Activities) TakeNomadSnapshot(ctx context.Context) (string, error) {
 	timestamp := time.Now().Format("20060102150405")
 	filename := filepath.Join(a.config.NomadBackupDir, fmt.Sprintf("nomad-%s.snap", timestamp))
 
-	cmd := exec.CommandContext(ctx, "nomad", "operator", "snapshot", "save", filename)
-	output, err := cmd.CombinedOutput()
+	snap, err := a.nomad.Operator().Snapshot((&nomadapi.QueryOptions{}).WithContext(ctx))
 	if err != nil {
-		return "", fmt.Errorf("nomad snapshot failed: %w, output: %s", err, output)
+		return "", fmt.Errorf("nomad snapshot: %w", err)
+	}
+	defer func() { _ = snap.Close() }()
+
+	written, err := streamToFile(filename, snap)
+	if err != nil {
+		return "", fmt.Errorf("write nomad snapshot: %w", err)
 	}
 
-	// Log file size for operational visibility
-	if info, statErr := os.Stat(filename); statErr == nil {
-		logger.Info("Nomad snapshot saved", "path", filename, "size_bytes", info.Size())
-	}
-
+	logger.Info("Nomad snapshot saved", "path", filename, "size_bytes", written)
 	return filename, nil
 }
 
 // TakeConsulSnapshot creates a Raft snapshot of the Consul cluster state
-// including KV store, service catalog, ACLs, sessions, and intentions.
-// Vault data is included since Vault uses Consul as its storage backend.
-// Requires CONSUL_HTTP_TOKEN with snapshot permissions in the environment.
+// including KV store, service catalog, ACLs, sessions, and intentions. Vault
+// data is included since Vault uses Consul as its storage backend. Streams the
+// snapshot from the Consul API through the shared OTel-instrumented client
+// straight to disk. The ACL token comes from CONSUL_HTTP_TOKEN and the address
+// from the CONSUL_* environment (default: local agent).
 func (a *Activities) TakeConsulSnapshot(ctx context.Context) (string, error) {
 	logger := activity.GetLogger(ctx)
 
@@ -239,22 +256,30 @@ func (a *Activities) TakeConsulSnapshot(ctx context.Context) (string, error) {
 	timestamp := time.Now().Format("20060102150405")
 	filename := filepath.Join(a.config.ConsulBackupDir, fmt.Sprintf("consul-%s.snap", timestamp))
 
-	cmd := exec.CommandContext(ctx, "consul", "snapshot", "save", filename)
-	output, err := cmd.CombinedOutput()
+	// nil Vault client: the ACL token falls back to CONSUL_HTTP_TOKEN.
+	client, err := shared.NewConsulClient(ctx, nil)
 	if err != nil {
-		return "", fmt.Errorf("consul snapshot failed: %w, output: %s", err, output)
+		return "", fmt.Errorf("create consul client: %w", err)
+	}
+	snap, _, err := client.Snapshot().Save((&consulapi.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		return "", fmt.Errorf("consul snapshot: %w", err)
+	}
+	defer func() { _ = snap.Close() }()
+
+	written, err := streamToFile(filename, snap)
+	if err != nil {
+		return "", fmt.Errorf("write consul snapshot: %w", err)
 	}
 
-	if info, statErr := os.Stat(filename); statErr == nil {
-		logger.Info("Consul snapshot saved", "path", filename, "size_bytes", info.Size())
-	}
-
+	logger.Info("Consul snapshot saved", "path", filename, "size_bytes", written)
 	return filename, nil
 }
 
 // ListPostgresDatabases returns the names of all non-template, connectable
 // databases in the cluster. The workflow fans these out into per-database
-// dumps. Requires PGPASSWORD in the environment.
+// dumps. Queries the catalog directly through the shared instrumented client.
+// Requires PGPASSWORD in the environment.
 func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error) {
 	logger := activity.GetLogger(ctx)
 
@@ -264,26 +289,16 @@ func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error
 	)
 	defer span.End()
 
-	const query = `SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn = true ORDER BY datname`
-	cmd := exec.CommandContext(ctx, "psql",
-		"-h", a.config.PostgresHost,
-		"-U", a.config.PostgresUser,
-		"-d", "postgres",
-		"-tAc", query)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+os.Getenv("PGPASSWORD"))
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("list databases failed: %w, output: %s", err, stderr.String())
-	}
-
-	var dbs []string
-	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
-		if name := strings.TrimSpace(line); name != "" {
-			dbs = append(dbs, name)
-		}
+	dbs, err := shared.ListDatabaseNames(ctx, shared.PostgresConfig{
+		Host:     a.config.PostgresHost,
+		Port:     "5432",
+		User:     a.config.PostgresUser,
+		Password: os.Getenv("PGPASSWORD"),
+		DBName:   "postgres",
+		SSLMode:  "prefer",
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	logger.Info("Discovered PostgreSQL databases", "count", len(dbs))
@@ -310,16 +325,12 @@ func (a *Activities) BackupPostgresGlobals(ctx context.Context) (string, error) 
 	timestamp := time.Now().Format("20060102150405")
 	filename := filepath.Join(a.config.PostgresBackupDir, fmt.Sprintf("postgres-globals-%s.sql.gz", timestamp))
 
-	// Positional args ($1..$3) avoid shell-injection from host/user/path.
-	// pipefail ensures pg_dumpall failures propagate through the gzip pipe.
-	const script = `set -o pipefail; pg_dumpall -h "$1" -U "$2" --globals-only | gzip > "$3"`
-	cmd := exec.CommandContext(ctx, "bash", "-c", script,
-		"bash", a.config.PostgresHost, a.config.PostgresUser, filename)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+os.Getenv("PGPASSWORD"))
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("postgres globals dump failed: %w, output: %s", err, output)
+	// pg_dumpall has no Go-native equivalent, so it stays a subprocess -- but
+	// its stdout is gzipped in-process rather than piped through a shell, so
+	// there is no bash, no pipefail, and no shell-injection surface.
+	if err := runDumpToGzip(ctx, filename, 0,
+		"pg_dumpall", "-h", a.config.PostgresHost, "-U", a.config.PostgresUser, "--globals-only"); err != nil {
+		return "", fmt.Errorf("postgres globals dump: %w", err)
 	}
 
 	if info, statErr := os.Stat(filename); statErr == nil {
@@ -352,48 +363,17 @@ func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string
 	timestamp := time.Now().Format("20060102150405")
 	filename := filepath.Join(dbDir, fmt.Sprintf("postgres-%s-%s.sql.gz", safe, timestamp))
 
-	// Positional args ($1..$4) avoid shell-injection from the database name.
-	// pipefail ensures pg_dump failures propagate through the gzip pipe.
-	const script = `set -o pipefail; pg_dump -h "$1" -U "$2" -d "$3" | gzip > "$4"`
-	cmd := exec.CommandContext(ctx, "bash", "-c", script,
-		"bash", a.config.PostgresHost, a.config.PostgresUser, database, filename)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+os.Getenv("PGPASSWORD"))
-
-	if err := runCommandWithHeartbeat(ctx, cmd, 30*time.Second); err != nil {
-		return "", fmt.Errorf("postgres dump of %q failed: %w", database, err)
+	// pg_dump stays a subprocess (no Go-native equivalent); its stdout is
+	// gzipped in-process and the dump heartbeats so a stall on a large
+	// database trips the activity's HeartbeatTimeout. The database name is
+	// passed as a direct argument, not interpolated into a shell command.
+	if err := runDumpToGzip(ctx, filename, 30*time.Second,
+		"pg_dump", "-h", a.config.PostgresHost, "-U", a.config.PostgresUser, "-d", database); err != nil {
+		return "", fmt.Errorf("postgres dump of %q: %w", database, err)
 	}
 
 	if info, statErr := os.Stat(filename); statErr == nil {
 		logger.Info("PostgreSQL database saved", "database", database, "path", filename, "size_bytes", info.Size())
-	}
-
-	return filename, nil
-}
-
-// TakeRegistryBackup creates a gzipped tarball of the container registry
-// data directory including all pushed images, layers, manifests, and
-// metadata.
-func (a *Activities) TakeRegistryBackup(ctx context.Context) (string, error) {
-	logger := activity.GetLogger(ctx)
-
-	if err := os.MkdirAll(a.config.RegistryBackupDir, 0o755); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
-	}
-
-	timestamp := time.Now().Format("20060102150405")
-	filename := filepath.Join(a.config.RegistryBackupDir, fmt.Sprintf("registry-%s.tar.gz", timestamp))
-
-	cmd := exec.CommandContext(ctx, "tar", "-czf", filename,
-		"-C", filepath.Dir(a.config.RegistryDataDir),
-		filepath.Base(a.config.RegistryDataDir))
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("registry backup failed: %w, output: %s", err, output)
-	}
-
-	if info, statErr := os.Stat(filename); statErr == nil {
-		logger.Info("Registry backup saved", "path", filename, "size_bytes", info.Size())
 	}
 
 	return filename, nil
@@ -584,70 +564,81 @@ func SanitizeDBName(s string) string {
 	}, s)
 }
 
-// runCommandWithHeartbeat starts cmd and records an activity heartbeat every
-// interval until it finishes, so a long-running dump that stalls trips the
-// activity's HeartbeatTimeout. On context cancellation the process is killed.
-func runCommandWithHeartbeat(ctx context.Context, cmd *exec.Cmd, interval time.Duration) error {
-	var combined bytes.Buffer
-	cmd.Stdout = &combined
-	cmd.Stderr = &combined
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start command: %w", err)
+// streamToFile copies r into a freshly created file at path and returns the
+// number of bytes written. A partial file is removed if the copy or close
+// fails, so a failed snapshot never leaves a truncated artifact behind.
+func streamToFile(path string, r io.Reader) (int64, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return 0, fmt.Errorf("create %s: %w", path, err)
 	}
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	ticks := 0
-	for {
-		select {
-		case err := <-done:
-			if err != nil {
-				return fmt.Errorf("%w (output: %s)", err, combined.String())
-			}
-			return nil
-		case <-ticker.C:
-			ticks++
-			activity.RecordHeartbeat(ctx, ticks)
-		case <-ctx.Done():
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-			return ctx.Err()
-		}
+	n, err := io.Copy(f, r)
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("write %s: %w", path, err)
 	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return 0, fmt.Errorf("close %s: %w", path, err)
+	}
+	return n, nil
 }
 
-// uploadWithHeartbeat runs a multipart upload and records an activity
-// heartbeat every uploadHeartbeatInterval until it finishes, so a stalled
-// upload trips the activity's HeartbeatTimeout instead of silently running
-// to the StartToClose timeout. The uploader respects ctx cancellation, so on
-// timeout it returns promptly and the goroutine unblocks before the caller
-// closes the file.
-func uploadWithHeartbeat(ctx context.Context, uploader *manager.Uploader, input *s3.PutObjectInput) error {
-	done := make(chan error, 1)
-	go func() {
-		_, err := uploader.Upload(ctx, input)
-		done <- err
-	}()
-
-	ticker := time.NewTicker(uploadHeartbeatInterval)
-	defer ticker.Stop()
-
-	ticks := 0
-	for {
-		select {
-		case err := <-done:
-			return err
-		case <-ticker.C:
-			ticks++
-			activity.RecordHeartbeat(ctx, ticks)
-		}
+// runDumpToGzip runs a pg_dump-family command (name + args), streaming its
+// stdout through gzip into filename. stderr is captured for diagnostics. When
+// heartbeat > 0 the activity heartbeats while the dump runs, so a stall on a
+// large database trips the activity's HeartbeatTimeout. A partial output file
+// is removed on failure.
+func runDumpToGzip(ctx context.Context, filename string, heartbeat time.Duration, name string, args ...string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", filename, err)
 	}
+	gz := gzip.NewWriter(f)
+
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+os.Getenv("PGPASSWORD"))
+	cmd.Stdout = gz
+	cmd.Stderr = &stderr
+
+	var runErr error
+	if heartbeat > 0 {
+		_, runErr = shared.WithHeartbeat(ctx, heartbeat, func() (struct{}, error) {
+			return struct{}{}, cmd.Run()
+		})
+	} else {
+		runErr = cmd.Run()
+	}
+	if runErr != nil {
+		_ = gz.Close()
+		_ = f.Close()
+		_ = os.Remove(filename)
+		return fmt.Errorf("%s: %w (stderr: %s)", name, runErr, strings.TrimSpace(stderr.String()))
+	}
+	if err := gz.Close(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(filename)
+		return fmt.Errorf("flush gzip %s: %w", filename, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(filename)
+		return fmt.Errorf("close %s: %w", filename, err)
+	}
+	return nil
+}
+
+// uploadWithHeartbeat runs a multipart upload while heartbeating, so a stalled
+// upload trips the activity's HeartbeatTimeout instead of silently running to
+// the StartToClose timeout. The uploader respects ctx cancellation, so on
+// timeout it returns promptly.
+func uploadWithHeartbeat(ctx context.Context, uploader *manager.Uploader, input *s3.PutObjectInput) error {
+	_, err := shared.WithHeartbeat(ctx, uploadHeartbeatInterval, func() (struct{}, error) {
+		_, e := uploader.Upload(ctx, input)
+		return struct{}{}, e
+	})
+	return err
 }
 
 // deleteOldestObject finds and removes the oldest S3 object under the
@@ -681,13 +672,13 @@ func (a *Activities) deleteOldestObject(ctx context.Context, prefix, skipKey str
 		return fmt.Errorf("no objects to evict under %s", prefix)
 	}
 
-	sort.Slice(objects, func(i, j int) bool {
-		return objects[i].LastModified.Before(*objects[j].LastModified)
+	oldestObj := slices.MinFunc(objects, func(x, y s3types.Object) int {
+		return x.LastModified.Compare(*y.LastModified)
 	})
 
-	oldest := aws.ToString(objects[0].Key)
+	oldest := aws.ToString(oldestObj.Key)
 	logger.Info("Evicting oldest S3 backup", "key", oldest,
-		"age_days", int(time.Since(*objects[0].LastModified).Hours()/24))
+		"age_days", int(time.Since(*oldestObj.LastModified).Hours()/24))
 
 	_, err := a.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &bucket,
@@ -701,8 +692,8 @@ func (a *Activities) deleteOldestObject(ctx context.Context, prefix, skipKey str
 // non-existent directories gracefully. Deletion failures are logged but
 // do not stop the cleanup process.
 func cleanupDirectory(dir string, cutoff time.Time, logger interface {
-	Info(string, ...interface{})
-	Warn(string, ...interface{})
+	Info(string, ...any)
+	Warn(string, ...any)
 }) error {
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
