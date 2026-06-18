@@ -67,45 +67,81 @@ func NewSSHClient(cfg SSHConfig) (*SSHClient, error) {
 		timeout = defaultSSHTimeout
 	}
 
-	keyData, err := os.ReadFile(cfg.KeyPath)
+	signer, err := loadSigner(cfg.KeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("read ssh key %s: %w", cfg.KeyPath, err)
+		return nil, err
+	}
+	auth, err := buildAuthMethods(signer, cfg.CertPath)
+	if err != nil {
+		return nil, err
+	}
+	hostKey, err := hostCACallback(cfg.HostCAPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SSHClient{auth: auth, hostKey: hostKey, timeout: timeout}, nil
+}
+
+// loadSigner reads and parses the SSH private key at keyPath.
+func loadSigner(keyPath string) (ssh.Signer, error) {
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read ssh key %s: %w", keyPath, err)
 	}
 	signer, err := ssh.ParsePrivateKey(keyData)
 	if err != nil {
 		return nil, fmt.Errorf("parse ssh key: %w", err)
 	}
+	return signer, nil
+}
 
-	// Prefer certificate auth when a cert is present, fall back to the bare key.
+// buildAuthMethods returns certificate-then-key auth when certPath is set, or
+// key-only when it is empty. A present-but-broken certificate is a hard error
+// rather than a silent fall-through to bare-key auth, which would otherwise
+// surface later as a confusing "permission denied" from the server.
+func buildAuthMethods(signer ssh.Signer, certPath string) ([]ssh.AuthMethod, error) {
 	var auth []ssh.AuthMethod
-	if cfg.CertPath != "" {
-		if certData, rerr := os.ReadFile(cfg.CertPath); rerr == nil {
-			if pub, _, _, _, perr := ssh.ParseAuthorizedKey(certData); perr == nil {
-				if cert, ok := pub.(*ssh.Certificate); ok {
-					if certSigner, serr := ssh.NewCertSigner(cert, signer); serr == nil {
-						auth = append(auth, ssh.PublicKeys(certSigner))
-					}
-				}
-			}
+	if certPath != "" {
+		certData, err := os.ReadFile(certPath)
+		if err != nil {
+			return nil, fmt.Errorf("read ssh cert %s: %w", certPath, err)
 		}
+		pub, _, _, _, err := ssh.ParseAuthorizedKey(certData)
+		if err != nil {
+			return nil, fmt.Errorf("parse ssh cert %s: %w", certPath, err)
+		}
+		cert, ok := pub.(*ssh.Certificate)
+		if !ok {
+			return nil, fmt.Errorf("ssh cert %s is not a certificate", certPath)
+		}
+		certSigner, err := ssh.NewCertSigner(cert, signer)
+		if err != nil {
+			return nil, fmt.Errorf("build cert signer: %w", err)
+		}
+		auth = append(auth, ssh.PublicKeys(certSigner))
 	}
 	auth = append(auth, ssh.PublicKeys(signer))
+	return auth, nil
+}
 
-	hostCAData, err := os.ReadFile(cfg.HostCAPath)
+// hostCACallback reads the host CA public key at caPath and returns a callback
+// that verifies remote host keys were signed by it.
+func hostCACallback(caPath string) (ssh.HostKeyCallback, error) {
+	caData, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, fmt.Errorf("read host CA %s: %w", cfg.HostCAPath, err)
+		return nil, fmt.Errorf("read host CA %s: %w", caPath, err)
 	}
-	hostCAKey, _, _, _, err := ssh.ParseAuthorizedKey(hostCAData)
+	caKey, _, _, _, err := ssh.ParseAuthorizedKey(caData)
 	if err != nil {
 		return nil, fmt.Errorf("parse host CA key: %w", err)
 	}
 	checker := &ssh.CertChecker{
 		IsHostAuthority: func(auth ssh.PublicKey, _ string) bool {
-			return bytes.Equal(auth.Marshal(), hostCAKey.Marshal())
+			return bytes.Equal(auth.Marshal(), caKey.Marshal())
 		},
 	}
-
-	return &SSHClient{auth: auth, hostKey: checker.CheckHostKey, timeout: timeout}, nil
+	return checker.CheckHostKey, nil
 }
 
 // Connect opens a connection to t. The caller must Close the returned SSHConn.

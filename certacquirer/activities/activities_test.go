@@ -150,6 +150,51 @@ func TestLoadAccount_BadJSON(t *testing.T) {
 	}
 }
 
+func TestEnsureUser_NewAccount(t *testing.T) {
+	acts := New(Config{Vault: newFakeVault()})
+
+	user, isNew, err := acts.ensureUser(context.Background(), "ops@munchbox.cc")
+	if err != nil {
+		t.Fatalf("ensureUser: %v", err)
+	}
+	if !isNew {
+		t.Error("isNew = false, want true for a missing account")
+	}
+	if user == nil || user.email != "ops@munchbox.cc" || user.GetPrivateKey() == nil {
+		t.Errorf("user = %+v, want a fresh account with the requested email and a key", user)
+	}
+}
+
+func TestEnsureUser_ExistingAccount(t *testing.T) {
+	fake := newFakeVault()
+	acts := New(Config{Vault: fake})
+
+	key, _ := certcrypto.GeneratePrivateKey(certcrypto.EC256)
+	body, _ := json.Marshal(persistedAccount{Email: "ops@munchbox.cc", KeyPEM: string(certcrypto.PEMEncode(key))})
+	fake.kv[acts.cfg.AccountPath] = map[string]any{"account": string(body)}
+
+	user, isNew, err := acts.ensureUser(context.Background(), "someone-else@munchbox.cc")
+	if err != nil {
+		t.Fatalf("ensureUser: %v", err)
+	}
+	if isNew {
+		t.Error("isNew = true, want false when an account already exists")
+	}
+	if user.email != "ops@munchbox.cc" {
+		t.Errorf("email = %q, want the persisted account's email", user.email)
+	}
+}
+
+func TestEnsureUser_VaultError(t *testing.T) {
+	fake := newFakeVault()
+	fake.maybeErr = errors.New("vault unreachable")
+	acts := New(Config{Vault: fake})
+
+	if _, _, err := acts.ensureUser(context.Background(), "ops@munchbox.cc"); err == nil {
+		t.Fatal("ensureUser must surface a Vault error rather than generating a new account")
+	}
+}
+
 func TestSaveAccount_RoundTrip(t *testing.T) {
 	fake := newFakeVault()
 	acts := New(Config{Vault: fake})

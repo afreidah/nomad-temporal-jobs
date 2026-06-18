@@ -19,21 +19,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
 	"munchbox/temporal-workers/shared"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	consulapi "github.com/hashicorp/consul/api"
+	"github.com/aws/smithy-go"
 	nomadapi "github.com/hashicorp/nomad/api"
 	"go.opentelemetry.io/otel/attribute"
 	"go.temporal.io/sdk/activity"
@@ -82,8 +79,7 @@ func (c *Config) ApplyDefaults() {
 	}
 }
 
-// Validate checks that the required S3 fields are present. Pure: it does not
-// mutate the config.
+// Validate checks that the required S3 fields are present.
 func (c *Config) Validate() error {
 	if c.S3Endpoint == "" {
 		return errors.New("S3Endpoint is required")
@@ -104,13 +100,38 @@ func (c *Config) Validate() error {
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
+// s3Store is the backup worker's view of shared.S3Store -- only the operations
+// the backup activities call. *shared.S3Store satisfies it structurally, so the
+// shared client can grow without widening this interface.
+type s3Store interface {
+	Put(ctx context.Context, key string, body io.Reader) error
+	ListObjects(ctx context.Context, prefix string) ([]s3types.Object, error)
+	DeleteObject(ctx context.Context, key string) error
+	DeleteOldest(ctx context.Context, prefix, skipKey string) (string, error)
+}
+
+// databaseLister is the backup worker's view of shared.Postgres -- it only
+// enumerates databases for the per-database dump fan-out. *shared.Postgres
+// satisfies it structurally.
+type databaseLister interface {
+	ListDatabases(ctx context.Context) ([]string, error)
+}
+
+// consulSnapshotter is the backup worker's view of shared.Consul -- it only
+// takes Raft snapshots. *shared.Consul satisfies it structurally.
+type consulSnapshotter interface {
+	SaveSnapshot(ctx context.Context) (io.ReadCloser, error)
+}
+
 // Activities holds shared dependencies for backup activities. Register an
 // instance with the Temporal worker to expose all exported methods as
 // activity implementations.
 type Activities struct {
-	config   Config
-	s3Client *s3.Client
-	nomad    *nomadapi.Client
+	config Config
+	store  s3Store
+	nomad  *nomadapi.Client
+	pg     databaseLister
+	consul consulSnapshotter
 }
 
 // New creates an Activities instance with a pre-configured S3 client and a
@@ -127,15 +148,29 @@ func New(cfg Config) (*Activities, error) {
 		return nil, fmt.Errorf("create nomad client: %w", err)
 	}
 
-	endpoint := cfg.S3Endpoint
-	s3Client := s3.New(s3.Options{
-		BaseEndpoint: &endpoint,
-		Region:       "us-east-1", // required by SDK but ignored by s3-orchestrator
-		Credentials:  credentials.NewStaticCredentialsProvider(cfg.S3AccessKey, cfg.S3SecretKey, ""),
-		UsePathStyle: true,
+	store := shared.NewS3Store(shared.S3Config{
+		Endpoint:  cfg.S3Endpoint,
+		Bucket:    cfg.S3Bucket,
+		AccessKey: cfg.S3AccessKey,
+		SecretKey: cfg.S3SecretKey,
 	})
 
-	return &Activities{config: cfg, s3Client: s3Client, nomad: nomad}, nil
+	pg := shared.NewPostgres(shared.PostgresConfig{
+		Host:     cfg.PostgresHost,
+		Port:     "5432",
+		User:     cfg.PostgresUser,
+		Password: os.Getenv("PGPASSWORD"),
+		SSLMode:  "prefer",
+	})
+
+	// nil Vault client: the Consul ACL token falls back to CONSUL_HTTP_TOKEN.
+	// Construction does no I/O for a nil client, so Background is fine here.
+	consul, err := shared.NewConsul(context.Background(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create consul client: %w", err)
+	}
+
+	return &Activities{config: cfg, store: store, nomad: nomad, pg: pg, consul: consul}, nil
 }
 
 // -------------------------------------------------------------------------
@@ -208,9 +243,7 @@ func (a *Activities) TakeNomadSnapshot(ctx context.Context) (string, error) {
 	logger := activity.GetLogger(ctx)
 
 	// Client span for nomad edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "nomad.snapshot",
-		shared.PeerServiceAttr("nomad"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.snapshot")
 	defer span.End()
 
 	if err := os.MkdirAll(a.config.NomadBackupDir, 0o755); err != nil {
@@ -245,9 +278,7 @@ func (a *Activities) TakeConsulSnapshot(ctx context.Context) (string, error) {
 	logger := activity.GetLogger(ctx)
 
 	// Client span for consul edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "consul.snapshot",
-		shared.PeerServiceAttr("consul"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "consul", "consul.snapshot")
 	defer span.End()
 
 	if err := os.MkdirAll(a.config.ConsulBackupDir, 0o755); err != nil {
@@ -257,12 +288,7 @@ func (a *Activities) TakeConsulSnapshot(ctx context.Context) (string, error) {
 	timestamp := time.Now().Format("20060102150405")
 	filename := filepath.Join(a.config.ConsulBackupDir, fmt.Sprintf("consul-%s.snap", timestamp))
 
-	// nil Vault client: the ACL token falls back to CONSUL_HTTP_TOKEN.
-	client, err := shared.NewConsulClient(ctx, nil)
-	if err != nil {
-		return "", fmt.Errorf("create consul client: %w", err)
-	}
-	snap, _, err := client.Snapshot().Save((&consulapi.QueryOptions{}).WithContext(ctx))
+	snap, err := a.consul.SaveSnapshot(ctx)
 	if err != nil {
 		return "", fmt.Errorf("consul snapshot: %w", err)
 	}
@@ -285,19 +311,10 @@ func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error
 	logger := activity.GetLogger(ctx)
 
 	// Client span for postgres edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "postgres.list_databases",
-		shared.PeerServiceAttr("postgres-primary"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.list_databases")
 	defer span.End()
 
-	dbs, err := shared.ListDatabaseNames(ctx, shared.PostgresConfig{
-		Host:     a.config.PostgresHost,
-		Port:     "5432",
-		User:     a.config.PostgresUser,
-		Password: os.Getenv("PGPASSWORD"),
-		DBName:   "postgres",
-		SSLMode:  "prefer",
-	})
+	dbs, err := a.pg.ListDatabases(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -314,9 +331,7 @@ func (a *Activities) BackupPostgresGlobals(ctx context.Context) (string, error) 
 	logger := activity.GetLogger(ctx)
 
 	// Client span for postgres edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "postgres.backup_globals",
-		shared.PeerServiceAttr("postgres-primary"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.backup_globals")
 	defer span.End()
 
 	if err := os.MkdirAll(a.config.PostgresBackupDir, 0o755); err != nil {
@@ -349,9 +364,8 @@ func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string
 	logger := activity.GetLogger(ctx)
 
 	// Client span for postgres edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "postgres.backup_database",
+	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.backup_database",
 		attribute.String("postgres.database", database),
-		shared.PeerServiceAttr("postgres-primary"),
 	)
 	defer span.End()
 
@@ -384,14 +398,6 @@ func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string
 // S3 UPLOAD ACTIVITIES
 // -------------------------------------------------------------------------
 
-// Multipart upload tuning: large dumps (hundreds of MB) upload as parallel
-// chunks instead of one slow stream that would blow the activity timeout.
-const (
-	uploadPartSize          = 16 * 1024 * 1024 // 16 MB parts
-	uploadConcurrency       = 4                // parallel part uploads
-	uploadHeartbeatInterval = 30 * time.Second
-)
-
 // UploadToS3 uploads a local backup file to S3 storage using multipart upload.
 // The S3 key is constructed from the prefix and the original filename. If the
 // upload fails with a 507 quota error, the oldest backup under the same prefix
@@ -400,9 +406,7 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 	logger := activity.GetLogger(ctx)
 
 	// Client span for s3-orchestrator edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "s3.upload",
-		shared.PeerServiceAttr("s3-orchestrator"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "s3-orchestrator", "s3.upload")
 	defer span.End()
 
 	info, err := os.Stat(localPath)
@@ -413,11 +417,6 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 	key := keyPrefix + "/" + filepath.Base(localPath)
 	bucket := a.config.S3Bucket
 
-	uploader := manager.NewUploader(a.s3Client, func(u *manager.Uploader) {
-		u.PartSize = uploadPartSize
-		u.Concurrency = uploadConcurrency
-	})
-
 	const maxEvictions = 3
 	for attempt := range maxEvictions + 1 {
 		file, err := os.Open(localPath)
@@ -426,12 +425,7 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 		}
 
 		logger.Info("Uploading to S3", "key", key, "size_bytes", info.Size(), "bucket", bucket)
-
-		err = uploadWithHeartbeat(ctx, uploader, &s3.PutObjectInput{
-			Bucket: &bucket,
-			Key:    &key,
-			Body:   file,
-		})
+		err = a.store.Put(ctx, key, file)
 		_ = file.Close()
 
 		if err == nil {
@@ -444,9 +438,11 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 		}
 
 		logger.Warn("S3 quota exceeded, evicting oldest backup", "prefix", keyPrefix, "attempt", attempt+1)
-		if evictErr := a.deleteOldestObject(ctx, keyPrefix, key); evictErr != nil {
+		evicted, evictErr := a.store.DeleteOldest(ctx, keyPrefix, key)
+		if evictErr != nil {
 			return "", fmt.Errorf("upload failed (quota) and eviction failed: upload: %w, evict: %v", err, evictErr)
 		}
+		logger.Info("Evicted oldest S3 backup", "key", evicted)
 	}
 
 	return "", fmt.Errorf("upload %s failed after %d eviction attempts", localPath, maxEvictions)
@@ -487,53 +483,31 @@ func (a *Activities) CleanupOldS3Backups(ctx context.Context, retentionDays int)
 	logger := activity.GetLogger(ctx)
 
 	// Client span for s3-orchestrator edge in service graph
-	ctx, span := shared.StartClientSpan(ctx, "s3.cleanup",
-		shared.PeerServiceAttr("s3-orchestrator"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "s3-orchestrator", "s3.cleanup")
 	defer span.End()
 
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
-	prefix := "backups/"
-	bucket := a.config.S3Bucket
 	deleted := 0
 
 	logger.Info("Cleaning up old S3 backups", "retention_days", retentionDays, "cutoff", cutoff)
 
-	paginator := s3.NewListObjectsV2Paginator(a.s3Client, &s3.ListObjectsV2Input{
-		Bucket: &bucket,
-		Prefix: &prefix,
-	})
+	objs, err := a.store.ListObjects(ctx, "backups/")
+	if err != nil {
+		return fmt.Errorf("list S3 objects: %w", err)
+	}
 
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("list S3 objects: %w", err)
+	for _, obj := range objs {
+		if obj.LastModified == nil || !obj.LastModified.Before(cutoff) {
+			continue
 		}
-
-		for _, obj := range page.Contents {
-			if obj.LastModified == nil || !obj.LastModified.Before(cutoff) {
-				continue
-			}
-			key := aws.ToString(obj.Key)
-
-			// Skip prefix markers
-			if strings.HasSuffix(key, "/") {
-				continue
-			}
-
-			_, err := a.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-				Bucket: &bucket,
-				Key:    obj.Key,
-			})
-			if err != nil {
-				logger.Warn("Failed to delete old S3 backup", "key", key, "error", err)
-				continue
-			}
-
-			logger.Info("Deleted old S3 backup", "key", key,
-				"age_days", int(time.Since(*obj.LastModified).Hours()/24))
-			deleted++
+		key := aws.ToString(obj.Key)
+		if err := a.store.DeleteObject(ctx, key); err != nil {
+			logger.Warn("Failed to delete old S3 backup", "key", key, "error", err)
+			continue
 		}
+		logger.Info("Deleted old S3 backup", "key", key,
+			"age_days", int(time.Since(*obj.LastModified).Hours()/24))
+		deleted++
 	}
 
 	logger.Info("S3 cleanup complete", "deleted_count", deleted)
@@ -547,7 +521,22 @@ func (a *Activities) CleanupOldS3Backups(ctx context.Context, retentionDays int)
 // isQuotaError reports whether an S3 error indicates insufficient storage
 // (HTTP 507), which triggers the eviction-and-retry logic in UploadToS3.
 func isQuotaError(err error) bool {
-	return strings.Contains(err.Error(), "InsufficientStorage") || strings.Contains(err.Error(), "507")
+	if err == nil {
+		return false
+	}
+	// Prefer structured errors: an InsufficientStorage API code or HTTP 507.
+	// The string fallback matches only the specific code, never a bare "507"
+	// (which could appear in a request ID or byte count and wrongly trigger a
+	// destructive eviction).
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InsufficientStorage" {
+		return true
+	}
+	var respErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusInsufficientStorage {
+		return true
+	}
+	return strings.Contains(err.Error(), "InsufficientStorage")
 }
 
 // SanitizeDBName makes a database name safe for use in a backup path (the
@@ -628,64 +617,6 @@ func runDumpToGzip(ctx context.Context, filename string, heartbeat time.Duration
 		return fmt.Errorf("close %s: %w", filename, err)
 	}
 	return nil
-}
-
-// uploadWithHeartbeat runs a multipart upload while heartbeating, so a stalled
-// upload trips the activity's HeartbeatTimeout instead of silently running to
-// the StartToClose timeout. The uploader respects ctx cancellation, so on
-// timeout it returns promptly.
-func uploadWithHeartbeat(ctx context.Context, uploader *manager.Uploader, input *s3.PutObjectInput) error {
-	_, err := shared.WithHeartbeat(ctx, uploadHeartbeatInterval, func() (struct{}, error) {
-		_, e := uploader.Upload(ctx, input)
-		return struct{}{}, e
-	})
-	return err
-}
-
-// deleteOldestObject finds and removes the oldest S3 object under the
-// given prefix, skipping the key currently being uploaded. Used to free
-// quota when an upload fails with 507.
-func (a *Activities) deleteOldestObject(ctx context.Context, prefix, skipKey string) error {
-	logger := activity.GetLogger(ctx)
-	bucket := a.config.S3Bucket
-
-	searchPrefix := prefix + "/"
-	var objects []s3types.Object
-
-	paginator := s3.NewListObjectsV2Paginator(a.s3Client, &s3.ListObjectsV2Input{
-		Bucket: &bucket,
-		Prefix: &searchPrefix,
-	})
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("list objects under %s: %w", prefix, err)
-		}
-		for _, obj := range page.Contents {
-			k := aws.ToString(obj.Key)
-			if k != skipKey && !strings.HasSuffix(k, "/") {
-				objects = append(objects, obj)
-			}
-		}
-	}
-
-	if len(objects) == 0 {
-		return fmt.Errorf("no objects to evict under %s", prefix)
-	}
-
-	oldestObj := slices.MinFunc(objects, func(x, y s3types.Object) int {
-		return x.LastModified.Compare(*y.LastModified)
-	})
-
-	oldest := aws.ToString(oldestObj.Key)
-	logger.Info("Evicting oldest S3 backup", "key", oldest,
-		"age_days", int(time.Since(*oldestObj.LastModified).Hours()/24))
-
-	_, err := a.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: &bucket,
-		Key:    &oldest,
-	})
-	return err
 }
 
 // cleanupDirectory removes backup files older than the cutoff time from a

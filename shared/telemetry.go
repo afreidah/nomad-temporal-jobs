@@ -13,9 +13,11 @@ package shared
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -105,4 +107,28 @@ func StartClientSpan(ctx context.Context, name string, attrs ...attribute.KeyVal
 // PeerServiceAttr returns a peer.service attribute for service graph edges.
 func PeerServiceAttr(name string) attribute.KeyValue {
 	return semconv.PeerService(name)
+}
+
+// StartPeerSpan opens a SpanKindClient span named op for an outbound call to
+// peer, attaching peer.service=peer so the call produces an edge in the Tempo
+// service graph. Extra attributes are appended. Callers must defer span.End()
+// and pass the returned context to the downstream call so the request nests
+// under the span. It folds the StartClientSpan + PeerServiceAttr pair into one.
+func StartPeerSpan(ctx context.Context, peer, op string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	return StartClientSpan(ctx, op, append([]attribute.KeyValue{PeerServiceAttr(peer)}, attrs...)...)
+}
+
+// otelTransport wraps base with an OTel transport whose spans are named
+// "<service>." + request path, producing per-call edges in the service graph.
+// base may be nil (defaults to http.DefaultTransport); pass a pre-configured
+// transport (e.g. one already carrying TLS settings) to instrument it in place.
+func otelTransport(service string, base http.RoundTripper) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return otelhttp.NewTransport(base,
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return service + "." + r.URL.Path
+		}),
+	)
 }

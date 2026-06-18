@@ -13,6 +13,8 @@ package activities
 import (
 	"errors"
 	"testing"
+
+	"github.com/aws/smithy-go"
 )
 
 // -------------------------------------------------------------------------
@@ -117,10 +119,19 @@ func TestIsQuotaError_InsufficientStorage(t *testing.T) {
 	}
 }
 
-func TestIsQuotaError_507(t *testing.T) {
-	err := errors.New("upload failed: 507 status code")
+func TestIsQuotaError_StructuredAPIError(t *testing.T) {
+	err := &smithy.GenericAPIError{Code: "InsufficientStorage", Message: "quota exceeded"}
 	if !isQuotaError(err) {
-		t.Error("Expected true for 507 error")
+		t.Error("Expected true for InsufficientStorage API error")
+	}
+}
+
+// A bare "507" in an unrelated message (e.g. a request ID or byte count) must
+// NOT trigger destructive eviction.
+func TestIsQuotaError_Bare507NotMatched(t *testing.T) {
+	err := errors.New("request 5071f failed: connection reset")
+	if isQuotaError(err) {
+		t.Error("Expected false for an unrelated error containing 507")
 	}
 }
 

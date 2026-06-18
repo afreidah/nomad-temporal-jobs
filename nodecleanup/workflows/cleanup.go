@@ -53,6 +53,15 @@ func Cleanup(ctx workflow.Context, config activities.CleanupConfig) ([]activitie
 	}
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
+	// CleanupNodeViaSSH heartbeats per directory, so a HeartbeatTimeout catches a
+	// hung SSH/SFTP/Docker call instead of waiting out the full StartToClose.
+	cleanupCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout:    10 * time.Minute,
+		ScheduleToCloseTimeout: 30 * time.Minute,
+		HeartbeatTimeout:       2 * time.Minute,
+		RetryPolicy:            shared.StandardRetry(),
+	})
+
 	// --- Discover nodes ---
 	var nodes []activities.NodeInfo
 	if err := workflow.ExecuteActivity(ctx, a.GetAllNomadClientNodes).Get(ctx, &nodes); err != nil {
@@ -68,7 +77,7 @@ func Cleanup(ctx workflow.Context, config activities.CleanupConfig) ([]activitie
 		logger.Info("Cleaning up node", "node", node.Name, "address", node.Address)
 
 		var result activities.CleanupResult
-		err := workflow.ExecuteActivity(ctx, a.CleanupNodeViaSSH, node, config).Get(ctx, &result)
+		err := workflow.ExecuteActivity(cleanupCtx, a.CleanupNodeViaSSH, node, config).Get(ctx, &result)
 		if err != nil {
 			logger.Error("Failed to cleanup node", "node", node.Name, "error", err)
 			result = activities.CleanupResult{

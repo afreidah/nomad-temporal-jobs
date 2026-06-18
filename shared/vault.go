@@ -19,13 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // -------------------------------------------------------------------------
@@ -71,12 +69,7 @@ func NewVaultClient() (*VaultClient, error) {
 	// default *http.Transport. Wrap that configured transport with OTel last:
 	// Vault's ConfigureTLS only understands a *http.Transport, so it must run
 	// before the otelhttp wrapper, not after.
-	cfg.HttpClient.Transport = otelhttp.NewTransport(
-		cfg.HttpClient.Transport,
-		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-			return "vault." + r.URL.Path
-		}),
-	)
+	cfg.HttpClient.Transport = otelTransport("vault", cfg.HttpClient.Transport)
 
 	c, err := vault.NewClient(cfg)
 	if err != nil {
