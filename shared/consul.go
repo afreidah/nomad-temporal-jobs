@@ -15,11 +15,11 @@ package shared
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 
 	consulapi "github.com/hashicorp/consul/api"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // -------------------------------------------------------------------------
@@ -44,14 +44,7 @@ const (
 func NewConsulClient(ctx context.Context, vc *VaultClient) (*consulapi.Client, error) {
 	cfg := consulapi.DefaultConfig()
 
-	cfg.HttpClient = &http.Client{
-		Transport: otelhttp.NewTransport(
-			http.DefaultTransport,
-			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-				return "consul." + r.URL.Path
-			}),
-		),
-	}
+	cfg.HttpClient = &http.Client{Transport: otelTransport("consul", nil)}
 
 	if vc != nil {
 		path := os.Getenv("CONSUL_TOKEN_VAULT_PATH")
@@ -75,4 +68,31 @@ func NewConsulClient(ctx context.Context, vc *VaultClient) (*consulapi.Client, e
 		return nil, fmt.Errorf("create consul client: %w", err)
 	}
 	return client, nil
+}
+
+// Consul wraps the instrumented Consul client with the operations workers use.
+// Workers consume it through their own narrow interfaces.
+type Consul struct {
+	client *consulapi.Client
+}
+
+// NewConsul builds a Consul service. Token sourcing follows NewConsulClient
+// (from Vault via vc, or CONSUL_HTTP_TOKEN when vc is nil).
+func NewConsul(ctx context.Context, vc *VaultClient) (*Consul, error) {
+	client, err := NewConsulClient(ctx, vc)
+	if err != nil {
+		return nil, err
+	}
+	return &Consul{client: client}, nil
+}
+
+// SaveSnapshot streams a Raft snapshot of the Consul cluster state (which
+// includes Vault's storage, as Vault uses Consul as its backend) from the API.
+// The caller must close the returned reader.
+func (c *Consul) SaveSnapshot(ctx context.Context) (io.ReadCloser, error) {
+	snap, _, err := c.client.Snapshot().Save((&consulapi.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+	return snap, nil
 }

@@ -161,7 +161,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     NOMAD_API: {
       title: 'Nomad API',
       badge: 'data', badgeText: 'external service',
-      body: '<p>HashiCorp Nomad HTTP API. Used by three workers via the native Go client (no CLI):</p><p><b>Backup:</b> <code>Operator().Snapshot()</code> for the Raft snapshot, streamed to disk.<br><b>Trivy:</b> allocation list to discover running Docker images.<br><b>Cleanup:</b> node list, and each node\'s running allocations (<code>Nodes().Allocations</code>) to decide which data dirs are orphaned &mdash; plus job scaling for the registry/aptly sagas.</p><p>All calls wrapped with OTel-instrumented HTTP transport via <code>shared.NewNomadClient()</code> (pooled on each activity struct). Produces <code>peer.service: nomad</code> service graph edges.</p>'
+      body: '<p>HashiCorp Nomad HTTP API. Used by three workers via the native Go client (no CLI):</p><p><b>Backup:</b> <code>Operator().Snapshot()</code> for the Raft snapshot, streamed to disk.<br><b>Trivy:</b> allocation list to discover running Docker images.<br><b>Cleanup:</b> node list, and each node\'s running allocations (<code>Nodes().Allocations</code>) to decide which data dirs are orphaned &mdash; plus job scaling for the registry/aptly sagas.</p><p>All calls go through the <code>shared.Nomad</code> service (OTel-instrumented HTTP transport); each worker consumes a narrow interface over it. Produces <code>peer.service: nomad</code> service graph edges.</p>'
     },
     CONSUL_API: {
       title: 'Consul API',

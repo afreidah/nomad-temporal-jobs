@@ -66,11 +66,56 @@ func NewPostgresDB(cfg PostgresConfig) (*sql.DB, error) {
 	return db, nil
 }
 
+// Postgres provides cluster maintenance operations -- database enumeration and
+// VACUUM -- against a PostgreSQL cluster. Each call opens a short-lived
+// instrumented pool (listing connects to the maintenance database "postgres";
+// VACUUM connects to its target database). Workers consume it through their own
+// narrow interfaces. For a long-lived application pool with bespoke queries,
+// use NewPostgresDB directly.
+type Postgres struct {
+	cfg PostgresConfig // DBName is overridden per operation
+}
+
+// NewPostgres returns a Postgres maintenance client. cfg.DBName is ignored --
+// each operation selects the database it needs.
+func NewPostgres(cfg PostgresConfig) *Postgres {
+	return &Postgres{cfg: cfg}
+}
+
+// ListDatabases returns the non-template, connectable databases ordered by
+// name, queried from the maintenance database.
+func (p *Postgres) ListDatabases(ctx context.Context) ([]string, error) {
+	return ListDatabaseNames(ctx, p.withDB("postgres"))
+}
+
+// VacuumAnalyze runs an online VACUUM (ANALYZE) against dbname to reclaim bloat
+// and refresh planner statistics. No FULL, so it stays lock-light.
+func (p *Postgres) VacuumAnalyze(ctx context.Context, dbname string) error {
+	db, err := NewPostgresDB(p.withDB(dbname))
+	if err != nil {
+		return fmt.Errorf("connect to %q: %w", dbname, err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// VACUUM cannot run inside a transaction; ExecContext on the pool is autocommit.
+	if _, err := db.ExecContext(ctx, "VACUUM (ANALYZE)"); err != nil {
+		return fmt.Errorf("vacuum %q: %w", dbname, err)
+	}
+	return nil
+}
+
+// withDB returns a copy of the base config pointed at dbname.
+func (p *Postgres) withDB(dbname string) PostgresConfig {
+	c := p.cfg
+	c.DBName = dbname
+	return c
+}
+
 // ListDatabaseNames returns the non-template, connectable databases in the
 // cluster, ordered by name. It opens a short-lived pool from cfg (which should
 // point at a maintenance database such as "postgres") and closes it before
-// returning. Shared by the backup and postgres-maintenance workers so both
-// enumerate databases the same way.
+// returning. Retained as the primitive behind Postgres.ListDatabases and for
+// callers that build a one-off config.
 func ListDatabaseNames(ctx context.Context, cfg PostgresConfig) ([]string, error) {
 	db, err := NewPostgresDB(cfg)
 	if err != nil {

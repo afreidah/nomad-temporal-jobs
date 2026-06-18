@@ -13,7 +13,6 @@ package activities
 
 import (
 	"context"
-	"fmt"
 
 	"go.temporal.io/sdk/activity"
 
@@ -46,30 +45,15 @@ type PostgresMaintenanceResult struct {
 	Success   bool                  `json:"success"`
 }
 
-// pgConfig builds a shared.PostgresConfig pointed at the given database.
-func (a *Activities) pgConfig(dbname string) shared.PostgresConfig {
-	return shared.PostgresConfig{
-		Host:        a.config.PostgresHost,
-		Port:        a.config.PostgresPort,
-		User:        a.config.PostgresUser,
-		Password:    a.config.PostgresPassword,
-		DBName:      dbname,
-		SSLMode:     a.config.PostgresSSLMode,
-		SSLRootCert: a.config.PostgresSSLRootCert,
-	}
-}
-
 // ListPostgresDatabases returns the non-template databases that accept
 // connections, queried from the primary.
 func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error) {
 	logger := activity.GetLogger(ctx)
 
-	ctx, span := shared.StartClientSpan(ctx, "postgres.list_databases",
-		shared.PeerServiceAttr("postgres-primary"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.list_databases")
 	defer span.End()
 
-	dbs, err := shared.ListDatabaseNames(ctx, a.pgConfig("postgres"))
+	dbs, err := a.pg.ListDatabases(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -83,20 +67,11 @@ func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error
 func (a *Activities) VacuumAnalyzeDatabase(ctx context.Context, dbname string) error {
 	logger := activity.GetLogger(ctx)
 
-	ctx, span := shared.StartClientSpan(ctx, "postgres.vacuum_analyze",
-		shared.PeerServiceAttr("postgres-primary"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.vacuum_analyze")
 	defer span.End()
 
-	db, err := shared.NewPostgresDB(a.pgConfig(dbname))
-	if err != nil {
-		return fmt.Errorf("connect to %q: %w", dbname, err)
-	}
-	defer func() { _ = db.Close() }()
-
-	// VACUUM cannot run inside a transaction; ExecContext on the pool is autocommit.
-	if _, err := db.ExecContext(ctx, "VACUUM (ANALYZE)"); err != nil {
-		return fmt.Errorf("vacuum %q: %w", dbname, err)
+	if err := a.pg.VacuumAnalyze(ctx, dbname); err != nil {
+		return err
 	}
 
 	logger.Info("VACUUM (ANALYZE) complete", "database", dbname)

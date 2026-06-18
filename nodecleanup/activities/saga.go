@@ -14,6 +14,7 @@ package activities
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -36,46 +37,24 @@ func (a *Activities) FindJobNode(ctx context.Context, jobName string) (NodeInfo,
 	logger := activity.GetLogger(ctx)
 	logger.Info("Finding node for job", "job", jobName)
 
-	_, span := shared.StartClientSpan(ctx, "nomad.find_job_node",
-		shared.PeerServiceAttr("nomad"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.find_job_node")
 	defer span.End()
 
-	client := a.nomad
-	allocs, _, err := client.Jobs().Allocations(jobName, false, nil)
+	node, err := a.nomad.FindJobNode(ctx, jobName)
+	if errors.Is(err, shared.ErrNoRunningAlloc) {
+		// Fail fast: a terminally-misconfigured cluster shouldn't retry-storm.
+		return NodeInfo{}, temporal.NewNonRetryableApplicationError(err.Error(), "NoRunningAlloc", err)
+	}
 	if err != nil {
-		return NodeInfo{}, fmt.Errorf("list allocs for %q: %w", jobName, err)
+		return NodeInfo{}, err
 	}
-
-	for _, alloc := range allocs {
-		if alloc.ClientStatus != "running" {
-			continue
-		}
-		node, _, err := client.Nodes().Info(alloc.NodeID, nil)
-		if err != nil {
-			return NodeInfo{}, fmt.Errorf("get node info: %w", err)
-		}
-		addr := node.Attributes["unique.network.ip-address"]
-		if addr == "" {
-			addr = node.HTTPAddr
-			if idx := strings.LastIndex(addr, ":"); idx != -1 {
-				addr = addr[:idx]
-			}
-		}
-		return NodeInfo{
-			ID:       alloc.NodeID,
-			Name:     node.Name,
-			Address:  addr,
-			HTTPAddr: node.HTTPAddr,
-			IsOracle: strings.HasPrefix(node.Name, "oracle"),
-		}, nil
-	}
-
-	return NodeInfo{}, temporal.NewNonRetryableApplicationError(
-		fmt.Sprintf("no running alloc for job %q", jobName),
-		"NoRunningAlloc",
-		nil,
-	)
+	return NodeInfo{
+		ID:       node.ID,
+		Name:     node.Name,
+		Address:  node.Address,
+		HTTPAddr: node.HTTPAddr,
+		IsOracle: strings.HasPrefix(node.Name, "oracle"),
+	}, nil
 }
 
 // -------------------------------------------------------------------------
@@ -110,15 +89,12 @@ func (a *Activities) ScaleJob(ctx context.Context, jobName, groupName string, co
 	logger := activity.GetLogger(ctx)
 	logger.Info("Scaling Nomad job", "job", jobName, "group", groupName, "count", count)
 
-	_, span := shared.StartClientSpan(ctx, "nomad.scale_job",
-		shared.PeerServiceAttr("nomad"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.scale_job")
 	defer span.End()
 
-	client := a.nomad
 	reason := fmt.Sprintf("temporal workflow: scale to %d", count)
-	if err := shared.ScaleNomadJob(client, jobName, groupName, count, reason); err != nil {
-		if strings.Contains(err.Error(), "job not found") || strings.Contains(err.Error(), "404") {
+	if err := a.nomad.ScaleJob(ctx, jobName, groupName, count, reason); err != nil {
+		if shared.IsJobNotFound(err) {
 			return temporal.NewNonRetryableApplicationError(err.Error(), "JobNotFound", err)
 		}
 		return err
@@ -150,8 +126,7 @@ func (a *Activities) WaitJobRunning(ctx context.Context, jobName string) error {
 // is at least target.
 func (a *Activities) waitAllocCount(ctx context.Context, jobName string, target int, interval time.Duration, label string) error {
 	logger := activity.GetLogger(ctx)
-	client := a.nomad
-	return shared.WaitNomadAllocCount(ctx, client, jobName, target, interval, func(running int) {
+	return a.nomad.WaitAllocCount(ctx, jobName, target, interval, func(running int) {
 		activity.RecordHeartbeat(ctx, running)
 		logger.Info("Waiting", "job", jobName, "label", label, "running", running, "target", target)
 	})

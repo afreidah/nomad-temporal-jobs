@@ -139,14 +139,17 @@ The `shared/` package provides common functionality used by all workers:
 | `metrics.go` | Prometheus metrics handler for Temporal SDK metrics (Tally bridge) |
 | `temporal.go` | Shared retry-policy and activity-option presets (`StandardRetry`, `NoRetry`, `QuickActivityOptions`, `LongActivityOptions`) |
 | `heartbeat.go` | `WithHeartbeat` — run a function while emitting activity heartbeats |
-| `nomad.go` | OTel-instrumented Nomad API client factory + idempotent job scaling / alloc-count polling |
-| `postgres.go` | OTel-instrumented PostgreSQL connection factory + database enumeration |
+| `nomad.go` | OTel-instrumented Nomad client + `Nomad` service (running images, client nodes, running job IDs, find-job-node, idempotent scaling, alloc-count waits) |
+| `postgres.go` | OTel-instrumented PostgreSQL connection factory + `Postgres` maintenance service (list databases, VACUUM ANALYZE) |
+| `s3store.go` | `S3Store` — multipart upload, listing, and retention / quota-eviction over an S3-compatible API |
 | `vault.go` | Self-authenticating Vault client (Workload Identity + KV) |
-| `consul.go` | OTel-instrumented Consul client, token sourced from Vault |
+| `consul.go` | OTel-instrumented Consul client + `Consul` service (Raft snapshots), token sourced from Vault |
 | `ssh.go` | Certificate-authenticated SSH client with SFTP file operations (`ReadDir`/`RemoveAll`/`DirSize`) — no remote shell |
 | `docker.go` | Remote Docker daemon driven through the Docker API, tunneled over the SSH connection to `/var/run/docker.sock` (one-shot containers + prune) |
 
-All workers use `StartClientSpan` with `PeerServiceAttr` to produce service graph edges in Tempo/Grafana for every external call (Nomad, Consul, PostgreSQL, S3, Trivy server, Vault, ACME, Cloudflare).
+Reusable clients (`Nomad`, `Postgres`, `Consul`, `S3Store`, `VaultClient`) are concrete `shared` services; each worker declares its own **narrow consumer interface** over the subset it calls (e.g. `nomadImages`, `pgMaintainer`, `s3Store`), satisfied structurally. Workers depend on small, testable surfaces and the shared client can grow without bloating existing consumers.
+
+All workers use `StartPeerSpan` to produce service graph edges in Tempo/Grafana for every external call (Nomad, Consul, PostgreSQL, S3, Trivy server, Vault, ACME, Cloudflare).
 
 **No remote shell.** Workers operate remote infrastructure through native Go APIs end-to-end — Nomad/Consul snapshots and job control via their APIs, the remote Docker daemon over an SSH socket tunnel, and remote files over SFTP. The cleanup worker connects as `root` everywhere (the Vault SSH CA issues a root principal the Oracle hosts accept), so no per-node user/sudo handling is needed. The only remaining subprocesses are `pg_dump`/`pg_dumpall`, which have no Go-native equivalent and whose output is gzipped in-process.
 
@@ -430,10 +433,11 @@ nomad-temporal-jobs/
     metrics.go                       Prometheus metrics handler via Tally bridge
     temporal.go                      Shared retry-policy + activity-option presets
     heartbeat.go                     WithHeartbeat: run a func while emitting activity heartbeats
-    nomad.go                         OTel-instrumented Nomad API client factory + scaling helpers
-    postgres.go                      OTel-instrumented PostgreSQL connection factory + DB listing
+    nomad.go                         OTel-instrumented Nomad client + Nomad service (images, nodes, scaling, alloc waits)
+    postgres.go                      OTel-instrumented PostgreSQL factory + Postgres maintenance service (list, vacuum)
+    s3store.go                       S3Store: multipart upload, listing, retention/quota eviction
     vault.go                         Self-authenticating Vault client (Workload Identity + KV)
-    consul.go                        OTel-instrumented Consul client, token sourced from Vault
+    consul.go                        OTel-instrumented Consul client + Consul service (Raft snapshots)
     ssh.go                           Cert-auth SSH client with SFTP file ops (no remote shell)
     docker.go                        Docker API over an SSH socket tunnel (one-shot runs + prune)
   backup/

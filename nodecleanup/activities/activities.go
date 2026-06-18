@@ -21,7 +21,6 @@ import (
 
 	"munchbox/temporal-workers/shared"
 
-	nomadapi "github.com/hashicorp/nomad/api"
 	"github.com/moby/moby/client"
 	"go.temporal.io/sdk/activity"
 )
@@ -75,20 +74,40 @@ func (c *Config) ApplyDefaults() {
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
+// pgMaintainer is the cleanup worker's view of shared.Postgres -- the database
+// maintenance operations the postgres-maintenance activities call.
+// *shared.Postgres satisfies it structurally.
+type pgMaintainer interface {
+	ListDatabases(ctx context.Context) ([]string, error)
+	VacuumAnalyze(ctx context.Context, dbname string) error
+}
+
+// nomadClient is the cleanup worker's view of shared.Nomad -- the node, alloc,
+// and job-scaling operations the cleanup and saga activities call.
+// *shared.Nomad satisfies it structurally.
+type nomadClient interface {
+	ClientNodes(ctx context.Context) ([]shared.NomadNode, error)
+	RunningJobIDs(ctx context.Context, nodeID string) (map[string]struct{}, error)
+	FindJobNode(ctx context.Context, jobName string) (shared.NomadNode, error)
+	ScaleJob(ctx context.Context, jobName, groupName string, count int, reason string) error
+	WaitAllocCount(ctx context.Context, jobName string, target int, interval time.Duration, onPoll func(running int)) error
+}
+
 // Activities holds shared dependencies for node cleanup activities. Register
 // an instance with the Temporal worker to expose all exported methods as
 // activity implementations.
 type Activities struct {
 	config Config
-	nomad  *nomadapi.Client
+	nomad  nomadClient
 	ssh    *shared.SSHClient
+	pg     pgMaintainer
 }
 
 // New creates an Activities instance with defaults applied and shared Nomad and
 // SSH clients reused across activity invocations (rather than rebuilt per call).
 func New(cfg Config) (*Activities, error) {
 	cfg.ApplyDefaults()
-	nomad, err := shared.NewNomadClient()
+	nomad, err := shared.NewNomad()
 	if err != nil {
 		return nil, fmt.Errorf("create nomad client: %w", err)
 	}
@@ -100,7 +119,19 @@ func New(cfg Config) (*Activities, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create ssh client: %w", err)
 	}
-	return &Activities{config: cfg, nomad: nomad, ssh: sshClient}, nil
+	return &Activities{
+		config: cfg,
+		nomad:  nomad,
+		ssh:    sshClient,
+		pg: shared.NewPostgres(shared.PostgresConfig{
+			Host:        cfg.PostgresHost,
+			Port:        cfg.PostgresPort,
+			User:        cfg.PostgresUser,
+			Password:    cfg.PostgresPassword,
+			SSLMode:     cfg.PostgresSSLMode,
+			SSLRootCert: cfg.PostgresSSLRootCert,
+		}),
+	}, nil
 }
 
 // sshTarget builds the SSH target for a node. The worker connects as root
@@ -157,44 +188,21 @@ func (a *Activities) GetAllNomadClientNodes(ctx context.Context) ([]NodeInfo, er
 	logger := activity.GetLogger(ctx)
 	logger.Info("Retrieving all Nomad client nodes")
 
-	_, span := shared.StartClientSpan(ctx, "nomad.list_nodes",
-		shared.PeerServiceAttr("nomad"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.list_nodes")
 	defer span.End()
 
-	client := a.nomad
-	nodeList, _, err := client.Nodes().List(nil)
+	found, err := a.nomad.ClientNodes(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list nodes: %w", err)
+		return nil, err
 	}
 
-	var nodes []NodeInfo
-	for _, n := range nodeList {
-		if n.Status != "ready" {
-			logger.Info("Skipping node - not ready", "node", n.Name, "status", n.Status)
-			continue
-		}
-
-		node, _, err := client.Nodes().Info(n.ID, nil)
-		if err != nil {
-			logger.Warn("Failed to get node info", "node", n.Name, "error", err)
-			continue
-		}
-
-		// Prefer the node's IP address for SSH; fall back to HTTPAddr
-		addr := node.Attributes["unique.network.ip-address"]
-		if addr == "" {
-			addr = node.HTTPAddr
-			if idx := strings.LastIndex(addr, ":"); idx != -1 {
-				addr = addr[:idx]
-			}
-		}
-
+	nodes := make([]NodeInfo, 0, len(found))
+	for _, n := range found {
 		nodes = append(nodes, NodeInfo{
 			ID:       n.ID,
 			Name:     n.Name,
-			Address:  addr,
-			HTTPAddr: node.HTTPAddr,
+			Address:  n.Address,
+			HTTPAddr: n.HTTPAddr,
 			IsOracle: strings.HasPrefix(n.Name, "oracle"),
 		})
 	}
@@ -237,34 +245,32 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node NodeInfo, confi
 	var out strings.Builder
 	for _, e := range entries {
 		result.Scanned++
-		if _, excluded := orphanExcludes[e.name]; excluded {
+		activity.RecordHeartbeat(ctx, e.name) // progress signal so a long scan trips HeartbeatTimeout, not StartToClose
+
+		action, ageDays := classifyEntry(e, running, config, now)
+		switch action {
+		case entrySkipExcluded:
 			result.Skipped++
-			continue
-		}
-		if isJobRunning(e.name, running) {
+		case entryActive:
 			fmt.Fprintf(&out, "OK (active): %s\n", e.name)
-			continue
-		}
-		ageDays := int(now.Sub(e.mtime).Hours() / 24)
-		if ageDays < config.GraceDays {
+		case entryWithinGrace:
 			fmt.Fprintf(&out, "SKIP (%dd old, grace=%dd): %s\n", ageDays, config.GraceDays, e.name)
 			result.Skipped++
-			continue
+		case entryOrphan:
+			result.Orphaned++
+			if config.DryRun {
+				fmt.Fprintf(&out, "WOULD DELETE (%dd old): %s\n", ageDays, e.name)
+				continue
+			}
+			path := strings.TrimRight(config.DataDir, "/") + "/" + e.name
+			if derr := conn.RemoveAll(path); derr != nil {
+				logger.Warn("Failed to delete orphan dir", "dir", e.name, "error", derr)
+				result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.name, derr))
+				continue
+			}
+			fmt.Fprintf(&out, "DELETED (%dd old): %s\n", ageDays, e.name)
+			result.Deleted++
 		}
-
-		result.Orphaned++
-		path := strings.TrimRight(config.DataDir, "/") + "/" + e.name
-		if config.DryRun {
-			fmt.Fprintf(&out, "WOULD DELETE (%dd old): %s\n", ageDays, e.name)
-			continue
-		}
-		if derr := conn.RemoveAll(path); derr != nil {
-			logger.Warn("Failed to delete orphan dir", "dir", e.name, "error", derr)
-			result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.name, derr))
-			continue
-		}
-		fmt.Fprintf(&out, "DELETED (%dd old): %s\n", ageDays, e.name)
-		result.Deleted++
 	}
 
 	if config.DockerPrune {
@@ -302,20 +308,10 @@ type dirEntry struct {
 // runningJobs returns the set of job IDs with a running allocation on the node,
 // read from the Nomad API.
 func (a *Activities) runningJobs(ctx context.Context, nodeID string) (map[string]struct{}, error) {
-	_, span := shared.StartClientSpan(ctx, "nomad.node_allocations", shared.PeerServiceAttr("nomad"))
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.node_allocations")
 	defer span.End()
 
-	allocs, _, err := a.nomad.Nodes().Allocations(nodeID, nil)
-	if err != nil {
-		return nil, fmt.Errorf("list allocations for node %s: %w", nodeID, err)
-	}
-	running := make(map[string]struct{})
-	for _, al := range allocs {
-		if al.ClientStatus == "running" {
-			running[al.JobID] = struct{}{}
-		}
-	}
-	return running, nil
+	return a.nomad.RunningJobIDs(ctx, nodeID)
 }
 
 // listDataDirs returns the immediate subdirectories of dataDir on the remote
@@ -343,6 +339,32 @@ func isJobRunning(dirName string, running map[string]struct{}) bool {
 	}
 	_, ok := running[indexSuffix.ReplaceAllString(dirName, "")]
 	return ok
+}
+
+// orphanAction is what CleanupNodeViaSSH should do with one data-dir entry.
+type orphanAction int
+
+const (
+	entrySkipExcluded orphanAction = iota // a protected Nomad runtime dir
+	entryActive                           // belongs to a running job
+	entryWithinGrace                      // orphaned but younger than the grace period
+	entryOrphan                           // a deletion candidate
+)
+
+// classifyEntry decides what should happen to one data-dir entry and returns
+// the action plus the entry's age in days.
+func classifyEntry(e dirEntry, running map[string]struct{}, cfg CleanupConfig, now time.Time) (orphanAction, int) {
+	if _, excluded := orphanExcludes[e.name]; excluded {
+		return entrySkipExcluded, 0
+	}
+	if isJobRunning(e.name, running) {
+		return entryActive, 0
+	}
+	ageDays := int(now.Sub(e.mtime).Hours() / 24)
+	if ageDays < cfg.GraceDays {
+		return entryWithinGrace, ageDays
+	}
+	return entryOrphan, ageDays
 }
 
 // dockerPrune reclaims unused Docker resources on the node through the Docker

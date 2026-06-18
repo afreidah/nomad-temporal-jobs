@@ -18,13 +18,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"os/exec"
-	"slices"
 	"strings"
 	"time"
 
-	nomadapi "github.com/hashicorp/nomad/api"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.temporal.io/sdk/activity"
@@ -70,13 +67,19 @@ func (c Config) Validate() error {
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
+// nomadImages is the trivy worker's view of shared.Nomad -- it only discovers
+// running container images. *shared.Nomad satisfies it structurally.
+type nomadImages interface {
+	RunningImages(ctx context.Context) ([]string, error)
+}
+
 // Activities holds shared dependencies for trivy scan activities. Register
 // an instance with the Temporal worker to expose all exported methods as
 // activity implementations.
 type Activities struct {
 	config Config
 	db     *sql.DB
-	nomad  *nomadapi.Client
+	nomad  nomadImages
 }
 
 // New creates an Activities instance with a pooled database connection and a
@@ -87,7 +90,7 @@ func New(cfg Config) (*Activities, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	nomad, err := shared.NewNomadClient()
+	nomad, err := shared.NewNomad()
 	if err != nil {
 		return nil, fmt.Errorf("create nomad client: %w", err)
 	}
@@ -168,49 +171,13 @@ func (a *Activities) GetRunningImages(ctx context.Context) ([]string, error) {
 	logger.Info("Discovering running images from Nomad")
 
 	// --- Client span for nomad edge in service graph ---
-	_, span := shared.StartClientSpan(ctx, "nomad.get_running_images",
-		shared.PeerServiceAttr("nomad"),
-	)
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.get_running_images")
 	defer span.End()
 
-	client := a.nomad
-	allocs, _, err := client.Allocations().List(nil)
+	images, err := a.nomad.RunningImages(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list allocations: %w", err)
+		return nil, err
 	}
-
-	imageSet := make(map[string]struct{})
-	for _, stub := range allocs {
-		if stub.ClientStatus != "running" {
-			continue
-		}
-
-		alloc, _, err := client.Allocations().Info(stub.ID, nil)
-		if err != nil {
-			logger.Warn("Failed to get allocation info", "alloc_id", stub.ID, "error", err)
-			continue
-		}
-
-		if alloc.Job == nil {
-			continue
-		}
-
-		for _, tg := range alloc.Job.TaskGroups {
-			for _, task := range tg.Tasks {
-				if task.Driver != "docker" || task.Config == nil {
-					continue
-				}
-				if img, ok := task.Config["image"]; ok {
-					if imgStr, ok := img.(string); ok && imgStr != "" {
-						imageSet[imgStr] = struct{}{}
-					}
-				}
-			}
-		}
-	}
-
-	// Sorted so the scan order is deterministic run-to-run.
-	images := slices.Sorted(maps.Keys(imageSet))
 
 	logger.Info("Found unique images", "count", len(images))
 	return images, nil
@@ -232,10 +199,9 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 	}
 
 	// --- Client span for trivy-server edge in service graph ---
-	ctx, span := shared.StartClientSpan(ctx, "trivy.scan",
+	ctx, span := shared.StartPeerSpan(ctx, "trivy-server", "trivy.scan",
 		attribute.String("trivy.image", image),
 		attribute.String("trivy.server", a.config.TrivyServerAddr),
-		shared.PeerServiceAttr("trivy-server"),
 	)
 	defer span.End()
 
@@ -252,10 +218,8 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 
 	if err := cmd.Run(); err != nil {
 		errMsg := stderr.String()
-
-		// --- Permanent failures: image does not exist or is inaccessible ---
-		if strings.Contains(errMsg, "manifest unknown") ||
-			strings.Contains(errMsg, "not found") {
+		switch classifyTrivyError(errMsg) {
+		case scanErrPermanent:
 			result.Status = "pull_failed"
 			result.Error = errMsg
 			span.SetStatus(codes.Error, "pull_failed")
@@ -263,85 +227,33 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 			logger.Warn("Image not found", "image", image, "error", errMsg)
 			return result, temporal.NewNonRetryableApplicationError(
 				"image not found: "+image, "PULL_FAILED", nil)
-		}
-
-		// --- Transient failures: server down, network issues ---
-		if strings.Contains(errMsg, "connection refused") ||
-			strings.Contains(errMsg, "timeout") ||
-			strings.Contains(errMsg, "connection reset") {
+		case scanErrTransient:
 			span.SetStatus(codes.Error, "transient")
 			span.SetAttributes(attribute.String("trivy.error", errMsg))
 			logger.Warn("Transient scan error, will retry", "image", image, "error", errMsg)
 			return result, fmt.Errorf("trivy server unavailable for %s: %s", image, errMsg)
+		default:
+			result.Status = "error"
+			result.Error = fmt.Sprintf("%v: %s", err, errMsg)
+			span.SetStatus(codes.Error, "scan_failed")
+			span.SetAttributes(attribute.String("trivy.error", result.Error))
+			logger.Error("Scan failed", "image", image, "error", result.Error)
+			return result, fmt.Errorf("scan failed for %s: %w", image, err)
 		}
-
-		// --- Unknown failures: let Temporal decide ---
-		result.Status = "error"
-		result.Error = fmt.Sprintf("%v: %s", err, errMsg)
-		span.SetStatus(codes.Error, "scan_failed")
-		span.SetAttributes(attribute.String("trivy.error", result.Error))
-		logger.Error("Scan failed", "image", image, "error", result.Error)
-		return result, fmt.Errorf("scan failed for %s: %w", image, err)
 	}
 
-	// --- Parse trivy JSON output ---
-	var trivyOutput struct {
-		Results []struct {
-			Vulnerabilities []struct {
-				VulnerabilityID  string `json:"VulnerabilityID"`
-				Severity         string `json:"Severity"`
-				PkgName          string `json:"PkgName"`
-				InstalledVersion string `json:"InstalledVersion"`
-				FixedVersion     string `json:"FixedVersion"`
-				Title            string `json:"Title"`
-				Description      string `json:"Description"`
-			} `json:"Vulnerabilities"`
-		} `json:"Results"`
-	}
-
-	if err := json.Unmarshal(stdout.Bytes(), &trivyOutput); err != nil {
+	vulns, counts, err := parseTrivyOutput(stdout.Bytes())
+	if err != nil {
 		result.Status = "error"
 		result.Error = fmt.Sprintf("failed to parse trivy output: %v", err)
 		return result, temporal.NewNonRetryableApplicationError(
 			result.Error, "PARSE_FAILED", nil)
 	}
-
-	// --- Collect and deduplicate vulnerabilities ---
-	seen := make(map[string]struct{})
-	for _, res := range trivyOutput.Results {
-		for _, vuln := range res.Vulnerabilities {
-			if _, ok := seen[vuln.VulnerabilityID]; ok {
-				continue
-			}
-			seen[vuln.VulnerabilityID] = struct{}{}
-
-			desc := vuln.Description
-			if len(desc) > 1000 {
-				desc = desc[:997] + "..."
-			}
-
-			result.Vulnerabilities = append(result.Vulnerabilities, Vulnerability{
-				VulnID:           vuln.VulnerabilityID,
-				Severity:         vuln.Severity,
-				PkgName:          vuln.PkgName,
-				InstalledVersion: vuln.InstalledVersion,
-				FixedVersion:     vuln.FixedVersion,
-				Title:            vuln.Title,
-				Description:      desc,
-			})
-
-			switch strings.ToUpper(vuln.Severity) {
-			case "CRITICAL":
-				result.CriticalCount++
-			case "HIGH":
-				result.HighCount++
-			case "MEDIUM":
-				result.MediumCount++
-			case "LOW":
-				result.LowCount++
-			}
-		}
-	}
+	result.Vulnerabilities = vulns
+	result.CriticalCount = counts.Critical
+	result.HighCount = counts.High
+	result.MediumCount = counts.Medium
+	result.LowCount = counts.Low
 
 	span.SetAttributes(
 		attribute.Int("trivy.critical", result.CriticalCount),
@@ -360,6 +272,107 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 		"total_vulns", len(result.Vulnerabilities))
 
 	return result, nil
+}
+
+// scanErrClass categorizes a trivy CLI failure so ScanImage can map it to the
+// right Temporal outcome.
+type scanErrClass int
+
+const (
+	scanErrUnknown   scanErrClass = iota // unclassified -- let Temporal decide
+	scanErrPermanent                     // image missing/inaccessible -- non-retryable
+	scanErrTransient                     // server down/network -- retryable
+)
+
+// classifyTrivyError inspects trivy's stderr and classifies the failure.
+// Matching is substring-based because the trivy CLI exposes no stable typed
+// error surface (the worker shells out to it; see the Dockerfile note).
+func classifyTrivyError(stderr string) scanErrClass {
+	switch {
+	case strings.Contains(stderr, "manifest unknown"),
+		strings.Contains(stderr, "not found"):
+		return scanErrPermanent
+	case strings.Contains(stderr, "connection refused"),
+		strings.Contains(stderr, "timeout"),
+		strings.Contains(stderr, "connection reset"):
+		return scanErrTransient
+	default:
+		return scanErrUnknown
+	}
+}
+
+// SeverityCounts tallies vulnerabilities by trivy severity.
+type SeverityCounts struct {
+	Critical, High, Medium, Low int
+}
+
+// trivyReport is the subset of trivy's JSON output the worker consumes.
+type trivyReport struct {
+	Results []struct {
+		Vulnerabilities []struct {
+			VulnerabilityID  string `json:"VulnerabilityID"`
+			Severity         string `json:"Severity"`
+			PkgName          string `json:"PkgName"`
+			InstalledVersion string `json:"InstalledVersion"`
+			FixedVersion     string `json:"FixedVersion"`
+			Title            string `json:"Title"`
+			Description      string `json:"Description"`
+		} `json:"Vulnerabilities"`
+	} `json:"Results"`
+}
+
+// maxDescriptionLen bounds a stored CVE description; longer text is truncated
+// with a trailing ellipsis to this exact length.
+const maxDescriptionLen = 1000
+
+// parseTrivyOutput unmarshals trivy JSON, deduplicates vulnerabilities by ID,
+// truncates long descriptions, and tallies severities.
+func parseTrivyOutput(stdout []byte) ([]Vulnerability, SeverityCounts, error) {
+	var report trivyReport
+	if err := json.Unmarshal(stdout, &report); err != nil {
+		return nil, SeverityCounts{}, err
+	}
+
+	var (
+		vulns  []Vulnerability
+		counts SeverityCounts
+	)
+	seen := make(map[string]struct{})
+	for _, res := range report.Results {
+		for _, v := range res.Vulnerabilities {
+			if _, ok := seen[v.VulnerabilityID]; ok {
+				continue
+			}
+			seen[v.VulnerabilityID] = struct{}{}
+
+			desc := v.Description
+			if len(desc) > maxDescriptionLen {
+				desc = desc[:maxDescriptionLen-3] + "..."
+			}
+
+			vulns = append(vulns, Vulnerability{
+				VulnID:           v.VulnerabilityID,
+				Severity:         v.Severity,
+				PkgName:          v.PkgName,
+				InstalledVersion: v.InstalledVersion,
+				FixedVersion:     v.FixedVersion,
+				Title:            v.Title,
+				Description:      desc,
+			})
+
+			switch strings.ToUpper(v.Severity) {
+			case "CRITICAL":
+				counts.Critical++
+			case "HIGH":
+				counts.High++
+			case "MEDIUM":
+				counts.Medium++
+			case "LOW":
+				counts.Low++
+			}
+		}
+	}
+	return vulns, counts, nil
 }
 
 // SaveScanResult stores a single scan result and its vulnerabilities in

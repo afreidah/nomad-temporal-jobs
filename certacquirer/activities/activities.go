@@ -178,53 +178,22 @@ type IssueRequest struct {
 func (a *Activities) IssueWildcardCert(ctx context.Context, req IssueRequest) error {
 	logger := activity.GetLogger(ctx)
 
-	ctx, span := shared.StartClientSpan(ctx, "acme.issue", shared.PeerServiceAttr("acme"))
+	ctx, span := shared.StartPeerSpan(ctx, "acme", "acme.issue")
 	defer span.End()
 
-	user, err := a.loadAccount(ctx)
+	user, isNew, err := a.ensureUser(ctx, req.Email)
 	if err != nil {
 		return err
 	}
-	newAccount := user == nil
-	if newAccount {
-		key, kerr := certcrypto.GeneratePrivateKey(certcrypto.EC256)
-		if kerr != nil {
-			return fmt.Errorf("generate acme account key: %w", kerr)
-		}
-		user = &acmeUser{email: req.Email, key: key}
-	}
 
-	config := lego.NewConfig(user)
-	config.CADirURL = a.cfg.CADirURL
-	config.Certificate.KeyType = certcrypto.RSA2048
-
-	client, err := lego.NewClient(config)
+	client, err := a.newACMEClient(ctx, user)
 	if err != nil {
-		return fmt.Errorf("create acme client: %w", err)
+		return err
 	}
 
-	cfToken, err := a.cfg.Vault.ReadKVField(ctx, a.cfg.CFTokenPath, a.cfg.CFTokenField)
-	if err != nil {
-		return fmt.Errorf("read cloudflare token: %w", err)
-	}
-	cfCfg := cloudflare.NewDefaultConfig()
-	cfCfg.AuthToken = cfToken
-	provider, err := cloudflare.NewDNSProviderConfig(cfCfg)
-	if err != nil {
-		return fmt.Errorf("create cloudflare dns provider: %w", err)
-	}
-	if err := client.Challenge.SetDNS01Provider(provider); err != nil {
-		return fmt.Errorf("set dns-01 provider: %w", err)
-	}
-
-	if newAccount {
-		reg, rerr := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
-		if rerr != nil {
-			return classifyACME(fmt.Errorf("register acme account: %w", rerr))
-		}
-		user.registration = reg
-		if serr := a.saveAccount(ctx, user); serr != nil {
-			return serr
+	if isNew {
+		if err := a.registerAccount(ctx, client, user); err != nil {
+			return err
 		}
 		logger.Info("Registered new ACME account", "email", req.Email)
 	}
@@ -242,6 +211,65 @@ func (a *Activities) IssueWildcardCert(ctx context.Context, req IssueRequest) er
 	}
 	logger.Info("Issued wildcard certificate to staging", "domains", req.Domains, "staging_path", a.cfg.StagingPath)
 	return nil
+}
+
+// ensureUser loads the persisted ACME account or, on first run, generates a
+// fresh EC256 key for a new one. isNew reports whether the account still needs
+// registration.
+func (a *Activities) ensureUser(ctx context.Context, email string) (user *acmeUser, isNew bool, err error) {
+	user, err = a.loadAccount(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if user != nil {
+		return user, false, nil
+	}
+	key, err := certcrypto.GeneratePrivateKey(certcrypto.EC256)
+	if err != nil {
+		return nil, false, fmt.Errorf("generate acme account key: %w", err)
+	}
+	return &acmeUser{email: email, key: key}, true, nil
+}
+
+// newACMEClient builds a lego client for user with the Cloudflare DNS-01
+// provider wired from the token in Vault. The leaf key is RSA2048 while the
+// account key is EC256 -- they are independent by design.
+func (a *Activities) newACMEClient(ctx context.Context, user *acmeUser) (*lego.Client, error) {
+	config := lego.NewConfig(user)
+	config.CADirURL = a.cfg.CADirURL
+	config.Certificate.KeyType = certcrypto.RSA2048
+
+	client, err := lego.NewClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("create acme client: %w", err)
+	}
+
+	cfToken, err := a.cfg.Vault.ReadKVField(ctx, a.cfg.CFTokenPath, a.cfg.CFTokenField)
+	if err != nil {
+		return nil, fmt.Errorf("read cloudflare token: %w", err)
+	}
+	cfCfg := cloudflare.NewDefaultConfig()
+	cfCfg.AuthToken = cfToken
+	provider, err := cloudflare.NewDNSProviderConfig(cfCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create cloudflare dns provider: %w", err)
+	}
+	if err := client.Challenge.SetDNS01Provider(provider); err != nil {
+		return nil, fmt.Errorf("set dns-01 provider: %w", err)
+	}
+	return client, nil
+}
+
+// registerAccount registers a new ACME account and persists it to Vault,
+// attaching the registration to user. The ACME error is classified so a
+// rate-limit response is non-retryable for the run.
+func (a *Activities) registerAccount(ctx context.Context, client *lego.Client, user *acmeUser) error {
+	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+	if err != nil {
+		return classifyACME(fmt.Errorf("register acme account: %w", err))
+	}
+	user.registration = reg
+	return a.saveAccount(ctx, user)
 }
 
 // -------------------------------------------------------------------------
