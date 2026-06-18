@@ -11,7 +11,7 @@
 package activities
 
 import (
-	"fmt"
+	"errors"
 	"testing"
 )
 
@@ -111,28 +111,28 @@ func TestConfig_Validate_MissingSecretKey(t *testing.T) {
 // -------------------------------------------------------------------------
 
 func TestIsQuotaError_InsufficientStorage(t *testing.T) {
-	err := fmt.Errorf("InsufficientStorage: bucket quota exceeded")
+	err := errors.New("InsufficientStorage: bucket quota exceeded")
 	if !isQuotaError(err) {
 		t.Error("Expected true for InsufficientStorage error")
 	}
 }
 
 func TestIsQuotaError_507(t *testing.T) {
-	err := fmt.Errorf("upload failed: 507 status code")
+	err := errors.New("upload failed: 507 status code")
 	if !isQuotaError(err) {
 		t.Error("Expected true for 507 error")
 	}
 }
 
 func TestIsQuotaError_OtherError(t *testing.T) {
-	err := fmt.Errorf("connection refused")
+	err := errors.New("connection refused")
 	if isQuotaError(err) {
 		t.Error("Expected false for non-quota error")
 	}
 }
 
 func TestIsQuotaError_404(t *testing.T) {
-	err := fmt.Errorf("404 not found")
+	err := errors.New("404 not found")
 	if isQuotaError(err) {
 		t.Error("Expected false for 404 error")
 	}

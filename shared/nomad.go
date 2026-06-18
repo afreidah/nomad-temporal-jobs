@@ -43,7 +43,7 @@ func NewNomadClient() (*api.Client, error) {
 		Transport: otelhttp.NewTransport(
 			http.DefaultTransport,
 			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-				return fmt.Sprintf("nomad.%s", r.URL.Path)
+				return "nomad." + r.URL.Path
 			}),
 		),
 	}

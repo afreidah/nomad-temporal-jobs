@@ -4,14 +4,27 @@
 # Author: Alex Freidah
 #
 # Linter settings for static analysis. Enables gocritic (diagnostic + performance
-# tags) and misspell.
+# tags), misspell, and the modern org-aligned set: staticcheck, modernize,
+# perfsprint, unconvert, intrange, errname.
+#
+# staticcheck's ST1000 (every package needs a doc comment, idiomatically in
+# doc.go) is re-enabled below -- golangci-lint disables the ST style checks by
+# default, and the broad "comments" exclusion preset is dropped so ST1000 is
+# not suppressed. The other opinionated ST style/naming/comment-form checks
+# stay off so this enforces package docs only, not a wider style sweep.
 # -------------------------------------------------------------------------------
 
 version: "2"
 linters:
   enable:
+    - errname
     - gocritic
+    - intrange
     - misspell
+    - modernize
+    - perfsprint
+    - staticcheck
+    - unconvert
   settings:
     gocritic:
       disabled-checks:
@@ -20,10 +33,19 @@ linters:
       enabled-tags:
         - diagnostic
         - performance
+    staticcheck:
+      # Default golangci set (all minus the opinionated ST style checks), but
+      # keep ST1000 on so a package without a doc comment fails lint.
+      checks:
+        - all
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
   exclusions:
     generated: lax
     presets:
-      - comments
       - common-false-positives
       - legacy
       - std-error-handling

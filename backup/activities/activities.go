@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -85,16 +86,16 @@ func (c *Config) ApplyDefaults() {
 // mutate the config.
 func (c *Config) Validate() error {
 	if c.S3Endpoint == "" {
-		return fmt.Errorf("S3Endpoint is required")
+		return errors.New("S3Endpoint is required")
 	}
 	if c.S3Bucket == "" {
-		return fmt.Errorf("S3Bucket is required")
+		return errors.New("S3Bucket is required")
 	}
 	if c.S3AccessKey == "" {
-		return fmt.Errorf("S3AccessKey is required")
+		return errors.New("S3AccessKey is required")
 	}
 	if c.S3SecretKey == "" {
-		return fmt.Errorf("S3SecretKey is required")
+		return errors.New("S3SecretKey is required")
 	}
 	return nil
 }

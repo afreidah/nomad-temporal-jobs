@@ -16,6 +16,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os/exec"
@@ -51,16 +52,16 @@ type Config struct {
 // Validate checks that required fields are present.
 func (c Config) Validate() error {
 	if c.TrivyServerAddr == "" {
-		return fmt.Errorf("TrivyServerAddr is required")
+		return errors.New("TrivyServerAddr is required")
 	}
 	if c.DBHost == "" {
-		return fmt.Errorf("DBHost is required")
+		return errors.New("DBHost is required")
 	}
 	if c.DBUser == "" {
-		return fmt.Errorf("DBUser is required")
+		return errors.New("DBUser is required")
 	}
 	if c.DBPassword == "" {
-		return fmt.Errorf("DBPassword is required")
+		return errors.New("DBPassword is required")
 	}
 	return nil
 }

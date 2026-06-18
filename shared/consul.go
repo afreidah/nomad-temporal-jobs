@@ -48,7 +48,7 @@ func NewConsulClient(ctx context.Context, vc *VaultClient) (*consulapi.Client, e
 		Transport: otelhttp.NewTransport(
 			http.DefaultTransport,
 			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-				return fmt.Sprintf("consul.%s", r.URL.Path)
+				return "consul." + r.URL.Path
 			}),
 		),
 	}
