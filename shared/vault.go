@@ -74,7 +74,7 @@ func NewVaultClient() (*VaultClient, error) {
 	cfg.HttpClient.Transport = otelhttp.NewTransport(
 		cfg.HttpClient.Transport,
 		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
-			return fmt.Sprintf("vault.%s", r.URL.Path)
+			return "vault." + r.URL.Path
 		}),
 	)
 

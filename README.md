@@ -322,6 +322,7 @@ make push-all
 make push-backup
 make push-trivy
 make push-cleanup
+make push-cert
 ```
 
 Each domain also has its own `Makefile` in its subdirectory for independent builds:
@@ -332,6 +333,21 @@ cd trivyscan && make help
 cd nodecleanup && make help
 cd certacquirer && make help
 ```
+
+### Image builds
+
+All four worker images build from a single root `Dockerfile` with one shared builder stage and one runtime *profile* per worker. Each domain `Makefile` picks its profile via `RUNTIME_TARGET`, so the build half is written once:
+
+| Profile (`--target`) | Base | Worker | Runtime user |
+|----------------------|------|--------|--------------|
+| `runtime-distroless-nonroot` | distroless static | cert-acquirer | non-root |
+| `runtime-distroless-root` | distroless static | cleanup | root (reads root-owned SSH key) |
+| `runtime-backup` | Debian slim | backup | root (bundles the PostgreSQL 18 client; `pg_dump`/`pg_dumpall` have no Go-native equivalent) |
+| `runtime-trivy` | Alpine | trivy-scan | non-root (Trivy CLI, downloaded and SHA256-verified) |
+
+The builder cross-compiles with `CGO_ENABLED=0`, so a multi-arch build never emulates the Go toolchain. Images are **`linux/amd64` only** today (our Nomad clients are amd64); re-adding `linux/arm64` is a one-line change to `PLATFORMS` in `_common.mk` with no emulation penalty. BuildKit cache mounts persist the module and build caches across builds and across workers, so the standard library and shared dependencies compile once for the whole fleet.
+
+Adding a pure-Go worker needs **no Dockerfile** — its `Makefile` just sets `IMAGE`, `PKG`, and `RUNTIME_TARGET := runtime-distroless-nonroot`.
 
 ### Versioning
 
@@ -405,7 +421,8 @@ nomad-temporal-jobs/
   README.md                          This file
   go.mod                             Module definition
   go.sum                             Dependency lock file
-  _common.mk                         Shared worker build rules (each domain Makefile includes it)
+  Dockerfile                         Unified image build: shared builder + one runtime profile per worker
+  _common.mk                         Shared worker build rules (selects a runtime profile; each domain Makefile includes it)
   shared/
     runtime.go                       RunWorker: common worker bootstrap (each main.go is ~15 lines)
     telemetry.go                     OTel tracer init, span helpers, peer.service attributes
@@ -421,8 +438,7 @@ nomad-temporal-jobs/
     docker.go                        Docker API over an SSH socket tunnel (one-shot runs + prune)
   backup/
     .version                         Image version tag
-    Dockerfile                       Multi-stage build (trimmed Debian, PG18 client only)
-    Makefile                         Build and push targets
+    Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-backup), includes ../_common.mk
     activities/
       activities.go                  Activity struct: snapshots, S3 upload, retention cleanup
     workflows/
@@ -431,8 +447,7 @@ nomad-temporal-jobs/
       main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   trivyscan/
     .version                         Image version tag
-    Dockerfile                       Multi-stage build (Alpine, Trivy CLI)
-    Makefile                         Build and push targets
+    Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-trivy) + TRIVY_VERSION, includes ../_common.mk
     activities/
       activities.go                  Activity struct: Nomad image discovery, Trivy scan, DB save
     workflows/
@@ -441,10 +456,9 @@ nomad-temporal-jobs/
       main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   nodecleanup/
     .version                         Image version tag
-    Dockerfile                       Multi-stage build (distroless static, pure Go)
-    Makefile                         Build and push targets
+    Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-root), includes ../_common.mk
     activities/
-      activities.go                  Activity struct: node discovery, SSH cleanup, script gen
+      activities.go                  Activity struct: node discovery, SSH/SFTP cleanup, Docker prune
       registry_gc.go                 Saga activities: find node, scale, drain, GC, measure
     workflows/
       cleanup.go                     Sequential per-node cleanup with failure tracking
@@ -453,8 +467,7 @@ nomad-temporal-jobs/
       main.go                       Worker entry point (registers Cleanup + RegistryGC workflows)
   certacquirer/
     .version                         Image version tag
-    Dockerfile                       Multi-stage build (Alpine, ca-certificates only)
-    Makefile                         Sets IMAGE/PKG, includes ../_common.mk
+    Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-nonroot), includes ../_common.mk
     activities/
       activities.go                  Activity struct: ACME issuance (lego), account + publish to Vault
     workflows/
