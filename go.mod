@@ -6,8 +6,8 @@ require (
 	github.com/XSAM/otelsql v0.42.0
 	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
-	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.21.1
-	github.com/aws/aws-sdk-go-v2/service/s3 v1.103.3
+	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.28
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.0
 	github.com/go-acme/lego/v4 v4.35.2
 	github.com/hashicorp/consul/api v1.34.3
 	github.com/hashicorp/nomad/api v0.0.0-20260316193234-fe53ba32ff2b
