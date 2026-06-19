@@ -2,18 +2,11 @@ FROM --platform=$BUILDPLATFORM golang:1.26.4 AS godoc
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY shared/ shared/
-COPY backup/ backup/
-COPY trivyscan/ trivyscan/
-COPY nodecleanup/ nodecleanup/
 RUN go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
-RUN mkdir -p /godoc && \
-    for entry in "shared:./shared" "backup-activities:./backup/activities" "backup-workflows:./backup/workflows" "trivyscan-activities:./trivyscan/activities" "trivyscan-workflows:./trivyscan/workflows" "nodecleanup-activities:./nodecleanup/activities" "nodecleanup-workflows:./nodecleanup/workflows"; do \
-        name="${entry%%:*}"; pkg="${entry#*:}"; \
-        printf -- '---\ntitle: "%s"\n---\n\n' "$name" > /godoc/$name.md && \
-        gomarkdoc $pkg >> /godoc/$name.md && \
-        sed -i '0,/^# /{/^# /d}' /godoc/$name.md; \
-    done
+# Whole tree so `go list ./...` in gen-godoc.sh sees every package; the package
+# set is discovered dynamically, never hardcoded here.
+COPY . .
+RUN sh web/gen-godoc.sh /godoc
 
 FROM --platform=$BUILDPLATFORM hugomods/hugo:latest AS build
 WORKDIR /src/web

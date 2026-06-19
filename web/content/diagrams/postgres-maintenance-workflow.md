@@ -39,7 +39,7 @@ Online PostgreSQL maintenance. The workflow enumerates every database in the clu
 <div id="ac-diagram"></div>
 <div id="ac-tooltip"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.8.0/dist/mermaid.min.js"></script>
 <script>
 (function() {
   var diagramSrc = [

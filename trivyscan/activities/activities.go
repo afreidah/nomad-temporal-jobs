@@ -30,6 +30,9 @@ import (
 	"munchbox/temporal-workers/shared"
 )
 
+// attrTrivyError is the span attribute key for a recorded Trivy scan error.
+const attrTrivyError = "trivy.error"
+
 // -------------------------------------------------------------------------
 // CONFIGURATION
 // -------------------------------------------------------------------------
@@ -67,9 +70,9 @@ func (c Config) Validate() error {
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
-// nomadImages is the trivy worker's view of shared.Nomad -- it only discovers
+// imageDiscoverer is the trivy worker's view of shared.Nomad -- it only discovers
 // running container images. *shared.Nomad satisfies it structurally.
-type nomadImages interface {
+type imageDiscoverer interface {
 	RunningImages(ctx context.Context) ([]string, error)
 }
 
@@ -79,7 +82,7 @@ type nomadImages interface {
 type Activities struct {
 	config Config
 	db     *sql.DB
-	nomad  nomadImages
+	nomad  imageDiscoverer
 }
 
 // New creates an Activities instance with a pooled database connection and a
@@ -223,20 +226,20 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 			result.Status = "pull_failed"
 			result.Error = errMsg
 			span.SetStatus(codes.Error, "pull_failed")
-			span.SetAttributes(attribute.String("trivy.error", errMsg))
+			span.SetAttributes(attribute.String(attrTrivyError, errMsg))
 			logger.Warn("Image not found", "image", image, "error", errMsg)
 			return result, temporal.NewNonRetryableApplicationError(
 				"image not found: "+image, "PULL_FAILED", nil)
 		case scanErrTransient:
 			span.SetStatus(codes.Error, "transient")
-			span.SetAttributes(attribute.String("trivy.error", errMsg))
+			span.SetAttributes(attribute.String(attrTrivyError, errMsg))
 			logger.Warn("Transient scan error, will retry", "image", image, "error", errMsg)
 			return result, fmt.Errorf("trivy server unavailable for %s: %s", image, errMsg)
 		default:
 			result.Status = "error"
 			result.Error = fmt.Sprintf("%v: %s", err, errMsg)
 			span.SetStatus(codes.Error, "scan_failed")
-			span.SetAttributes(attribute.String("trivy.error", result.Error))
+			span.SetAttributes(attribute.String(attrTrivyError, result.Error))
 			logger.Error("Scan failed", "image", image, "error", result.Error)
 			return result, fmt.Errorf("scan failed for %s: %w", image, err)
 		}
