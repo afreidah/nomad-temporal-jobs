@@ -14,6 +14,8 @@ archetype: "home"
 {{% badge style="red" title=" " icon="fas fa-shield-alt" %}}Trivy Scanning{{% /badge %}}
 {{% badge style="green" icon="fas fa-broom" %}}Node Cleanup{{% /badge %}}
 {{% badge style="green" title=" " icon="fas fa-recycle" %}}Registry GC{{% /badge %}}
+{{% badge style="green" title=" " icon="fas fa-box-archive" %}}Aptly Cleanup{{% /badge %}}
+{{% badge style="info" title=" " icon="fas fa-database" %}}Postgres Maintenance{{% /badge %}}
 {{% badge style="info" title=" " icon="fas fa-certificate" %}}Cert Renewal{{% /badge %}}
 {{% badge style="warning" title=" " icon="fas fa-fire" %}}Prometheus Metrics{{% /badge %}}
 {{% badge style="primary" icon="fas fa-project-diagram" %}}OpenTelemetry{{% /badge %}}
@@ -30,19 +32,21 @@ archetype: "home"
 
 ---
 
-<h2 style="text-align: center; color: #34d399;">Temporal workflow workers for infrastructure automation</h2>
+<h2 class="hero-heading" style="color: #34d399;">Temporal workers for infrastructure automation</h2>
 
-<p style="text-align: center; max-width: 700px; margin: 0 auto; color: #94a3b8; font-size: 1.1rem;">
-Four independent Temporal workers handle backup orchestration, container vulnerability scanning, orphaned data cleanup across Nomad client nodes, and ACME wildcard-certificate renewal &mdash; with the cleanup worker also reclaiming Docker registry storage via a saga-style garbage-collect. Every remote operation runs through a native Go API or library &mdash; no remote shell commands.
+<p class="hero-lead">
+Four independent Temporal workers run seven scheduled infrastructure jobs you'd otherwise babysit &mdash; backups, vulnerability scanning, node cleanup, registry and aptly garbage collection, PostgreSQL maintenance, and certificate renewal. Every remote operation goes through a native Go API or library, never a remote shell.
 </p>
 
 <div class="hero-bullets">
 
-- Automated nightly backups of Nomad, Consul, and PostgreSQL with S3 offsite replication and configurable retention
-- Vulnerability scanning of all running container images with parallel batched Trivy scans and CVE persistence
-- Orphaned data directory cleanup across Nomad nodes (Nomad API + SFTP) with dry-run safety and grace period filtering
-- Docker registry garbage collection that scales the registry offline, runs GC, and always scales it back via saga compensation
-- ACME DNS-01 wildcard certificate renewal published to Vault, self-authenticating via Nomad Workload Identity
+- **Backups** &mdash; nightly Nomad, Consul, and PostgreSQL snapshots with S3 offsite replication and configurable retention
+- **Vulnerability scanning** &mdash; parallel batched Trivy scans of every running image, with CVE results persisted to PostgreSQL
+- **Node cleanup** &mdash; orphaned data directories removed across Nomad nodes over SFTP, with dry-run safety and a grace period
+- **Registry GC** &mdash; scales the registry offline, garbage-collects, and always scales it back via saga compensation
+- **Aptly cleanup** &mdash; the same saga pattern for `aptly db cleanup`, releasing the leveldb lock and reclaiming pool storage
+- **Postgres maintenance** &mdash; online `VACUUM (ANALYZE)` across every database with bounded concurrency
+- **Cert renewal** &mdash; ACME DNS-01 wildcard issued to Vault, self-authenticating via Nomad Workload Identity
 
 </div>
 
@@ -81,6 +85,22 @@ Four independent Temporal workers handle backup orchestration, container vulnera
 <strong>Registry Garbage Collection</strong>
 <p>Reclaim Docker registry storage with a saga that never leaves the registry offline.</p>
 <div class="feature-detail">Scales the registry Nomad job to 0, waits for allocations to drain, runs <code>garbage-collect</code> as a one-shot container through the Docker API (tunneled over SSH), then scales back to 1. The scale-back is a deferred compensation on a disconnected context &mdash; it always fires, even if GC fails or the workflow is cancelled. Reports blobs deleted and bytes reclaimed.</div>
+</div>
+</div>
+
+<div class="feature-item">
+<div>
+<strong>Aptly Cleanup</strong>
+<p>Reclaim Debian repository pool storage with the same offline-safe saga as registry GC.</p>
+<div class="feature-detail">Scales the aptly Nomad job to 0 so the server releases its single-writer leveldb lock, runs <code>aptly db cleanup</code> as a one-shot container through the Docker API (tunneled over SSH), then scales back to 1 via the same deferred compensation. Shares the find / scale / wait / measure saga activities with registry GC. Reports bytes reclaimed.</div>
+</div>
+</div>
+
+<div class="feature-item">
+<div>
+<strong>Postgres Maintenance</strong>
+<p>Online <code>VACUUM (ANALYZE)</code> across every database with bounded concurrency.</p>
+<div class="feature-detail">Lists the cluster's databases from the primary, then vacuums each with a bounded-concurrency fan-out (default 2) so the maintenance burst never overwhelms the primary. Online and lock-light &mdash; no <code>FULL</code>. A per-database failure is recorded and the run continues, failing the workflow only after every database has been attempted.</div>
 </div>
 </div>
 

@@ -44,4 +44,25 @@ weight: 20
 </div>
 </a>
 
+<a class="landing-card" href="aptly-cleanup-workflow/">
+<div>
+<strong>Aptly Cleanup Workflow</strong>
+<p>Saga-style scale-down, <code>aptly db cleanup</code>, and guaranteed scale-back &mdash; sharing the registry-GC saga steps.</p>
+</div>
+</a>
+
+<a class="landing-card" href="postgres-maintenance-workflow/">
+<div>
+<strong>Postgres Maintenance Workflow</strong>
+<p>Per-database <code>VACUUM (ANALYZE)</code> fan-out with bounded concurrency and per-database failure tracking.</p>
+</div>
+</a>
+
+<a class="landing-card" href="cert-acquirer-workflow/">
+<div>
+<strong>Cert Acquirer Workflow</strong>
+<p>ACME DNS-01 wildcard issuance and Vault publish as separate, independently-retried activities.</p>
+</div>
+</a>
+
 </div>

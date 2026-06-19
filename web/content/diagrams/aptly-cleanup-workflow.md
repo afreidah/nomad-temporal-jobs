@@ -1,10 +1,10 @@
 ---
-title: "Registry GC Workflow"
-linkTitle: "Registry GC"
-weight: 40
+title: "Aptly Cleanup Workflow"
+linkTitle: "Aptly Cleanup"
+weight: 50
 ---
 
-Saga-style Docker registry garbage collection. The registry is scaled offline, garbage-collected via a one-shot container run through the Docker API (tunneled over SSH), and **always** scaled back online via a deferred compensation &mdash; even if GC fails, an activity times out, or the workflow is cancelled. The find / scale / wait / measure steps are the generic saga activities shared with [Aptly Cleanup](../aptly-cleanup-workflow/). **Hover over any step** for implementation details.
+Saga-style aptly repository cleanup. The aptly job is scaled offline so the server releases its single-writer leveldb lock, `aptly db cleanup` runs in a one-shot container through the Docker API (tunneled over SSH), and the job is **always** scaled back online via a deferred compensation &mdash; even if cleanup fails, an activity times out, or the workflow is cancelled. It shares the find / scale / wait / measure saga activities with [Registry GC](../registry-gc-workflow/). **Hover over any step** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -45,20 +45,20 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
 (function() {
   var diagramSrc = [
     'flowchart TD',
-    '    START([RegistryGC\\nWorkflow]):::workflow --> DEFAULTS[Apply Config\\nDefaults]:::workflow',
-    '    DEFAULTS --> FIND[Find Registry\\nNode]:::activity',
+    '    START([AptlyCleanup\\nWorkflow]):::workflow --> DEFAULTS[Apply Config\\nDefaults]:::workflow',
+    '    DEFAULTS --> FIND[Find Aptly\\nNode]:::activity',
     '    FIND --> MEASURE1[Measure Data Dir\\nbefore]:::activity',
-    '    MEASURE1 --> SCALE0[Scale Registry\\nto 0]:::activity',
+    '    MEASURE1 --> SCALE0[Scale Aptly\\nto 0]:::activity',
     '    SCALE0 --> SGATE{Scale-down\\nOK?}:::decision',
     '    SGATE -->|no| ABORT[Return Error\\nno compensation]:::error',
     '    SGATE -->|yes| DEFER[Register Deferred\\nScale-Back]:::compensation',
     '    DEFER --> DRAIN[Wait Allocs\\nDrained]:::activity',
-    '    DRAIN --> GC[Run Garbage-\\nCollect Docker API]:::activity',
-    '    GC --> MEASURE2[Measure Data Dir\\nafter]:::activity',
+    '    DRAIN --> CLEAN[Run aptly db cleanup\\nDocker API]:::activity',
+    '    CLEAN --> MEASURE2[Measure Data Dir\\nafter]:::activity',
     '    MEASURE2 --> REPORT[Compute Bytes\\nReclaimed]:::workflow',
     '    REPORT --> COMP',
     '    DRAIN -.->|failure| COMP',
-    '    GC -.->|failure / timeout / cancel| COMP',
+    '    CLEAN -.->|failure / timeout / cancel| COMP',
     '    COMP[Compensation:\\nScale Back to 1]:::compensation --> WAITRUN[Wait Alloc\\nRunning]:::activity',
     '    WAITRUN --> CGATE{Scale-back\\nOK?}:::decision',
     '    CGATE -->|no| CRIT[Log CRITICAL\\nmanual recovery]:::error',
@@ -78,36 +78,36 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
     flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
   });
 
-  mermaid.render('registry-gc-mermaid-svg', diagramSrc).then(function(result) {
+  mermaid.render('aptly-cleanup-mermaid-svg', diagramSrc).then(function(result) {
     document.getElementById('ac-diagram').innerHTML = result.svg;
     wireUpInteractivity();
   });
 
   var nodeInfo = {
     START: {
-      title: 'RegistryGC Workflow',
+      title: 'AptlyCleanup Workflow',
       badge: 'workflow', badgeText: 'workflow entry',
-      body: '<p>Orchestrates a saga that garbage-collects the Docker registry while guaranteeing it never stays offline.</p><p>Receives <code>RegistryGCConfig</code> with <code>JobName</code>, <code>GroupName</code>, <code>RegistryDataDir</code>, <code>RegistryImage</code>, <code>DryRun</code>, and <code>DeleteUntagged</code> from the schedule input. Runs on the cleanup worker / <code>cleanup-task-queue</code>.</p>'
+      body: '<p>Orchestrates a saga that reclaims aptly pool storage while guaranteeing the aptly server never stays offline.</p><p>Receives <code>AptlyCleanupConfig</code> with <code>JobName</code>, <code>GroupName</code>, <code>Image</code>, and <code>DataDir</code> from the schedule input. Runs on the cleanup worker / <code>cleanup-task-queue</code>.</p>'
     },
     DEFAULTS: {
       title: 'Apply Config Defaults',
       badge: 'workflow', badgeText: 'workflow logic',
-      body: '<p>Fills unset fields so every activity sees a deterministic config across replay:</p><p><code>JobName</code>: <code>registry</code><br><code>GroupName</code>: = JobName<br><code>RegistryDataDir</code>: <code>/mnt/gdrive/munchbox-data/registry</code><br><code>RegistryImage</code>: <code>registry:3</code></p>'
+      body: '<p>Fills unset fields so every activity sees a deterministic config across replay:</p><p><code>JobName</code>: <code>aptly</code><br><code>GroupName</code>: = JobName<br><code>Image</code>: <code>urpylka/aptly:1.6.2</code><br><code>DataDir</code>: <code>/mnt/gdrive/aptly</code></p>'
     },
     FIND: {
-      title: 'Find Registry Node',
+      title: 'Find Aptly Node',
       badge: 'activity', badgeText: 'shared saga activity',
-      body: '<p><code>FindJobNode</code> queries the Nomad API for the running alloc of the registry job and returns the <code>NodeInfo</code> for SSH dialing. Shared with the aptly-cleanup saga.</p><p>3 attempts with exponential backoff. A "no running alloc" condition is wrapped as a <b>non-retryable</b> error so the workflow fails fast instead of retry-storming.</p>'
+      body: '<p><code>FindJobNode</code> queries the Nomad API for the running alloc of the aptly job and returns the <code>NodeInfo</code> for SSH dialing. Shared with the Registry GC saga.</p><p>3 attempts with exponential backoff. A "no running alloc" condition is wrapped as a <b>non-retryable</b> error so the workflow fails fast instead of retry-storming.</p>'
     },
     MEASURE1: {
       title: 'Measure Data Dir (before)',
       badge: 'activity', badgeText: 'shared saga activity',
-      body: '<p><code>MeasureDataDir</code> measures the registry\'s bind-mounted storage by walking it over <b>SFTP</b> (<code>DirSize</code>) on the registry host &mdash; the path is host-side and the Nomad API does not expose disk usage.</p><p>The result is reported as the "before" size and used to compute bytes reclaimed.</p>'
+      body: '<p><code>MeasureDataDir</code> measures the aptly pool by walking it over <b>SFTP</b> (<code>DirSize</code>) on the host &mdash; the path is host-side and the Nomad API does not expose disk usage.</p><p>The result is reported as the "before" size and used to compute bytes reclaimed.</p>'
     },
     SCALE0: {
-      title: 'Scale Registry to 0',
+      title: 'Scale Aptly to 0',
       badge: 'activity', badgeText: 'shared saga activity',
-      body: '<p><code>ScaleJob</code> POSTs to <code>/v1/job/{name}/scale</code> to take the registry offline so its storage is quiescent for GC.</p><p>Idempotent &mdash; Nomad accepts the call even if already at the target count. A "job not found" error is wrapped as non-retryable.</p>'
+      body: '<p><code>ScaleJob</code> POSTs to <code>/v1/job/{name}/scale</code> to take aptly offline so it releases the single-writer leveldb lock on the pool.</p><p>Idempotent &mdash; Nomad accepts the call even if already at the target count. A "job not found" error is wrapped as non-retryable.</p>'
     },
     SGATE: {
       title: 'Scale-down OK?',
@@ -117,57 +117,57 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
     ABORT: {
       title: 'Return Error (no compensation)',
       badge: 'error', badgeText: 'early exit',
-      body: '<p>Scale-down failed before the registry went offline, so no compensation is needed. The workflow returns the error immediately.</p>'
+      body: '<p>Scale-down failed before aptly went offline, so no compensation is needed. The workflow returns the error immediately.</p>'
     },
     DEFER: {
       title: 'Register Deferred Scale-Back',
       badge: 'compensation', badgeText: 'saga setup',
-      body: '<p>A <code>defer</code> closure is registered using <code>workflow.NewDisconnectedContext</code>. This is the saga compensation: it scales the registry back to 1 and waits for it to become running.</p><p>The disconnected context ensures it fires even when the parent context is cancelled (workflow timeout, parent cancel).</p>'
+      body: '<p>A <code>defer</code> closure is registered using <code>workflow.NewDisconnectedContext</code>. This is the saga compensation: it scales aptly back to 1 and waits for it to become running.</p><p>The disconnected context ensures it fires even when the parent context is cancelled (workflow timeout, parent cancel).</p>'
     },
     DRAIN: {
       title: 'Wait Allocs Drained',
       badge: 'activity', badgeText: 'poll + heartbeat',
-      body: '<p><code>WaitJobDrained</code> polls the Nomad API until the registry job has zero running allocations. Heartbeats every poll; bounded by the activity\'s start-to-close timeout.</p>'
+      body: '<p><code>WaitJobDrained</code> polls the Nomad API until the aptly job has zero running allocations &mdash; so the leveldb lock is released before cleanup runs. Heartbeats every poll; bounded by the activity\'s start-to-close timeout.</p>'
     },
-    GC: {
-      title: 'Run Garbage-Collect (Docker API)',
+    CLEAN: {
+      title: 'Run aptly db cleanup (Docker API)',
       badge: 'activity', badgeText: 'long-running, 1 attempt',
-      body: '<p><code>RunRegistryGarbageCollect</code> runs the one-shot <code>garbage-collect</code> container through the <b>Docker API</b> &mdash; tunneled over the SSH connection to the registry host\'s docker socket (container create &rarr; start &rarr; wait while heartbeating &rarr; read logs &rarr; remove) &mdash; honoring <code>--dry-run</code> and <code>--delete-untagged</code>. No <code>docker run</code> shell command is involved.</p><p>Configured with <b>MaxAttempts=1</b> &mdash; a partial GC is not retried; the deferred scale-back brings the registry back online and the failure surfaces.</p>'
+      body: '<p><code>RunAptlyDBCleanup</code> runs a one-shot container through the <b>Docker API</b> &mdash; tunneled over the SSH connection to the host\'s docker socket (container create &rarr; start &rarr; wait while heartbeating &rarr; read logs &rarr; remove). The entrypoint is overridden to a shell that first writes a minimal <code>{"rootDir":"/opt/aptly"}</code> config, then runs <code>aptly db cleanup</code> against the mounted pool. No <code>docker run</code> shell command is involved.</p><p>Configured with <b>MaxAttempts=1</b> &mdash; a partial cleanup is not retried; the deferred scale-back brings aptly back online and the failure surfaces.</p>'
     },
     MEASURE2: {
       title: 'Measure Data Dir (after)',
       badge: 'activity', badgeText: 'shared saga activity',
-      body: '<p>A second <code>MeasureDataDir</code> captures the post-GC size. The workflow subtracts it from the "before" size to report bytes reclaimed (rendered in human-friendly KiB/MiB/GiB).</p>'
+      body: '<p>A second <code>MeasureDataDir</code> captures the post-cleanup size. The workflow subtracts it from the "before" size to report bytes reclaimed (rendered in human-friendly KiB/MiB/GiB).</p>'
     },
     REPORT: {
       title: 'Compute Bytes Reclaimed',
       badge: 'workflow', badgeText: 'summary',
-      body: '<p>Folds the activity results into <code>RegistryGCResult</code>: node name/address, blobs deleted, before/after sizes, and bytes reclaimed.</p>'
+      body: '<p>Folds the activity results into <code>AptlyCleanupResult</code>: node name, before/after sizes, bytes reclaimed, and the cleanup command output.</p>'
     },
     COMP: {
       title: 'Compensation: Scale Back to 1',
       badge: 'compensation', badgeText: 'always runs',
-      body: '<p>The deferred closure scales the registry job back to 1. It runs on <b>both</b> the success and failure paths once scale-down succeeded &mdash; scaling is idempotent, so re-issuing <code>count=1</code> on the happy path is a safe no-op.</p>'
+      body: '<p>The deferred closure scales the aptly job back to 1. It runs on <b>both</b> the success and failure paths once scale-down succeeded &mdash; scaling is idempotent, so re-issuing <code>count=1</code> on the happy path is a safe no-op.</p>'
     },
     WAITRUN: {
       title: 'Wait Alloc Running',
       badge: 'activity', badgeText: 'poll + heartbeat',
-      body: '<p><code>WaitJobRunning</code> polls the Nomad API until at least one registry alloc is running again, confirming the scale-back succeeded and the registry is back online.</p>'
+      body: '<p><code>WaitJobRunning</code> polls the Nomad API until at least one aptly alloc is running again, confirming the scale-back succeeded and aptly is back online.</p>'
     },
     CGATE: {
       title: 'Scale-back OK?',
       badge: 'decision', badgeText: 'recovery check',
-      body: '<p>If the scale-back or wait-running step fails, the registry may still be offline.</p>'
+      body: '<p>If the scale-back or wait-running step fails, aptly may still be offline.</p>'
     },
     CRIT: {
       title: 'Log CRITICAL, manual recovery',
       badge: 'error', badgeText: 'operator alert',
-      body: '<p>Logs a <code>CRITICAL</code> message that the registry could not be scaled back and joins the compensation error into the workflow result so it surfaces to the operator for manual recovery.</p>'
+      body: '<p>Logs a <code>CRITICAL</code> message that aptly could not be scaled back and joins the compensation error into the workflow result so it surfaces to the operator for manual recovery.</p>'
     },
     DONE: {
       title: 'Workflow Complete',
       badge: 'workflow', badgeText: 'result',
-      body: '<p>Returns <code>RegistryGCResult</code>. On the happy path the registry is back online and storage has been reclaimed; on failure the deferred compensation has still attempted to restore the registry.</p>'
+      body: '<p>Returns <code>AptlyCleanupResult</code>. On the happy path aptly is back online and pool storage has been reclaimed; on failure the deferred compensation has still attempted to restore the server.</p>'
     }
   };
 
