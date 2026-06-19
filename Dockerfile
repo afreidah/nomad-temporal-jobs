@@ -44,7 +44,7 @@ COPY --from=builder /out/worker /usr/local/bin/worker
 USER nonroot:nonroot
 ENTRYPOINT ["worker"]
 
-# ---- profile: pure-Go, root (nodecleanup: reads SSH key from root-owned mount) ----
+# ---- profile: pure-Go, root (maintenance: reads SSH key from root-owned mount) ----
 FROM gcr.io/distroless/static-debian12 AS runtime-distroless-root
 COPY --from=builder /out/worker /usr/local/bin/worker
 ENTRYPOINT ["worker"]

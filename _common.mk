@@ -7,9 +7,9 @@
 # Makefile sets IMAGE (the registry image name), PKG (the domain's Go package
 # directory), and RUNTIME_TARGET (the runtime profile stage in the root
 # Dockerfile), then includes this file. Optionally it sets BUILD_ARGS for extra
-# --build-arg flags (e.g. TRIVY_VERSION). The image tag is owned by the domain's
-# own .version; the build context is the repo root so the shared packages and
-# the single Dockerfile are available.
+# --build-arg flags (e.g. TRIVY_VERSION). The image tag is derived from git
+# (git describe), so there is nothing to hand-bump; the build context is the
+# repo root so the shared packages and the single Dockerfile are available.
 # -------------------------------------------------------------------------------
 
 REGISTRY ?= registry.munchbox.cc
@@ -24,17 +24,25 @@ ifeq ($(RUNTIME_TARGET),)
 $(error RUNTIME_TARGET not set -- set it in the domain Makefile before including _common.mk)
 endif
 
-# --- image tag is owned by this dir's .version; never inherited from env ---
-VERSION := $(strip $(shell cat .version 2>/dev/null))
+# --- image tag derived from git; computed from the nearest tag + commit, so
+# --- no manual bump is ever needed. Override with VERSION=... if necessary.
+VERSION ?= $(strip $(shell git describe --tags --always --dirty 2>/dev/null))
 ifeq ($(VERSION),)
-$(error .version missing in $(CURDIR) -- each worker owns its own image tag)
+$(error git describe produced no version -- is this a git checkout with tags?)
 endif
 
 FULL_TAG   := $(REGISTRY)/$(IMAGE):$(VERSION)
-# amd64 only for now: our Nomad clients are amd64, so we skip the emulated
-# arm64 leg entirely. Re-add linux/arm64 here when arm clients land -- the
-# builder already cross-compiles, so there's no emulation penalty.
-PLATFORMS  := linux/amd64
+# Nomad jobs pin `:latest`; the git-describe tag is the immutable, traceable
+# alias for the exact same image. Both are pushed together.
+LATEST_TAG := $(REGISTRY)/$(IMAGE):latest
+# Every image is multi-arch (our Nomad clients are a mix of amd64 and arm64).
+# The Go build cross-compiles via $BUILDPLATFORM/$TARGETARCH, so it never
+# emulates. Pure-Go distroless profiles (cleanup, cert) assemble both arches
+# for free; backup (apt) and trivy (apk) have RUN steps in their runtime stage,
+# so their arm64 leg emulates under QEMU -- the build host needs binfmt
+# registered (one-time: `docker run --privileged --rm tonistiigi/binfmt --install arm64`).
+# Override per worker (set PLATFORMS before the include) to scope down if needed.
+PLATFORMS  ?= linux/amd64,linux/arm64
 BUILD_CTX  := ..
 DOCKERFILE := $(BUILD_CTX)/Dockerfile
 
@@ -56,7 +64,7 @@ builder: ## Ensure the Buildx builder exists
 	@docker buildx inspect --bootstrap
 
 build: ## Build for local architecture
-	docker build $(BUILD_FLAGS) -t $(FULL_TAG) -f $(DOCKERFILE) $(BUILD_CTX)
+	docker build $(BUILD_FLAGS) -t $(FULL_TAG) -t $(LATEST_TAG) -f $(DOCKERFILE) $(BUILD_CTX)
 
 push: builder ## Build and push image to registry
 	docker buildx build \
@@ -64,6 +72,7 @@ push: builder ## Build and push image to registry
 	  $(BUILD_FLAGS) \
 	  -f $(DOCKERFILE) \
 	  -t $(FULL_TAG) \
+	  -t $(LATEST_TAG) \
 	  --output type=image,push=true,registry.insecure=true \
 	  $(BUILD_CTX)
 

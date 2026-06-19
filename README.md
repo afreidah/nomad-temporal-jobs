@@ -11,7 +11,7 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-Temporal workflow workers for automated infrastructure operations. Each domain (backup, vulnerability scanning, node cleanup, certificate acquisition) runs as an independent worker with its own container image, task queue, and Nomad service job. The cleanup worker hosts several infrastructure workflows on a shared task queue; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
+Temporal workflow workers for automated infrastructure operations. **Four worker binaries host seven scheduled jobs.** Three workers map to one job each — backup, vulnerability scanning, and certificate acquisition — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
 
 ```
   Temporal Schedules            Temporal Server
@@ -28,7 +28,8 @@ Temporal workflow workers for automated infrastructure operations. Each domain (
                             +------------------------+
                             | cleanup-worker         |
                             | cleanup-task-queue     |
-                            | (cleanup + registry-gc)|
+                            | (cleanup, registry-gc, |
+                            |  aptly, postgres-maint)|
                             +------------------------+
                             | cert-acquirer-worker   |
                             | cert-task-queue        |
@@ -46,7 +47,7 @@ Each worker is a long-running Temporal worker process that polls its dedicated t
 ## Table of Contents
 
 - [Workflow Domains](#workflow-domains)
-- [Registry GC Saga](#registry-gc-saga)
+- [Maintenance Sagas](#maintenance-sagas)
 - [Shared Infrastructure](#shared-infrastructure)
 - [Scheduling](#scheduling)
 - [Retry and Error Handling](#retry-and-error-handling)
@@ -87,12 +88,30 @@ Removes Nomad job data directories that no longer correspond to a running alloca
 
 ### Registry Garbage Collection
 
-Reclaims disk space from the Docker registry by running the registry's `garbage-collect` against its bind-mounted storage. Because the registry tool requires the registry to be offline, the workflow scales the registry Nomad job to 0, waits for its allocations to drain, runs the `garbage-collect` as a one-shot container through the Docker API (tunneled over SSH), then scales it back to 1. It reports blobs deleted and bytes reclaimed (before/after sizes). Runs on the cleanup worker, sharing its SSH and Nomad-client infrastructure. See [Registry GC Saga](#registry-gc-saga) for the compensation guarantees.
+Reclaims disk space from the Docker registry by running the registry's `garbage-collect` against its bind-mounted storage. Because the registry tool requires the registry to be offline, the workflow scales the registry Nomad job to 0, waits for its allocations to drain, runs the `garbage-collect` as a one-shot container through the Docker API (tunneled over SSH), then scales it back to 1. It reports blobs deleted and bytes reclaimed (before/after sizes). Runs on the cleanup worker, sharing its SSH and Nomad-client infrastructure. See [Maintenance Sagas](#maintenance-sagas) for the compensation guarantees.
 
 **Task queue:** `cleanup-task-queue` (shared with node cleanup)
 **Workflow:** `RegistryGC`
 **Image:** `cleanup-worker`
 **Dependencies:** SSH access to the registry host, Nomad API (job scaling), Docker on the registry host
+
+### Aptly Cleanup
+
+Reclaims storage from the aptly Debian repository pool by running `aptly db cleanup` against the pool volume, dropping packages no longer referenced by any snapshot or repo. Because aptly holds a single-writer leveldb lock while running, the workflow scales the aptly Nomad job to 0, waits for its allocations to drain, runs the cleanup as a one-shot container through the Docker API (tunneled over SSH), then scales it back to 1. It reuses the same find / scale / wait / measure saga activities as registry GC and reports bytes reclaimed (before/after sizes). See [Maintenance Sagas](#maintenance-sagas) for the compensation guarantees.
+
+**Task queue:** `cleanup-task-queue` (shared with node cleanup)
+**Workflow:** `AptlyCleanup`
+**Image:** `cleanup-worker`
+**Dependencies:** SSH access to the aptly host, Nomad API (job scaling), Docker on the aptly host
+
+### Postgres Maintenance
+
+Runs online `VACUUM (ANALYZE)` across every database in the cluster to reclaim bloat and refresh planner statistics. Lists the non-template databases from the primary, then vacuums each with a bounded-concurrency fan-out (`Concurrency`, default 2) so the maintenance burst doesn't overwhelm the primary. Online and lock-light — no `FULL`. A per-database failure is recorded and the run continues; the workflow returns an error only after every database has been attempted.
+
+**Task queue:** `cleanup-task-queue` (shared with node cleanup)
+**Workflow:** `PostgresMaintenance`
+**Image:** `cleanup-worker`
+**Dependencies:** PostgreSQL primary (via the shared instrumented client)
 
 ### Cert Acquirer
 
@@ -103,20 +122,20 @@ Issues the `*.munchbox.cc` wildcard certificate via ACME DNS-01 (Cloudflare) usi
 **Image:** `cert-acquirer-worker`
 **Dependencies:** Vault (Workload Identity), Cloudflare DNS API, Let's Encrypt
 
-## Registry GC Saga
+## Maintenance Sagas
 
-The registry GC workflow is structured as a saga so the registry is never left stranded offline. The sequence decomposes into per-step activities, each with its own retry policy:
+The registry GC and aptly cleanup workflows share one saga skeleton so the job being maintained is never left stranded offline: scale it to 0, do the work while it's down, then always scale it back. The generic steps — locate the job's node, scale, wait for drain/running, measure the data dir — are the **shared saga activities** (`maintenance/internal/nodes`); only the middle "do the work" step is job-specific. Each step has its own retry policy:
 
 | Step | Activity | Retry |
 |------|----------|-------|
-| Locate registry host | `FindRegistryNode` | 3 attempts, exponential backoff |
-| Measure storage (before) | `MeasureRegistryDataDir` | 3 attempts |
-| Scale registry to 0 | `ScaleRegistry` | 3 attempts (idempotent) |
-| Wait for allocs to drain | `WaitRegistryAllocsDrained` | bounded by timeout, heartbeats each poll |
-| Run garbage-collect | `RunRegistryGarbageCollect` | **1 attempt** (no retry on partial GC) |
-| Measure storage (after) | `MeasureRegistryDataDir` | 3 attempts |
+| Locate the job's host | `FindJobNode` | 3 attempts, exponential backoff |
+| Measure storage (before) | `MeasureDataDir` | 3 attempts |
+| Scale job to 0 | `ScaleJob` | 3 attempts (idempotent) |
+| Wait for allocs to drain | `WaitJobDrained` | bounded by timeout, heartbeats each poll |
+| Do the work | `RunRegistryGarbageCollect` / `RunAptlyDBCleanup` | **1 attempt** (no retry on partial work) |
+| Measure storage (after) | `MeasureDataDir` | 3 attempts |
 
-Once the scale-down to 0 succeeds, a **compensation** is registered with `defer` and `workflow.NewDisconnectedContext`. It scales the registry back to 1 and waits for a running allocation — and it always fires, even if GC fails, an activity times out, or the workflow is cancelled mid-flight. Scaling is idempotent, so re-issuing `count=1` is a safe no-op on the happy path. If the scale-back itself fails, the workflow logs a `CRITICAL` recovery message and joins the error so it surfaces to the operator.
+Once the scale-down to 0 succeeds, a **compensation** is registered with `defer` and `workflow.NewDisconnectedContext`. It scales the job back to 1 (`ScaleJob`) and waits for a running allocation (`WaitJobRunning`) — and it always fires, even if the work step fails, an activity times out, or the workflow is cancelled mid-flight. Scaling is idempotent, so re-issuing `count=1` is a safe no-op on the happy path. If the scale-back itself fails, the workflow logs a `CRITICAL` recovery message and joins the error so it surfaces to the operator.
 
 | Config | Default | Description |
 |--------|---------|-------------|
@@ -163,6 +182,8 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 | `trivy-daily` | `Scan` | `trivy-task-queue` | `0 3 * * *` | `ScanConfig` (scan concurrency) |
 | `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, dry-run, docker prune) |
 | `registry-gc-weekly` | `RegistryGC` | `cleanup-task-queue` | `0 2 * * 0` | `RegistryGCConfig` (job/dir/image, dry-run, delete-untagged) |
+| `aptly-cleanup-weekly` | `AptlyCleanup` | `cleanup-task-queue` | `0 4 * * 0` | `AptlyCleanupConfig` (job/group/image, data dir) |
+| `postgres-maintenance-weekly` | `PostgresMaintenance` | `cleanup-task-queue` | `0 6 * * 0` | `PostgresMaintenanceConfig` (concurrency) |
 | `cert-acquirer-weekly` | `CertAcquirer` | `cert-task-queue` | `0 4 * * 1` | `IssueRequest` (domains, email) |
 
 ## Retry and Error Handling
@@ -252,16 +273,24 @@ All configuration is via environment variables, injected by Nomad job templates 
 
 ### Cleanup Worker
 
+The cleanup worker hosts all four maintenance workflows, so its environment covers SSH (node cleanup + the registry/aptly sagas), the Nomad token, and Postgres (the maintenance workflow).
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SSH_KEY_PATH` | `/root/.ssh/id_ed25519` | SSH private key path |
 | `SSH_CERT_PATH` | `/root/.ssh/id_ed25519-cert.pub` | SSH client certificate path |
 | `SSH_HOST_CA_PATH` | `/root/.ssh/ssh-host-ca.pub` | SSH host CA public key path |
-| `NOMAD_TOKEN` | -- | Nomad API token (read nodes/allocations) |
+| `NOMAD_TOKEN` | -- | Nomad API token (read nodes/allocations; job-scale for the sagas) |
+| `PG_HOST` | `postgres-primary.service.consul` | PostgreSQL host for VACUUM maintenance |
+| `PG_PORT` | `5432` | PostgreSQL port |
+| `PG_USER` | `postgres` | PostgreSQL user |
+| `PGPASSWORD` | -- | PostgreSQL password |
+| `PG_SSLMODE` | `prefer` | PostgreSQL SSL mode |
+| `PG_SSLROOTCERT` | -- | Optional CA path for `verify-ca`/`verify-full` |
 
-### Registry GC
+### Maintenance Workflow Config
 
-Registry GC runs on the cleanup worker, so it inherits the SSH and `NOMAD_TOKEN` settings above (the Nomad token additionally needs job-scale permission). Its workflow config (job name, data dir, image, dry-run, delete-untagged) comes from the `registry-gc-weekly` schedule input -- see the `RegistryGCConfig` table under [Registry Garbage Collection](#registry-garbage-collection).
+The registry GC, aptly cleanup, and postgres maintenance workflows all run on the cleanup worker, inheriting the SSH/Nomad/Postgres settings above. Their per-run config comes from the schedule input, not the environment: `RegistryGCConfig` (job/dir/image, dry-run, delete-untagged — see [Maintenance Sagas](#maintenance-sagas)), `AptlyCleanupConfig` (job/group/image, data dir), and `PostgresMaintenanceConfig` (concurrency).
 
 ### Cert Acquirer Worker
 
@@ -283,7 +312,7 @@ All workers initialize OpenTelemetry with OTLP gRPC export. The Temporal SDK tra
 
 - `backup-worker` -> nomad, consul, postgres-primary, s3-orchestrator
 - `trivy-scan-worker` -> nomad, trivy-server, postgres (via otelsql)
-- `cleanup-worker` -> nomad
+- `cleanup-worker` -> nomad, postgres-primary
 - `cert-acquirer-worker` -> vault, acme, cloudflare
 
 ### Metrics
@@ -333,7 +362,7 @@ Each domain also has its own `Makefile` in its subdirectory for independent buil
 ```bash
 cd backup && make help
 cd trivyscan && make help
-cd nodecleanup && make help
+cd maintenance && make help
 cd certacquirer && make help
 ```
 
@@ -348,23 +377,16 @@ All four worker images build from a single root `Dockerfile` with one shared bui
 | `runtime-backup` | Debian slim | backup | root (bundles the PostgreSQL 18 client; `pg_dump`/`pg_dumpall` have no Go-native equivalent) |
 | `runtime-trivy` | Alpine | trivy-scan | non-root (Trivy CLI, downloaded and SHA256-verified) |
 
-The builder cross-compiles with `CGO_ENABLED=0`, so a multi-arch build never emulates the Go toolchain. Images are **`linux/amd64` only** today (our Nomad clients are amd64); re-adding `linux/arm64` is a one-line change to `PLATFORMS` in `_common.mk` with no emulation penalty. BuildKit cache mounts persist the module and build caches across builds and across workers, so the standard library and shared dependencies compile once for the whole fleet.
+The builder cross-compiles with `CGO_ENABLED=0` (`$BUILDPLATFORM` → `$TARGETARCH`), so the Go toolchain never emulates. Images are built **multi-arch (`linux/amd64` + `linux/arm64`)** since the Nomad clients are a mix of both (e.g. the cleanup-worker is pinned to an arm64 node). For the pure-Go distroless profiles (cleanup, cert) the arm64 leg is free — just the cross-compiled binary in a multi-arch base. The backup (`apt`) and trivy (`apk`) profiles have `RUN` steps in their runtime stage, so their arm64 leg emulates under QEMU; the build host needs binfmt registered (`docker run --privileged --rm tonistiigi/binfmt --install arm64`). BuildKit cache mounts persist the module and build caches across builds and across workers, so the standard library and shared dependencies compile once for the whole fleet.
 
 Adding a pure-Go worker needs **no Dockerfile** — its `Makefile` just sets `IMAGE`, `PKG`, and `RUNTIME_TARGET := runtime-distroless-nonroot`.
 
 ### Versioning
 
-A `.version` file holds the tag for the artifact built from its directory, and each is bumped independently:
+Nothing is hand-bumped. Every version is derived from git:
 
-| File | Tags | Bumped when |
-|------|------|-------------|
-| `backup/.version` | `backup-worker` image | the backup worker changes |
-| `trivyscan/.version` | `trivy-scan-worker` image | the trivy worker changes |
-| `nodecleanup/.version` | `cleanup-worker` image | the cleanup worker changes |
-| `certacquirer/.version` | `cert-acquirer-worker` image | the cert worker changes |
-| `./.version` (root) | git release tag + `temporal-workers-web` image | cutting a repo release |
-
-`make push-backup` (and `push-all`) read each worker's own `.version` — the root version is never used for worker images. The worker tags drift apart on purpose: rebuild only what changed, and an image tag tells you exactly which worker code it holds.
+- **Image tags** (all workers + the `temporal-workers-web` image) come from `git describe --tags --always --dirty`, computed in `_common.mk`. `make push-backup` (and `push-all`) tag whatever the current commit resolves to, so an image tag always points back to an exact commit. Override with `VERSION=...` if you ever need to. Each push also publishes `:latest` for the same image — the Nomad jobs pin `:latest`, while the git-describe tag stays as the immutable, traceable alias for that exact build.
+- **Release tags** are computed from the conventional-commit history by [`svu`](https://github.com/caarlos0/svu). `make release` runs `svu next`, tags it, and pushes — which triggers the Release workflow. You decide *when* to cut a release; the *number* is derived from the `feat:`/`fix:`/breaking commits since the last tag.
 
 ## Deployment
 
@@ -372,12 +394,12 @@ Each domain is deployed as a separate Nomad service job. Workflows are started o
 
 ### Nomad Jobs
 
-| Job | Type | Image | Task Queue |
-|-----|------|-------|------------|
-| `backup-worker` | service | `backup-worker` | `backup-task-queue` |
-| `trivy-scan-worker` | service | `trivy-scan-worker` | `trivy-task-queue` |
-| `cleanup-worker` | service | `cleanup-worker` | `cleanup-task-queue` |
-| `cert-acquirer-worker` | service | `cert-acquirer-worker` | `cert-task-queue` |
+| Job | Type | Image | Task Queue | Workflows |
+|-----|------|-------|------------|-----------|
+| `backup-worker` | service | `backup-worker` | `backup-task-queue` | `Backup` |
+| `trivy-scan-worker` | service | `trivy-scan-worker` | `trivy-task-queue` | `Scan` |
+| `cleanup-worker` | service | `cleanup-worker` | `cleanup-task-queue` | `Cleanup`, `RegistryGC`, `AptlyCleanup`, `PostgresMaintenance` |
+| `cert-acquirer-worker` | service | `cert-acquirer-worker` | `cert-task-queue` | `CertAcquirer` |
 
 ### Manual Runs
 
@@ -404,6 +426,16 @@ temporal workflow start --task-queue cleanup-task-queue --type RegistryGC \
   --address temporal-server.service.consul:7233 \
   --input '{"job_name":"registry","registry_data_dir":"/mnt/gdrive/munchbox-data/registry","registry_image":"registry:3","dry_run":true,"delete_untagged":true}'
 
+# Aptly repository cleanup
+temporal workflow start --task-queue cleanup-task-queue --type AptlyCleanup \
+  --address temporal-server.service.consul:7233 \
+  --input '{"job_name":"aptly","image":"urpylka/aptly:1.6.2","data_dir":"/mnt/gdrive/aptly"}'
+
+# Postgres maintenance (VACUUM ANALYZE every database)
+temporal workflow start --task-queue cleanup-task-queue --type PostgresMaintenance \
+  --address temporal-server.service.consul:7233 \
+  --input '{"concurrency":2}'
+
 # Wildcard certificate acquisition
 temporal workflow start --task-queue cert-task-queue --type CertAcquirer \
   --address temporal-server.service.consul:7233 \
@@ -415,10 +447,9 @@ temporal workflow start --task-queue cert-task-queue --type CertAcquirer \
 ```
 nomad-temporal-jobs/
   .github/workflows/
-    ci.yml                           CI: lint, test, vet, govulncheck, version check
+    ci.yml                           CI: lint, test, vet, govulncheck
   .gitignore                         Ignores coverage output and dist artifacts
   .golangci.yml                      Linter configuration (gocritic, misspell)
-  .version                           Root version tag
   LICENSE                            MIT
   Makefile                           Root: build, test, lint, push-all targets
   README.md                          This file
@@ -441,7 +472,6 @@ nomad-temporal-jobs/
     ssh.go                           Cert-auth SSH client with SFTP file ops (no remote shell)
     docker.go                        Docker API over an SSH socket tunnel (one-shot runs + prune)
   backup/
-    .version                         Image version tag
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-backup), includes ../_common.mk
     activities/
       activities.go                  Activity struct: snapshots, S3 upload, retention cleanup
@@ -450,7 +480,6 @@ nomad-temporal-jobs/
     worker/
       main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
   trivyscan/
-    .version                         Image version tag
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-trivy) + TRIVY_VERSION, includes ../_common.mk
     activities/
       activities.go                  Activity struct: Nomad image discovery, Trivy scan, DB save
@@ -458,19 +487,21 @@ nomad-temporal-jobs/
       scan.go                        Bounded-concurrency scanning with per-image error handling
     worker/
       main.go                       Worker entry point (tracing, slog, metrics, Temporal client)
-  nodecleanup/
-    .version                         Image version tag
+  maintenance/                       cleanup-worker: four workflows on one task queue
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-root), includes ../_common.mk
-    activities/
-      activities.go                  Activity struct: node discovery, SSH/SFTP cleanup, Docker prune
-      registry_gc.go                 Saga activities: find node, scale, drain, GC, measure
-    workflows/
-      cleanup.go                     Sequential per-node cleanup with failure tracking
-      registry_gc.go                 Saga orchestration with deferred scale-back compensation
+    internal/nodes/                  Shared primitives: NodeInfo, SSH target, HumanBytes,
+                                       and the generic find/scale/wait/measure saga activities
+    nodecleanup/                     Orphaned data-dir removal over SSH/SFTP (+ optional Docker prune)
+      activities.go, workflow.go     node discovery, per-node cleanup, sequential orchestration
+    registrygc/                      Docker registry GC saga
+      activities.go, workflow.go     one-shot garbage-collect + deferred scale-back compensation
+    aptlycleanup/                    aptly `db cleanup` saga (same skeleton as registry GC)
+      activities.go, workflow.go     one-shot cleanup + deferred scale-back compensation
+    postgresmaint/                   PostgreSQL VACUUM (ANALYZE) maintenance
+      activities.go, workflow.go     list databases + bounded-concurrency vacuum fan-out
     worker/
-      main.go                       Worker entry point (registers Cleanup + RegistryGC workflows)
+      main.go                        Worker entry point (registers all four workflows + activity sets)
   certacquirer/
-    .version                         Image version tag
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-nonroot), includes ../_common.mk
     activities/
       activities.go                  Activity struct: ACME issuance (lego), account + publish to Vault

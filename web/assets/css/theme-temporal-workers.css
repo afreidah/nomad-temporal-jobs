@@ -352,6 +352,26 @@ a.landing-card:hover p {
   display: inline;
 }
 
+/* Hero heading + lead paragraph on the landing page.
+   The relearn theme sets `hyphens: auto` on all headings, which chops words
+   mid-line ("infrastruc-ture"); force manual hyphenation here and let the
+   browser balance/pretty-wrap instead. */
+.home h2,
+.home .hero-heading {
+  hyphens: manual;
+  text-wrap: balance;
+}
+
+.hero-lead {
+  max-width: 700px;
+  margin: 0 auto;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 1.1rem;
+  hyphens: manual;
+  text-wrap: pretty;
+}
+
 /* Hero bullet points on landing page */
 .hero-bullets {
   max-width: 700px;

@@ -26,7 +26,7 @@ assignees: ''
 
 ## Environment
 
-- **Version**: (check `.version` or container tag)
+- **Version**: (the container image tag, e.g. from `git describe`)
 - **Workflow domain**: (backup / trivyscan / nodecleanup)
 - **Deployment method**: (Docker / Nomad)
 

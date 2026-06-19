@@ -46,15 +46,36 @@ weight: 30
 
 <a class="landing-card" href="nodecleanup-activities/">
 <div>
-<strong>nodecleanup/activities</strong>
-<p>Node discovery, orphaned-directory cleanup over SFTP (running jobs from the Nomad API), Docker-API pruning, and the registry-GC / aptly saga steps.</p>
+<strong>maintenance/internal/nodes</strong>
+<p>Shared node primitives: the NodeInfo descriptor, SSH target helper, HumanBytes formatter, and the generic find / scale / wait / measure saga activities reused by the registry-GC and aptly-cleanup sagas.</p>
 </div>
 </a>
 
-<a class="landing-card" href="nodecleanup-workflows/">
+<a class="landing-card" href="maintenance-nodecleanup/">
 <div>
-<strong>nodecleanup/workflows</strong>
-<p>Sequential node cleanup plus the registry-GC, aptly-cleanup, and postgres-maintenance workflows with deferred scale-back compensation.</p>
+<strong>maintenance/nodecleanup</strong>
+<p>Orphaned data-directory removal over SSH/SFTP (running jobs from the Nomad API) with optional Docker-API pruning, and the sequential per-node cleanup workflow.</p>
+</div>
+</a>
+
+<a class="landing-card" href="maintenance-registrygc/">
+<div>
+<strong>maintenance/registrygc</strong>
+<p>Saga-style Docker registry garbage collection: a one-shot <code>garbage-collect</code> run plus deferred scale-back compensation.</p>
+</div>
+</a>
+
+<a class="landing-card" href="maintenance-aptlycleanup/">
+<div>
+<strong>maintenance/aptlycleanup</strong>
+<p>Saga-style <code>aptly db cleanup</code> on the same skeleton as registry GC, releasing the leveldb lock and reclaiming pool storage.</p>
+</div>
+</a>
+
+<a class="landing-card" href="maintenance-postgresmaint/">
+<div>
+<strong>maintenance/postgresmaint</strong>
+<p>Online <code>VACUUM (ANALYZE)</code> across every database with a bounded-concurrency fan-out and per-database failure tracking.</p>
 </div>
 </a>
 

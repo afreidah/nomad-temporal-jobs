@@ -70,6 +70,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '',
     '    CWORKER --> NOMAD_API',
     '    CWORKER --> SSH[SSH / SFTP\\n+ Docker tunnel]:::data',
+    '    CWORKER --> PG',
     '',
     '    CEWORKER --> VAULT[Vault]:::data',
     '    CEWORKER --> ACME[ACME\\nLetsEncrypt]:::data',
@@ -111,7 +112,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     SCHED: {
       title: 'Temporal Schedules',
       badge: 'entry', badgeText: 'scheduler',
-      body: '<p>Temporal Schedules start each workflow on cron &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
+      body: '<p>Temporal Schedules start each workflow on cron &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC, aptly cleanup, postgres maintenance, cert acquirer). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
     },
     TEMPORAL: {
       title: 'Temporal Server',
@@ -131,7 +132,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     CTQ: {
       title: 'cleanup-task-queue',
       badge: 'middleware', badgeText: 'task queue',
-      body: '<p>Temporal task queue shared by the node cleanup and registry GC workflows and their activities. Only the cleanup worker polls this queue.</p><p>Retry policy: 1s initial interval, 2.0 backoff, 1m max interval, 3 max attempts (the long-running registry GC step runs with 1 attempt).</p>'
+      body: '<p>Temporal task queue shared by the four maintenance workflows &mdash; node cleanup, registry GC, aptly cleanup, and postgres maintenance &mdash; and their activities. Only the cleanup worker polls this queue.</p><p>Retry policy: 1s initial interval, 2.0 backoff, 1m max interval, 3 max attempts (the long-running registry GC and aptly cleanup steps run with 1 attempt).</p>'
     },
     CETQ: {
       title: 'cert-task-queue',
@@ -151,12 +152,12 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     CWORKER: {
       title: 'Cleanup Worker',
       badge: 'handler', badgeText: 'worker',
-      body: '<p>Removes orphaned Nomad job data directories. Running jobs come from the central Nomad API; the per-node directory work is done over <b>SFTP</b> (list / measure / delete) &mdash; never a remote shell. Optional Docker prune runs through the Docker API. Nodes are processed sequentially.</p><p>Excludes system dirs (alloc, plugins, tmp, server, client). Grace-period filter skips recently modified directories. Dry-run mode enabled by default.</p><p>This worker also hosts the <b>registry GC</b> and <b>aptly cleanup</b> sagas (scale a job offline, run a one-shot container via the Docker API tunneled over SSH, always scale back via deferred compensation) and a <b>postgres-maintenance</b> workflow, all on the same task queue.</p><p><a href="../nodecleanup-workflow/">Node cleanup workflow diagram &rarr;</a><br><a href="../registry-gc-workflow/">Registry GC workflow diagram &rarr;</a></p>'
+      body: '<p>Removes orphaned Nomad job data directories. Running jobs come from the central Nomad API; the per-node directory work is done over <b>SFTP</b> (list / measure / delete) &mdash; never a remote shell. Optional Docker prune runs through the Docker API. Nodes are processed sequentially.</p><p>Excludes system dirs (alloc, plugins, tmp, server, client). Grace-period filter skips recently modified directories. Dry-run mode enabled by default.</p><p>This worker also hosts the <b>registry GC</b> and <b>aptly cleanup</b> sagas (scale a job offline, run a one-shot container via the Docker API tunneled over SSH, always scale back via deferred compensation) and a <b>postgres-maintenance</b> workflow, all on the same task queue. The two sagas share the generic find / scale / wait / measure activities.</p><p><a href="../nodecleanup-workflow/">Node cleanup workflow diagram &rarr;</a><br><a href="../registry-gc-workflow/">Registry GC workflow diagram &rarr;</a><br><a href="../aptly-cleanup-workflow/">Aptly cleanup workflow diagram &rarr;</a><br><a href="../postgres-maintenance-workflow/">Postgres maintenance workflow diagram &rarr;</a></p>'
     },
     CEWORKER: {
       title: 'Cert Acquirer Worker',
       badge: 'handler', badgeText: 'worker',
-      body: '<p>Issues the <code>*.munchbox.cc</code> wildcard certificate via ACME DNS-01 (Cloudflare, go-acme/lego) and publishes it to Vault for Traefik to read.</p><p>Issuance and publish are separate activities: the issued cert+key are written to a Vault staging path so a publish retry never re-runs ACME (Let\'s Encrypt rate limits), and the private key never transits workflow history.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the Cloudflare token through Vault &mdash; no static secrets in the job.</p>'
+      body: '<p>Issues the <code>*.munchbox.cc</code> wildcard certificate via ACME DNS-01 (Cloudflare, go-acme/lego) and publishes it to Vault for Traefik to read.</p><p>Issuance and publish are separate activities: the issued cert+key are written to a Vault staging path so a publish retry never re-runs ACME (Let\'s Encrypt rate limits), and the private key never transits workflow history.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the Cloudflare token through Vault &mdash; no static secrets in the job.</p><p><a href="../cert-acquirer-workflow/">Cert acquirer workflow diagram &rarr;</a></p>'
     },
     NOMAD_API: {
       title: 'Nomad API',
@@ -171,7 +172,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     PG: {
       title: 'PostgreSQL',
       badge: 'data', badgeText: 'database',
-      body: '<p>Used by two workers:</p><p><b>Backup:</b> dumps cluster globals once, lists databases via <code>database/sql</code>, then fans out a per-database <code>pg_dump</code> with bounded concurrency &mdash; each subprocess gzipped in-process (no <code>| gzip</code> shell pipe). Long timeout (30min/60min) for large databases.</p><p><b>Trivy:</b> Stores scan results transactionally &mdash; scan record + individual vulnerabilities. Deduplicates by vuln ID, truncates long descriptions to 1000 chars. Connection wrapped with <code>otelsql</code> for trace propagation.</p>'
+      body: '<p>Used by three workers:</p><p><b>Backup:</b> dumps cluster globals once, lists databases via <code>database/sql</code>, then fans out a per-database <code>pg_dump</code> with bounded concurrency &mdash; each subprocess gzipped in-process (no <code>| gzip</code> shell pipe). Long timeout (30min/60min) for large databases.</p><p><b>Trivy:</b> Stores scan results transactionally &mdash; scan record + individual vulnerabilities. Deduplicates by vuln ID, truncates long descriptions to 1000 chars. Connection wrapped with <code>otelsql</code> for trace propagation.</p><p><b>Cleanup (postgres maintenance):</b> lists databases and runs an online <code>VACUUM (ANALYZE)</code> on each with bounded concurrency through the same shared client.</p>'
     },
     S3: {
       title: 'S3 Storage',

@@ -31,8 +31,9 @@ govulncheck: ## Scan for known vulnerabilities
 	govulncheck ./...
 
 # -------------------------------------------------------------------------
-# Each worker image tags from its OWN <dir>/.version; the sub-make reads it
-# in that dir. Root .version (release tag + web image) is unrelated here.
+# Every image (workers + web) tags from git describe via _common.mk -- there
+# are no .version files to bump. Release tags are computed from conventional
+# commits by svu (see the release target).
 # -------------------------------------------------------------------------
 
 push-backup: ## Build and push backup-worker image
@@ -42,19 +43,30 @@ push-trivy: ## Build and push trivy-scan-worker image
 	cd trivyscan && $(MAKE) push
 
 push-cleanup: ## Build and push cleanup-worker image
-	cd nodecleanup && $(MAKE) push
+	cd maintenance && $(MAKE) push
 
 push-cert: ## Build and push cert-acquirer-worker image
 	cd certacquirer && $(MAKE) push
 
 push-all: push-backup push-trivy push-cleanup push-cert ## Build and push all images
 
+# Recurses with -j so the four image builds run concurrently. They share one
+# buildx builder + BuildKit cache mounts, so the Go-compile phases partly
+# serialize (cache-mount locks); the registry pushes, runtime stages, and the
+# emulated arm64 legs overlap. Net speedup, not a clean 4x.
+push-all-parallel: ## Build and push all images concurrently (make -j)
+	$(MAKE) -j4 push-backup push-trivy push-cleanup push-cert
+
 changelog: ## Generate CHANGELOG.md from git history
 	git cliff -o CHANGELOG.md
 
-release: ## Tag and push to trigger a GitHub Release
-	git tag $$(cat .version)
-	git push origin $$(cat .version)
+SVU := go run github.com/caarlos0/svu/v3@latest
+
+release: ## Compute the next version from commits, tag, and push to trigger a Release
+	@next=$$($(SVU) next) && \
+		echo "Releasing $$next (current: $$($(SVU) current))" && \
+		git tag "$$next" && \
+		git push origin "$$next"
 
 # -------------------------------------------------------------------------
 # WEBSITE
@@ -62,7 +74,7 @@ release: ## Tag and push to trigger a GitHub Release
 
 REGISTRY   ?= registry.munchbox.cc
 WEB_IMAGE  := $(REGISTRY)/temporal-workers-web
-WEB_TAG    ?= $(shell cat .version)
+WEB_TAG    ?= $(shell git describe --tags --always --dirty)
 PLATFORMS  ?= linux/amd64,linux/arm64
 
 GODOC_PKGS := shared:./shared \
@@ -70,8 +82,11 @@ GODOC_PKGS := shared:./shared \
               backup-workflows:./backup/workflows \
               trivyscan-activities:./trivyscan/activities \
               trivyscan-workflows:./trivyscan/workflows \
-              nodecleanup-activities:./nodecleanup/activities \
-              nodecleanup-workflows:./nodecleanup/workflows \
+              maintenance-nodes:./maintenance/internal/nodes \
+              maintenance-nodecleanup:./maintenance/nodecleanup \
+              maintenance-registrygc:./maintenance/registrygc \
+              maintenance-aptlycleanup:./maintenance/aptlycleanup \
+              maintenance-postgresmaint:./maintenance/postgresmaint \
               certacquirer-activities:./certacquirer/activities \
               certacquirer-workflows:./certacquirer/workflows
 
@@ -96,7 +111,7 @@ web-build: web-godoc ## Build the project website
 	cd web && hugo --minify
 
 web-docker: ## Build website Docker image for local architecture
-	docker build --pull -f web/Dockerfile -t $(WEB_IMAGE):$(WEB_TAG) .
+	docker build --pull -f web/Dockerfile -t $(WEB_IMAGE):$(WEB_TAG) -t $(WEB_IMAGE):latest .
 
 builder: ## Ensure the Buildx builder exists
 	@docker buildx inspect munchbox-builder >/dev/null 2>&1 || \
@@ -109,8 +124,9 @@ web-push: builder ## Build and push multi-arch website image to registry
 	  --platform $(PLATFORMS) \
 	  -f web/Dockerfile \
 	  -t $(WEB_IMAGE):$(WEB_TAG) \
+	  -t $(WEB_IMAGE):latest \
 	  --output type=image,push=true \
 	  .
 
-.PHONY: help builder build test vet lint govulncheck push-backup push-trivy push-cleanup push-cert push-all changelog release web-tools web-godoc web-serve web-build web-docker web-push
+.PHONY: help builder build test vet lint govulncheck push-backup push-trivy push-cleanup push-cert push-all push-all-parallel changelog release web-tools web-godoc web-serve web-build web-docker web-push
 .DEFAULT_GOAL := help
