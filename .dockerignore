@@ -1,0 +1,8 @@
+# Build-context excludes. No Dockerfile stage (worker images or the website)
+# needs these, so keep them out of the context that the web image's `COPY . .`
+# (godoc stage) pulls in. Versions come from image tags, not git inside Docker.
+.git
+.github
+dist
+web/public
+web/resources

@@ -36,6 +36,11 @@ import (
 	"go.temporal.io/sdk/activity"
 )
 
+const (
+	peerPostgresPrimary = "postgres-primary"
+	errCreateBackupDir  = "create backup dir: %w"
+)
+
 // -------------------------------------------------------------------------
 // CONFIGURATION
 // -------------------------------------------------------------------------
@@ -247,7 +252,7 @@ func (a *Activities) TakeNomadSnapshot(ctx context.Context) (string, error) {
 	defer span.End()
 
 	if err := os.MkdirAll(a.config.NomadBackupDir, 0o755); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
+		return "", fmt.Errorf(errCreateBackupDir, err)
 	}
 
 	timestamp := time.Now().Format("20060102150405")
@@ -282,7 +287,7 @@ func (a *Activities) TakeConsulSnapshot(ctx context.Context) (string, error) {
 	defer span.End()
 
 	if err := os.MkdirAll(a.config.ConsulBackupDir, 0o755); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
+		return "", fmt.Errorf(errCreateBackupDir, err)
 	}
 
 	timestamp := time.Now().Format("20060102150405")
@@ -311,7 +316,7 @@ func (a *Activities) ListPostgresDatabases(ctx context.Context) ([]string, error
 	logger := activity.GetLogger(ctx)
 
 	// Client span for postgres edge in service graph
-	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.list_databases")
+	ctx, span := shared.StartPeerSpan(ctx, peerPostgresPrimary, "postgres.list_databases")
 	defer span.End()
 
 	dbs, err := a.pg.ListDatabases(ctx)
@@ -331,11 +336,11 @@ func (a *Activities) BackupPostgresGlobals(ctx context.Context) (string, error) 
 	logger := activity.GetLogger(ctx)
 
 	// Client span for postgres edge in service graph
-	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.backup_globals")
+	ctx, span := shared.StartPeerSpan(ctx, peerPostgresPrimary, "postgres.backup_globals")
 	defer span.End()
 
 	if err := os.MkdirAll(a.config.PostgresBackupDir, 0o755); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
+		return "", fmt.Errorf(errCreateBackupDir, err)
 	}
 
 	timestamp := time.Now().Format("20060102150405")
@@ -364,7 +369,7 @@ func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string
 	logger := activity.GetLogger(ctx)
 
 	// Client span for postgres edge in service graph
-	ctx, span := shared.StartPeerSpan(ctx, "postgres-primary", "postgres.backup_database",
+	ctx, span := shared.StartPeerSpan(ctx, peerPostgresPrimary, "postgres.backup_database",
 		attribute.String("postgres.database", database),
 	)
 	defer span.End()
@@ -372,7 +377,7 @@ func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string
 	safe := SanitizeDBName(database)
 	dbDir := filepath.Join(a.config.PostgresBackupDir, safe)
 	if err := os.MkdirAll(dbDir, 0o755); err != nil {
-		return "", fmt.Errorf("create backup dir: %w", err)
+		return "", fmt.Errorf(errCreateBackupDir, err)
 	}
 
 	timestamp := time.Now().Format("20060102150405")
@@ -619,14 +624,48 @@ func runDumpToGzip(ctx context.Context, filename string, heartbeat time.Duration
 	return nil
 }
 
+// backupLogger is the minimal logging surface the cleanup helpers need.
+type backupLogger interface {
+	Info(string, ...any)
+	Warn(string, ...any)
+}
+
+// isBackupFile reports whether name is one of the backup artifact types.
+func isBackupFile(name string) bool {
+	return filepath.Ext(name) == ".snap" ||
+		strings.HasSuffix(name, ".sql.gz") ||
+		strings.HasSuffix(name, ".tar.gz")
+}
+
+// pruneBackupEntry removes a single walked entry when it is a backup file
+// older than cutoff, returning true if it deleted the file. Directories,
+// non-backup files, and stat/remove failures are skipped (failures logged).
+func pruneBackupEntry(path string, d os.DirEntry, cutoff time.Time, logger backupLogger) bool {
+	if d.IsDir() || !isBackupFile(d.Name()) {
+		return false
+	}
+	info, err := d.Info()
+	if err != nil {
+		logger.Warn("Failed to stat file", "file", d.Name(), "error", err)
+		return false
+	}
+	if !info.ModTime().Before(cutoff) {
+		return false
+	}
+	if err := os.Remove(path); err != nil {
+		logger.Warn("Failed to remove old backup", "path", path, "error", err)
+		return false
+	}
+	logger.Info("Removed old backup", "path", path,
+		"age_days", int(time.Since(info.ModTime()).Hours()/24))
+	return true
+}
+
 // cleanupDirectory removes backup files older than the cutoff time from a
 // single directory. Handles .snap, .sql.gz, and .tar.gz extensions. Skips
 // non-existent directories gracefully. Deletion failures are logged but
 // do not stop the cleanup process.
-func cleanupDirectory(dir string, cutoff time.Time, logger interface {
-	Info(string, ...any)
-	Warn(string, ...any)
-}) error {
+func cleanupDirectory(dir string, cutoff time.Time, logger backupLogger) error {
 	if _, err := os.Stat(dir); err != nil {
 		if os.IsNotExist(err) {
 			logger.Info("Backup directory does not exist, skipping", "dir", dir)
@@ -641,32 +680,8 @@ func cleanupDirectory(dir string, cutoff time.Time, logger interface {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
-			return nil
-		}
-
-		name := d.Name()
-		isBackup := filepath.Ext(name) == ".snap" ||
-			strings.HasSuffix(name, ".sql.gz") ||
-			strings.HasSuffix(name, ".tar.gz")
-		if !isBackup {
-			return nil
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			logger.Warn("Failed to stat file", "file", name, "error", err)
-			return nil
-		}
-
-		if info.ModTime().Before(cutoff) {
-			if err := os.Remove(path); err != nil {
-				logger.Warn("Failed to remove old backup", "path", path, "error", err)
-			} else {
-				logger.Info("Removed old backup", "path", path,
-					"age_days", int(time.Since(info.ModTime()).Hours()/24))
-				deleted++
-			}
+		if pruneBackupEntry(path, d, cutoff, logger) {
+			deleted++
 		}
 		return nil
 	})

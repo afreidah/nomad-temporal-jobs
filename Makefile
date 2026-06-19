@@ -77,32 +77,12 @@ WEB_IMAGE  := $(REGISTRY)/temporal-workers-web
 WEB_TAG    ?= $(shell git describe --tags --always --dirty)
 PLATFORMS  ?= linux/amd64,linux/arm64
 
-GODOC_PKGS := shared:./shared \
-              backup-activities:./backup/activities \
-              backup-workflows:./backup/workflows \
-              trivyscan-activities:./trivyscan/activities \
-              trivyscan-workflows:./trivyscan/workflows \
-              maintenance-nodes:./maintenance/internal/nodes \
-              maintenance-nodecleanup:./maintenance/nodecleanup \
-              maintenance-registrygc:./maintenance/registrygc \
-              maintenance-aptlycleanup:./maintenance/aptlycleanup \
-              maintenance-postgresmaint:./maintenance/postgresmaint \
-              certacquirer-activities:./certacquirer/activities \
-              certacquirer-workflows:./certacquirer/workflows
-
 web-tools: ## Install Hugo and gomarkdoc for local website development
 	go install github.com/gohugoio/hugo@latest
 	go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
 
 web-godoc: ## Generate Go API reference markdown for the website
-	@mkdir -p web/content/godoc
-	@for entry in $(GODOC_PKGS); do \
-		name=$${entry%%:*}; pkg=$${entry#*:}; \
-		echo "  godoc: $$pkg"; \
-		printf -- '---\ntitle: "%s"\n---\n\n' "$$name" > web/content/godoc/$$name.md; \
-		gomarkdoc $$pkg >> web/content/godoc/$$name.md; \
-		sed -i '0,/^# /{/^# /d}' web/content/godoc/$$name.md; \
-	done
+	@sh web/gen-godoc.sh web/content/godoc
 
 web-serve: web-godoc ## Serve the project website locally
 	cd web && hugo serve

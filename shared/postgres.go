@@ -17,6 +17,8 @@ import (
 	"strconv"
 
 	"github.com/XSAM/otelsql"
+	// pq registers the "postgres" driver with database/sql for its side effects;
+	// it is never referenced directly, only by driver name in sql.Open.
 	_ "github.com/lib/pq"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )

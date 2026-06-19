@@ -16,8 +16,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   preflight:
@@ -38,6 +37,11 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: [preflight]
+    # Only this job mutates the repo: GoReleaser cuts the GitHub Release
+    # (contents) and the changelog step opens a PR (pull-requests).
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:

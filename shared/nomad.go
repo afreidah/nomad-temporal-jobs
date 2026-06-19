@@ -163,18 +163,23 @@ func (n *Nomad) RunningImages(ctx context.Context) ([]string, error) {
 		if err != nil || alloc.Job == nil {
 			continue
 		}
-		for _, tg := range alloc.Job.TaskGroups {
-			for _, task := range tg.Tasks {
-				if task.Driver != "docker" || task.Config == nil {
-					continue
-				}
-				if img, ok := task.Config["image"].(string); ok && img != "" {
-					imageSet[img] = struct{}{}
-				}
+		collectDockerImages(alloc.Job, imageSet)
+	}
+	return slices.Sorted(maps.Keys(imageSet)), nil
+}
+
+// collectDockerImages adds the image of every docker-driver task in job to set.
+func collectDockerImages(job *api.Job, set map[string]struct{}) {
+	for _, tg := range job.TaskGroups {
+		for _, task := range tg.Tasks {
+			if task.Driver != "docker" || task.Config == nil {
+				continue
+			}
+			if img, ok := task.Config["image"].(string); ok && img != "" {
+				set[img] = struct{}{}
 			}
 		}
 	}
-	return slices.Sorted(maps.Keys(imageSet)), nil
 }
 
 // ClientNodes returns the ready Nomad client nodes with SSH-dialable addresses.
