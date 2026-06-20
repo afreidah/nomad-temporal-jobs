@@ -74,6 +74,12 @@ jobs:
       - name: Unit tests
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
+      - name: Upload coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: coverage.out
+
   vet:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
@@ -104,3 +110,25 @@ jobs:
 
       - name: Run govulncheck
         run: govulncheck ./...
+
+  # ---------------------------------------------------------------------------
+  # SONARQUBE ANALYSIS (coverage + quality gate -> SonarCloud)
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    needs: [changes, test]
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history so SonarCloud can attribute new code
+
+      - name: Download coverage
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coverage
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@2f77a1ec69fb1d595b06f35ab27e97605bdef703 # v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
