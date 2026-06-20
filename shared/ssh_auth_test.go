@@ -95,25 +95,23 @@ func TestBuildAuthMethods(t *testing.T) {
 		}
 	})
 
-	t.Run("present but broken cert is a hard error", func(t *testing.T) {
-		path := writeTemp(t, "broken", []byte("garbage"))
-		if _, err := buildAuthMethods(signer, path); err == nil {
-			t.Error("expected an error for a broken cert, not a silent fallback")
-		}
-	})
-
-	t.Run("non-certificate public key errors", func(t *testing.T) {
-		path := writeTemp(t, "pub", ssh.MarshalAuthorizedKey(signer.PublicKey()))
-		if _, err := buildAuthMethods(signer, path); err == nil {
-			t.Error("expected an error when the cert file holds a non-certificate key")
-		}
-	})
-
-	t.Run("missing cert file errors", func(t *testing.T) {
-		if _, err := buildAuthMethods(signer, filepath.Join(t.TempDir(), "nope")); err == nil {
-			t.Error("expected an error for a missing cert file")
-		}
-	})
+	// A cert path that can't yield a valid certificate must be a hard error,
+	// never a silent fallback to key-only auth.
+	errCases := []struct {
+		name string
+		path string
+	}{
+		{"broken cert", writeTemp(t, "broken", []byte("garbage"))},
+		{"non-certificate public key", writeTemp(t, "pub", ssh.MarshalAuthorizedKey(signer.PublicKey()))},
+		{"missing cert file", filepath.Join(t.TempDir(), "nope")},
+	}
+	for _, c := range errCases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := buildAuthMethods(signer, c.path); err == nil {
+				t.Errorf("%s: expected an error, not a silent fallback", c.name)
+			}
+		})
+	}
 }
 
 func TestHostCACallback(t *testing.T) {
