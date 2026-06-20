@@ -8,7 +8,8 @@ RUN go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
 COPY . .
 RUN sh web/gen-godoc.sh /godoc
 
-FROM --platform=$BUILDPLATFORM hugomods/hugo:latest AS build
+# Pinned by digest for reproducible builds (bump via renovate/dependabot).
+FROM --platform=$BUILDPLATFORM hugomods/hugo@sha256:367ea85950c9f3e12746fbf049f29ea00758c86791072dfdc9772748ff9306bc AS build
 WORKDIR /src/web
 COPY web/ /src/web/
 COPY README.md /src/README.md

@@ -45,7 +45,8 @@ USER nonroot:nonroot
 ENTRYPOINT ["worker"]
 
 # ---- profile: pure-Go, root (maintenance: reads SSH key from root-owned mount) ----
-FROM gcr.io/distroless/static-debian12 AS runtime-distroless-root
+# Pinned by digest for reproducible builds (bump via renovate/dependabot).
+FROM gcr.io/distroless/static-debian12@sha256:9c346e4be81b5ca7ff31a0d89eaeade58b0f95cfd3baed1f36083ddb47ca3160 AS runtime-distroless-root
 COPY --from=builder /out/worker /usr/local/bin/worker
 ENTRYPOINT ["worker"]
 
