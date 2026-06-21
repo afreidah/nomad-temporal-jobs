@@ -13,6 +13,8 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+
+	"go.temporal.io/sdk/testsuite"
 )
 
 // -------------------------------------------------------------------------
@@ -219,5 +221,23 @@ func TestParseTrivyOutput_Empty(t *testing.T) {
 	}
 	if len(vulns) != 0 || counts != (SeverityCounts{}) {
 		t.Errorf("expected empty result, got %d vulns, counts %+v", len(vulns), counts)
+	}
+}
+
+// -------------------------------------------------------------------------
+// SCAN IMAGE
+// -------------------------------------------------------------------------
+
+// TestScanImage_BinaryFailure runs ScanImage where the trivy binary can't run
+// (it isn't present at trivyBin in the test environment), so cmd.Run fails.
+// ScanImage must surface that as an error -- so Temporal retries -- rather than
+// reporting a silent success. Exercises the command build and the failure path.
+func TestScanImage_BinaryFailure(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	a := &Activities{config: Config{TrivyServerAddr: "127.0.0.1:0"}}
+	env.RegisterActivity(a.ScanImage)
+
+	if _, err := env.ExecuteActivity(a.ScanImage, "alpine:3"); err == nil {
+		t.Fatal("expected an error when the trivy binary cannot run, got nil")
 	}
 }
