@@ -53,11 +53,13 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    TEMPORAL --> TTQ[trivy\\ntask-queue]:::middleware',
     '    TEMPORAL --> CTQ[cleanup\\ntask-queue]:::middleware',
     '    TEMPORAL --> CETQ[cert\\ntask-queue]:::middleware',
+    '    TEMPORAL --> GTQ[github-token\\ntask-queue]:::middleware',
     '',
     '    BTQ --> BWORKER[Backup\\nWorker]:::handler',
     '    TTQ --> TWORKER[Trivy Scan\\nWorker]:::handler',
     '    CTQ --> CWORKER[Cleanup\\nWorker]:::handler',
     '    CETQ --> CEWORKER[Cert Acquirer\\nWorker]:::handler',
+    '    GTQ --> GWORKER[GitHub Token\\nRenewer Worker]:::handler',
     '',
     '    BWORKER --> NOMAD_API[Nomad API]:::data',
     '    BWORKER --> CONSUL_API[Consul API]:::data',
@@ -76,6 +78,10 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    CEWORKER --> ACME[ACME\\nLetsEncrypt]:::data',
     '    CEWORKER --> CF[Cloudflare\\nDNS]:::data',
     '',
+    '    GWORKER --> VAULT',
+    '    GWORKER --> CONSUL_API',
+    '    GWORKER --> GITHUB[GitHub\\nApp API]:::data',
+    '',
     '    BWORKER --> TEMPO[Tempo\\nTracing]:::observability',
     '    BWORKER --> PROM[Prometheus\\nMetrics]:::observability',
     '    TWORKER --> TEMPO',
@@ -84,11 +90,14 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    CWORKER --> PROM',
     '    CEWORKER --> TEMPO',
     '    CEWORKER --> PROM',
+    '    GWORKER --> TEMPO',
+    '    GWORKER --> PROM',
     '',
     '    BWORKER --> LOKI[Loki\\nLogging]:::observability',
     '    TWORKER --> LOKI',
     '    CWORKER --> LOKI',
     '    CEWORKER --> LOKI',
+    '    GWORKER --> LOKI',
     '',
     '    classDef entry fill:#059669,stroke:#34d399,color:#fff,font-weight:bold',
     '    classDef middleware fill:#0d9488,stroke:#14b8a6,color:#fff',
@@ -112,7 +121,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     SCHED: {
       title: 'Temporal Schedules',
       badge: 'entry', badgeText: 'scheduler',
-      body: '<p>Temporal Schedules start each workflow on cron &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC, aptly cleanup, postgres maintenance, cert acquirer). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
+      body: '<p>Temporal Schedules start each workflow on cron &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC, aptly cleanup, postgres maintenance, cert acquirer, github token renewer). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
     },
     TEMPORAL: {
       title: 'Temporal Server',
@@ -139,6 +148,11 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
       badge: 'middleware', badgeText: 'task queue',
       body: '<p>Temporal task queue for the cert-acquirer workflow and activities. Only the cert-acquirer worker polls this queue.</p><p>Issuance uses few attempts with long backoff (DNS-01 propagation is slow and Let\'s Encrypt rate-limits duplicate issuance); the publish step retries quickly.</p>'
     },
+    GTQ: {
+      title: 'github-token-task-queue',
+      badge: 'middleware', badgeText: 'task queue',
+      body: '<p>Temporal task queue for the GitHub token-renewer workflow and activities. Only the github-token-renewer worker polls this queue.</p><p>3 attempts with exponential backoff; an unparseable <code>owner/repo</code> is non-retryable.</p>'
+    },
     BWORKER: {
       title: 'Backup Worker',
       badge: 'handler', badgeText: 'worker',
@@ -158,6 +172,11 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
       title: 'Cert Acquirer Worker',
       badge: 'handler', badgeText: 'worker',
       body: '<p>Issues the <code>*.munchbox.cc</code> wildcard certificate via ACME DNS-01 (Cloudflare, go-acme/lego) and publishes it to Vault for Traefik to read.</p><p>Issuance and publish are separate activities: the issued cert+key are written to a Vault staging path so a publish retry never re-runs ACME (Let\'s Encrypt rate limits), and the private key never transits workflow history.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the Cloudflare token through Vault &mdash; no static secrets in the job.</p><p><a href="../cert-acquirer-workflow/">Cert acquirer workflow diagram &rarr;</a></p>'
+    },
+    GWORKER: {
+      title: 'GitHub Token Renewer Worker',
+      badge: 'handler', badgeText: 'worker',
+      body: '<p>Keeps each managed repo\'s CI/release token secret continuously valid by minting a fresh GitHub App installation token every run &mdash; replacing hand-rotated Personal Access Tokens (which can\'t be API-minted).</p><p>Reads the repo list from Consul KV, then per repo mints a repo-scoped token (<code>contents</code> + <code>pull-requests: write</code>), seals it with a NaCl box against the repo\'s Actions public key, and writes it to the <code>RELEASE_PAT</code> secret via a separate <code>secrets: write</code> token &mdash; native <code>go-github</code>, no <code>gh</code> CLI.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the App private key through Vault &mdash; no static secrets in the job.</p><p><a href="../ghtokenrenewer-workflow/">GitHub token renewer workflow diagram &rarr;</a></p>'
     },
     NOMAD_API: {
       title: 'Nomad API',
@@ -203,6 +222,11 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
       title: 'Cloudflare DNS',
       badge: 'data', badgeText: 'external service',
       body: '<p>Cloudflare DNS API. The cert worker provisions the <code>_acme-challenge</code> TXT record for the DNS-01 challenge using a scoped API token read from Vault.</p>'
+    },
+    GITHUB: {
+      title: 'GitHub App API',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>GitHub REST API, reached as a GitHub App (one app installed across all managed repos) via the native <code>go-github</code> client &mdash; no <code>gh</code> CLI.</p><p>Mints short-lived, repo-scoped installation tokens and writes repository Actions secrets (sealed against the repo\'s public key). An App is the only way to mint PR-capable tokens programmatically. Produces <code>peer.service: github</code> service-graph edges.</p>'
     },
     TEMPO: {
       title: 'Tempo (Tracing)',
