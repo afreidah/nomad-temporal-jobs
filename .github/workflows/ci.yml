@@ -99,17 +99,13 @@ jobs:
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
+      # Use the official action (it does checkout + setup-go + install + run) so
+      # the workflow has no `go install ...@version` of its own -- that install
+      # isn't lock-file-deterministic (SonarCloud S8545).
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
         with:
           go-version-file: go.mod
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.4.0
-
-      - name: Run govulncheck
-        run: govulncheck ./...
 
   # ---------------------------------------------------------------------------
   # SONARQUBE ANALYSIS (coverage + quality gate -> SonarCloud)
