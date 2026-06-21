@@ -35,8 +35,8 @@ func main() {
 		Service:   "github-token-renewer",
 		TaskQueue: "github-token-renewer-task-queue",
 		Register: func(ctx context.Context, slogger *slog.Logger, w worker.Worker) (func(), error) {
-			// Vault (Workload Identity); the GitHub App key and the Consul token
-			// are pulled through it, so the Nomad job carries only its identity.
+			// Vault (Workload Identity); the GitHub App key is pulled through it,
+			// so the Nomad job carries only its identity.
 			vc, err := shared.NewVaultWithRefresher(ctx, slogger)
 			if err != nil {
 				return nil, err
@@ -46,7 +46,9 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			consul, err := shared.NewConsul(ctx, vc)
+			// Consul KV (the repo list) uses the local agent's default ACL token
+			// over host networking -- no per-worker Consul token to manage.
+			consul, err := shared.NewConsul(ctx, nil)
 			if err != nil {
 				return nil, err
 			}
