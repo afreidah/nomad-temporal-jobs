@@ -4,7 +4,7 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Runs the activities in a TestActivityEnvironment with fakes for the githubClient
-// and repoSource consumer interfaces -- repo-list parsing, the mint-and-store
+// and kvGetter consumer interfaces -- repo-list parsing, the mint-and-store
 // path, and error handling -- with no real GitHub or Consul.
 // -------------------------------------------------------------------------------
 

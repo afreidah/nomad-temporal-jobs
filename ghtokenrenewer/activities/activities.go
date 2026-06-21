@@ -39,9 +39,9 @@ type githubClient interface {
 	SetRepoSecret(ctx context.Context, owner, repo, name, value string) error
 }
 
-// repoSource is the Consul KV surface the renewer uses: read the repo-list key.
+// kvGetter is the Consul KV surface the renewer uses: read the repo-list key.
 // *shared.Consul satisfies it structurally.
-type repoSource interface {
+type kvGetter interface {
 	KVGet(ctx context.Context, key string) (value []byte, found bool, err error)
 }
 
@@ -53,7 +53,7 @@ type repoSource interface {
 // activities.
 type Config struct {
 	GitHub githubClient
-	Repos  repoSource
+	Repos  kvGetter
 
 	// RepoListKey is the Consul KV key holding the newline-separated owner/repo
 	// list. SecretName is the Actions secret each repo's token is written to.
