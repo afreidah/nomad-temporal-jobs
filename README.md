@@ -5,6 +5,8 @@
 # Nomad Temporal Jobs
 
 [![CI](https://github.com/afreidah/nomad-temporal-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/afreidah/nomad-temporal-jobs/actions/workflows/ci.yml)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=afreidah_nomad-temporal-jobs&metric=coverage)](https://sonarcloud.io/summary/new_code?id=afreidah_nomad-temporal-jobs)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=afreidah_nomad-temporal-jobs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=afreidah_nomad-temporal-jobs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 <p align="center">

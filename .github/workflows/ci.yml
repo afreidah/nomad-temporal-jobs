@@ -5,6 +5,7 @@
 #
 # Runs on push to main and pull requests. Detects which paths changed and
 # skips irrelevant work. Lints, tests, and vulnerability-checks all Go code.
+# Permissions are declared per job (least privilege) rather than workflow-wide.
 # -------------------------------------------------------------------------------
 
 name: CI
@@ -14,15 +15,14 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
-
 jobs:
   # ---------------------------------------------------------------------------
   # PATH DETECTION
   # ---------------------------------------------------------------------------
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       go: ${{ steps.filter.outputs.go }}
     steps:
@@ -32,7 +32,7 @@ jobs:
 
       - name: Detect changed paths
         id: filter
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4
         with:
           filters: |
             go:
@@ -48,6 +48,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -56,7 +58,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9
         with:
           version: v2.10.1
 
@@ -64,6 +66,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -74,10 +78,18 @@ jobs:
       - name: Unit tests
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
+      - name: Upload coverage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: coverage.out
+
   vet:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -92,15 +104,37 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-go@v6
+      # Use the official action (it does checkout + setup-go + install + run) so
+      # the workflow has no `go install ...@version` of its own -- that install
+      # isn't lock-file-deterministic (SonarCloud S8545).
+      - name: Run govulncheck
+        uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
         with:
           go-version-file: go.mod
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+  # ---------------------------------------------------------------------------
+  # SONARQUBE ANALYSIS (coverage + quality gate -> SonarCloud)
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    needs: [changes, test]
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # full history so SonarCloud can attribute new code
 
-      - name: Run govulncheck
-        run: govulncheck ./...
+      - name: Download coverage
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coverage
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@2f77a1ec69fb1d595b06f35ab27e97605bdef703 # v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

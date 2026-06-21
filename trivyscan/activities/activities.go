@@ -33,6 +33,11 @@ import (
 // attrTrivyError is the span attribute key for a recorded Trivy scan error.
 const attrTrivyError = "trivy.error"
 
+// trivyBin is the absolute path to the Trivy binary in the runtime image. Using
+// a fixed path avoids resolving the command through PATH (which could include a
+// writable directory).
+const trivyBin = "/usr/local/bin/trivy"
+
 // -------------------------------------------------------------------------
 // CONFIGURATION
 // -------------------------------------------------------------------------
@@ -208,7 +213,7 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 	)
 	defer span.End()
 
-	cmd := exec.CommandContext(ctx, "trivy", "image",
+	cmd := exec.CommandContext(ctx, trivyBin, "image",
 		"--server", a.config.TrivyServerAddr,
 		"--format", "json",
 		"--timeout", "10m",
