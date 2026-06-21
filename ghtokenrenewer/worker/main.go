@@ -22,7 +22,6 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
-	"time"
 
 	"munchbox/temporal-workers/ghtokenrenewer/activities"
 	"munchbox/temporal-workers/ghtokenrenewer/workflows"
@@ -31,8 +30,6 @@ import (
 	"go.temporal.io/sdk/worker"
 )
 
-const tokenRefreshInterval = time.Minute
-
 func main() {
 	err := shared.RunWorker(context.Background(), shared.WorkerSpec{
 		Service:   "github-token-renewer",
@@ -40,11 +37,10 @@ func main() {
 		Register: func(ctx context.Context, slogger *slog.Logger, w worker.Worker) (func(), error) {
 			// Vault (Workload Identity); the GitHub App key and the Consul token
 			// are pulled through it, so the Nomad job carries only its identity.
-			vc, err := shared.NewVaultClient()
+			vc, err := shared.NewVaultWithRefresher(ctx, slogger)
 			if err != nil {
 				return nil, err
 			}
-			go vc.StartTokenRefresher(ctx, tokenRefreshInterval, slogger)
 
 			gh, err := newGitHub(ctx, vc)
 			if err != nil {

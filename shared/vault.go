@@ -90,6 +90,22 @@ func NewVaultClient() (*VaultClient, error) {
 	return &VaultClient{api: c, mount: mount, tokenFile: os.Getenv("VAULT_TOKEN_FILE")}, nil
 }
 
+// defaultTokenRefreshInterval is how often a worker reloads its Vault token from
+// the file Nomad rotates.
+const defaultTokenRefreshInterval = time.Minute
+
+// NewVaultWithRefresher builds a Workload-Identity Vault client and starts its
+// token refresher in the background for the life of ctx. Every worker that pulls
+// credentials from Vault uses this instead of repeating the wiring.
+func NewVaultWithRefresher(ctx context.Context, log *slog.Logger) (*VaultClient, error) {
+	vc, err := NewVaultClient()
+	if err != nil {
+		return nil, err
+	}
+	go vc.StartTokenRefresher(ctx, defaultTokenRefreshInterval, log)
+	return vc, nil
+}
+
 // workloadToken returns the Vault token from VAULT_TOKEN, falling back to the
 // file named by VAULT_TOKEN_FILE.
 func workloadToken() (string, error) {
