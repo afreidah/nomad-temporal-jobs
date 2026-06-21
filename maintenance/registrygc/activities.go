@@ -33,12 +33,12 @@ import (
 // an activity implementation; the generic saga steps come from a separate
 // nodes.SagaActivities registration.
 type Activities struct {
-	ssh *shared.SSHClient
+	runner shared.ContainerRunner
 }
 
 // New creates an Activities instance over the shared SSH client.
-func New(ssh *shared.SSHClient) *Activities {
-	return &Activities{ssh: ssh}
+func New(runner shared.ContainerRunner) *Activities {
+	return &Activities{runner: runner}
 }
 
 // -------------------------------------------------------------------------
@@ -140,7 +140,7 @@ func (a *Activities) RunRegistryGarbageCollect(ctx context.Context, node nodes.N
 	}
 	cmd = append(cmd, "/etc/distribution/config.yml")
 
-	out, err := a.ssh.RunContainer(ctx, nodes.Target(node), &container.Config{
+	out, err := a.runner.RunContainer(ctx, nodes.Target(node), &container.Config{
 		Image: config.RegistryImage,
 		Cmd:   cmd,
 	}, []string{config.RegistryDataDir + ":/var/lib/registry"}, 30*time.Second)

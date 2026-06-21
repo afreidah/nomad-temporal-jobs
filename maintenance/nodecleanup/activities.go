@@ -22,7 +22,6 @@ import (
 	"munchbox/temporal-workers/maintenance/internal/nodes"
 	"munchbox/temporal-workers/shared"
 
-	"github.com/moby/moby/client"
 	"go.temporal.io/sdk/activity"
 )
 
@@ -43,13 +42,14 @@ type nomadClient interface {
 // activity implementations.
 type Activities struct {
 	nomad nomadClient
-	ssh   *shared.SSHClient
+	host  shared.HostConnector
 }
 
-// New creates an Activities instance over the shared Nomad and SSH clients
-// (reused across activity invocations rather than rebuilt per call).
-func New(nomad nomadClient, ssh *shared.SSHClient) *Activities {
-	return &Activities{nomad: nomad, ssh: ssh}
+// New creates an Activities instance over the shared Nomad client and a remote-
+// host connector (reused across activity invocations rather than rebuilt per
+// call).
+func New(nomad nomadClient, host shared.HostConnector) *Activities {
+	return &Activities{nomad: nomad, host: host}
 }
 
 // -------------------------------------------------------------------------
@@ -128,7 +128,7 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 	}
 
 	logger.Info("Connecting to node via SSH", "node", node.Name, "address", node.Address)
-	conn, err := a.ssh.Connect(nodes.Target(node))
+	conn, err := a.host.Connect(nodes.Target(node))
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("ssh connect: %v", err))
 		return result, err
@@ -216,7 +216,7 @@ func (a *Activities) runningJobs(ctx context.Context, nodeID string) (map[string
 
 // listDataDirs returns the immediate subdirectories of dataDir on the remote
 // host with their modification times, over SFTP.
-func listDataDirs(conn *shared.SSHConn, dataDir string) ([]dirEntry, error) {
+func listDataDirs(conn shared.RemoteHost, dataDir string) ([]dirEntry, error) {
 	infos, err := conn.ReadDir(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("list data dirs in %s: %w", dataDir, err)
@@ -271,41 +271,21 @@ func classifyEntry(e dirEntry, running map[string]struct{}, cfg CleanupConfig, n
 // API (tunneled over conn) -- the equivalent of `docker system prune -af`. In
 // dry-run it does nothing. Returns the reclaimed-space string and a log
 // fragment.
-func (a *Activities) dockerPrune(ctx context.Context, conn *shared.SSHConn, dryRun bool) (string, string) {
+func (a *Activities) dockerPrune(ctx context.Context, conn shared.RemoteHost, dryRun bool) (string, string) {
 	if dryRun {
 		return "0B", "=== Docker Cleanup (dry run; skipped) ===\n"
 	}
 
-	cli, err := conn.DockerClient()
+	reclaimed, warnings, err := conn.DockerSystemPrune(ctx)
 	if err != nil {
 		return "0B", "=== Docker Cleanup ===\ndocker client: " + err.Error() + "\n"
 	}
-	defer func() { _ = cli.Close() }()
 
-	var reclaimed uint64
 	var note strings.Builder
 	note.WriteString("=== Docker Cleanup ===\n")
-
-	if cp, perr := cli.ContainerPrune(ctx, client.ContainerPruneOptions{}); perr != nil {
-		fmt.Fprintf(&note, "container prune: %v\n", perr)
-	} else {
-		reclaimed += cp.Report.SpaceReclaimed
+	for _, w := range warnings {
+		note.WriteString(w + "\n")
 	}
-	// dangling=false prunes all unused images, matching `prune -a`.
-	if ip, perr := cli.ImagePrune(ctx, client.ImagePruneOptions{Filters: client.Filters{}.Add("dangling", "false")}); perr != nil {
-		fmt.Fprintf(&note, "image prune: %v\n", perr)
-	} else {
-		reclaimed += ip.Report.SpaceReclaimed
-	}
-	if _, perr := cli.NetworkPrune(ctx, client.NetworkPruneOptions{}); perr != nil {
-		fmt.Fprintf(&note, "network prune: %v\n", perr)
-	}
-	if bp, perr := cli.BuildCachePrune(ctx, client.BuildCachePruneOptions{All: true}); perr != nil {
-		fmt.Fprintf(&note, "build cache prune: %v\n", perr)
-	} else {
-		reclaimed += bp.Report.SpaceReclaimed
-	}
-
 	freed := nodes.HumanBytes(int64(reclaimed))
 	fmt.Fprintf(&note, "reclaimed %s\n", freed)
 	return freed, note.String()

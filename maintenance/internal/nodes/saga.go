@@ -41,13 +41,13 @@ type nomad interface {
 // activity implementations used by every job-scaling saga.
 type SagaActivities struct {
 	nomad nomad
-	ssh   *shared.SSHClient
+	disk  shared.DirMeasurer
 }
 
 // NewSagaActivities builds the shared saga activities over the given Nomad and
 // SSH clients (reused across invocations rather than rebuilt per call).
-func NewSagaActivities(n nomad, ssh *shared.SSHClient) *SagaActivities {
-	return &SagaActivities{nomad: n, ssh: ssh}
+func NewSagaActivities(n nomad, disk shared.DirMeasurer) *SagaActivities {
+	return &SagaActivities{nomad: n, disk: disk}
 }
 
 // -------------------------------------------------------------------------
@@ -93,7 +93,7 @@ func (a *SagaActivities) MeasureDataDir(ctx context.Context, node NodeInfo, data
 	logger := activity.GetLogger(ctx)
 	logger.Info("Measuring data dir", "node", node.Name, "path", dataDir)
 
-	n, err := a.ssh.DirSize(ctx, Target(node), dataDir)
+	n, err := a.disk.DirSize(ctx, Target(node), dataDir)
 	if err != nil {
 		return 0, fmt.Errorf("measure %s on %s: %w", dataDir, node.Name, err)
 	}
