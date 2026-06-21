@@ -12,6 +12,7 @@ package nodecleanup
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -21,6 +22,36 @@ import (
 	"munchbox/temporal-workers/maintenance/internal/nodes"
 	"munchbox/temporal-workers/shared"
 )
+
+func runCleanup(t *testing.T, host shared.RemoteHost) CleanupResult {
+	t.Helper()
+	a := New(&fakeNomad{}, &fakeConnector{host: host})
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(a.CleanupNodeViaSSH)
+	val, err := env.ExecuteActivity(a.CleanupNodeViaSSH, nodes.NodeInfo{Name: "n1"},
+		CleanupConfig{DataDir: "/data", DockerPrune: true})
+	if err != nil {
+		t.Fatalf("CleanupNodeViaSSH: %v", err)
+	}
+	var r CleanupResult
+	if err := val.Get(&r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return r
+}
+
+// Docker prune that emits per-step warnings still succeeds (warnings are noted).
+func TestCleanupNodeViaSSH_DockerPruneWarnings(t *testing.T) {
+	_ = runCleanup(t, &fakeRemoteHost{warnings: []string{"container prune: busy"}})
+}
+
+// A failed daemon prune is reported, not fatal; reclaimed space stays 0B.
+func TestCleanupNodeViaSSH_DockerPruneError(t *testing.T) {
+	r := runCleanup(t, &fakeRemoteHost{pruneErr: errors.New("daemon down")})
+	if r.DockerSpaceFreed != "0B" {
+		t.Errorf("on prune error DockerSpaceFreed = %q, want 0B", r.DockerSpaceFreed)
+	}
+}
 
 // fakeFileInfo is a directory entry with a controllable name and mtime.
 type fakeFileInfo struct {
