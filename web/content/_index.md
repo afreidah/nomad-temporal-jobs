@@ -17,6 +17,7 @@ archetype: "home"
 {{% badge style="green" title=" " icon="fas fa-box-archive" %}}Aptly Cleanup{{% /badge %}}
 {{% badge style="info" title=" " icon="fas fa-database" %}}Postgres Maintenance{{% /badge %}}
 {{% badge style="info" title=" " icon="fas fa-certificate" %}}Cert Renewal{{% /badge %}}
+{{% badge style="info" title=" " icon="fas fa-key" %}}GitHub Token Renewal{{% /badge %}}
 {{% badge style="warning" title=" " icon="fas fa-fire" %}}Prometheus Metrics{{% /badge %}}
 {{% badge style="primary" icon="fas fa-project-diagram" %}}OpenTelemetry{{% /badge %}}
 
@@ -35,7 +36,7 @@ archetype: "home"
 <h2 class="hero-heading" style="color: #34d399;">Temporal workers for infrastructure automation</h2>
 
 <p class="hero-lead">
-Four independent Temporal workers run seven scheduled infrastructure jobs you'd otherwise babysit &mdash; backups, vulnerability scanning, node cleanup, registry and aptly garbage collection, PostgreSQL maintenance, and certificate renewal. Every remote operation goes through a native Go API or library, never a remote shell.
+Five independent Temporal workers run eight scheduled infrastructure jobs you'd otherwise babysit &mdash; backups, vulnerability scanning, node cleanup, registry and aptly garbage collection, PostgreSQL maintenance, certificate renewal, and GitHub CI-token renewal. Every remote operation goes through a native Go API or library, never a remote shell.
 </p>
 
 <div class="hero-bullets">
@@ -47,6 +48,7 @@ Four independent Temporal workers run seven scheduled infrastructure jobs you'd 
 - **Aptly cleanup** &mdash; the same saga pattern for `aptly db cleanup`, releasing the leveldb lock and reclaiming pool storage
 - **Postgres maintenance** &mdash; online `VACUUM (ANALYZE)` across every database with bounded concurrency
 - **Cert renewal** &mdash; ACME DNS-01 wildcard issued to Vault, self-authenticating via Nomad Workload Identity
+- **GitHub token renewal** &mdash; a GitHub App mints short-lived, repo-scoped tokens into each repo's Actions secret every run, so CI/release tokens never expire and no PATs are hand-rotated
 
 </div>
 
@@ -109,6 +111,14 @@ Four independent Temporal workers run seven scheduled infrastructure jobs you'd 
 <strong>Certificate Acquisition</strong>
 <p>Renew the <code>*.munchbox.cc</code> wildcard via ACME DNS-01 and publish it to Vault.</p>
 <div class="feature-detail">Issues the wildcard via Let's Encrypt DNS-01 (Cloudflare, go-acme/lego), persisting the ACME account to Vault so registration happens once. Issue and publish are split so a publish retry never re-runs ACME (rate limits), and the private key never transits workflow history. Self-authenticates with its Nomad Workload Identity &mdash; no static secrets.</div>
+</div>
+</div>
+
+<div class="feature-item">
+<div>
+<strong>GitHub Token Renewal</strong>
+<p>Mint short-lived GitHub App tokens into each repo's Actions secret so CI tokens never expire.</p>
+<div class="feature-detail">Reads the managed repo list from Consul, then for each repo mints a repo-scoped GitHub App installation token (<code>contents</code> + <code>pull-requests: write</code>), seals it with a NaCl box against the repo's Actions public key, and writes it to the <code>RELEASE_PAT</code> secret &mdash; all via native go-github, never the <code>gh</code> CLI. Re-minting on every run replaces hand-rotated Personal Access Tokens. Self-authenticates with its Nomad Workload Identity, pulling the App key from Vault.</div>
 </div>
 </div>
 

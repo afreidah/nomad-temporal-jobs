@@ -13,7 +13,7 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-Temporal workflow workers for automated infrastructure operations. **Four worker binaries host seven scheduled jobs.** Three workers map to one job each — backup, vulnerability scanning, and certificate acquisition — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
+Temporal workflow workers for automated infrastructure operations. **Five worker binaries host eight scheduled jobs.** Four workers map to one job each — backup, vulnerability scanning, certificate acquisition, and GitHub token renewal — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
 
 ```
   Temporal Schedules            Temporal Server
@@ -36,12 +36,17 @@ Temporal workflow workers for automated infrastructure operations. **Four worker
                             | cert-acquirer-worker   |
                             | cert-task-queue        |
                             +------------------------+
+                            | github-token-renewer   |
+                            | (github-token-renewer- |
+                            |  task-queue)           |
+                            +------------------------+
                                         |
                                         v
                               Nomad, Consul, S3,
                               PostgreSQL, Trivy,
                               SSH (client nodes),
-                              Vault, ACME, Cloudflare
+                              Vault, ACME, Cloudflare,
+                              GitHub
 ```
 
 Each worker is a long-running Temporal worker process that polls its dedicated task queue. Workflows are pure orchestration; all I/O happens in activities. Activities are registered as struct methods, sharing pooled connections (DB, S3) across invocations.
@@ -123,6 +128,15 @@ Issues the `*.munchbox.cc` wildcard certificate via ACME DNS-01 (Cloudflare) usi
 **Workflow:** `CertAcquirer`
 **Image:** `cert-acquirer-worker`
 **Dependencies:** Vault (Workload Identity), Cloudflare DNS API, Let's Encrypt
+
+### GitHub Token Renewal
+
+Keeps each managed repository's CI/release token secret continuously valid so it never expires — replacing hand-rotated Personal Access Tokens. The workflow reads the `owner/repo` list from Consul KV, then for each repo mints a short-lived GitHub App installation token scoped to that repo (`contents` + `pull-requests: write`), seals it with a NaCl box against the repo's Actions public key, and writes it to the repo's `RELEASE_PAT` Actions secret via a separate `secrets: write` token. Re-minting on every scheduled run means the secret is always fresh; a per-repo failure is recorded and the run continues, failing the workflow only after every repo has been attempted. One GitHub App, installed across all repos, is the only way to mint PR-capable tokens programmatically — a user PAT can't be API-minted. All GitHub I/O uses the native `go-github` client, never the `gh` CLI. The worker authenticates to Vault with its Nomad Workload Identity and pulls the App private key through that client; no static secrets are templated into the job.
+
+**Task queue:** `github-token-renewer-task-queue`
+**Workflow:** `RenewTokens`
+**Image:** `github-token-renewer`
+**Dependencies:** Vault (Workload Identity, holds the App key), Consul KV (repo list), GitHub API
 
 ## Maintenance Sagas
 

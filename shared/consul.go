@@ -96,3 +96,17 @@ func (c *Consul) SaveSnapshot(ctx context.Context) (io.ReadCloser, error) {
 	}
 	return snap, nil
 }
+
+// KVGet reads the raw value at a Consul KV key. The boolean is false (with a nil
+// value and nil error) when the key does not exist, so callers can distinguish
+// an absent key from an empty value.
+func (c *Consul) KVGet(ctx context.Context, key string) ([]byte, bool, error) {
+	pair, _, err := c.client.KV().Get(key, (&consulapi.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		return nil, false, fmt.Errorf("consul kv get %s: %w", key, err)
+	}
+	if pair == nil {
+		return nil, false, nil
+	}
+	return pair.Value, true, nil
+}

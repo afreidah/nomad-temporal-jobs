@@ -93,4 +93,18 @@ weight: 30
 </div>
 </a>
 
+<a class="landing-card" href="ghtokenrenewer-activities/">
+<div>
+<strong>ghtokenrenewer/activities</strong>
+<p>Read the managed repo list from Consul and mint GitHub App installation tokens into each repo's Actions secret (NaCl sealed) &mdash; behind narrow GitHub/Consul consumer interfaces.</p>
+</div>
+</a>
+
+<a class="landing-card" href="ghtokenrenewer-workflows/">
+<div>
+<strong>ghtokenrenewer/workflows</strong>
+<p>Per-repo token-renewal fan-out with bounded concurrency and continue-on-error, so a CI-token secret never expires.</p>
+</div>
+</a>
+
 </div>

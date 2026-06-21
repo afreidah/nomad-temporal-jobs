@@ -18,7 +18,6 @@ import (
 	"log"
 	"log/slog"
 	"os"
-	"time"
 
 	"munchbox/temporal-workers/certacquirer/activities"
 	"munchbox/temporal-workers/certacquirer/workflows"
@@ -27,19 +26,16 @@ import (
 	"go.temporal.io/sdk/worker"
 )
 
-const tokenRefreshInterval = time.Minute
-
 func main() {
 	err := shared.RunWorker(context.Background(), shared.WorkerSpec{
 		Service:   "cert-acquirer-worker",
 		TaskQueue: "cert-task-queue",
 		Register: func(ctx context.Context, slogger *slog.Logger, w worker.Worker) (func(), error) {
 			// Vault client (Workload Identity); other creds are pulled through it.
-			vc, err := shared.NewVaultClient()
+			vc, err := shared.NewVaultWithRefresher(ctx, slogger)
 			if err != nil {
 				return nil, err
 			}
-			go vc.StartTokenRefresher(ctx, tokenRefreshInterval, slogger)
 
 			acts := activities.New(activities.Config{
 				Vault:    vc,

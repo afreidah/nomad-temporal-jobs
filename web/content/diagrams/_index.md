@@ -65,4 +65,11 @@ weight: 20
 </div>
 </a>
 
+<a class="landing-card" href="ghtokenrenewer-workflow/">
+<div>
+<strong>GitHub Token Renewer Workflow</strong>
+<p>Per-repo GitHub App token minting into Actions secrets with bounded concurrency &mdash; CI tokens that never expire.</p>
+</div>
+</a>
+
 </div>
