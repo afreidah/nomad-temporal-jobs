@@ -15,12 +15,11 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: read
-
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 

@@ -5,6 +5,7 @@
 #
 # Runs on push to main and pull requests. Detects which paths changed and
 # skips irrelevant work. Lints, tests, and vulnerability-checks all Go code.
+# Permissions are declared per job (least privilege) rather than workflow-wide.
 # -------------------------------------------------------------------------------
 
 name: CI
@@ -14,15 +15,14 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
-
 jobs:
   # ---------------------------------------------------------------------------
   # PATH DETECTION
   # ---------------------------------------------------------------------------
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       go: ${{ steps.filter.outputs.go }}
     steps:
@@ -48,6 +48,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -64,6 +66,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -84,6 +88,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -98,6 +104,8 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       # Use the official action (it does checkout + setup-go + install + run) so
       # the workflow has no `go install ...@version` of its own -- that install
@@ -114,6 +122,8 @@ jobs:
     needs: [changes, test]
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:
