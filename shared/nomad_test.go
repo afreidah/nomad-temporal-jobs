@@ -105,3 +105,32 @@ func TestIsJobNotFound(t *testing.T) {
 		})
 	}
 }
+
+func TestCollectDockerImages(t *testing.T) {
+	job := &api.Job{
+		TaskGroups: []*api.TaskGroup{
+			{Tasks: []*api.Task{
+				{Driver: "docker", Config: map[string]any{"image": "nginx:1.27"}},
+				{Driver: "docker", Config: map[string]any{"image": "redis:7"}},
+				{Driver: "docker", Config: map[string]any{"image": "nginx:1.27"}},  // dup collapses
+				{Driver: "exec", Config: map[string]any{"image": "ignored"}},       // non-docker driver
+				{Driver: "docker", Config: nil},                                    // no config
+				{Driver: "docker", Config: map[string]any{"image": ""}},            // empty image
+				{Driver: "docker", Config: map[string]any{"command": "/bin/true"}}, // image absent
+			}},
+		},
+	}
+
+	set := make(map[string]struct{})
+	collectDockerImages(job, set)
+
+	want := map[string]struct{}{"nginx:1.27": {}, "redis:7": {}}
+	if len(set) != len(want) {
+		t.Fatalf("got %d images %v, want %d %v", len(set), set, len(want), want)
+	}
+	for img := range want {
+		if _, ok := set[img]; !ok {
+			t.Errorf("missing expected image %q", img)
+		}
+	}
+}

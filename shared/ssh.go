@@ -46,7 +46,7 @@ type SSHTarget struct {
 	Host string // hostname or IP (no port)
 	User string // login user
 	Port int    // SSH port; defaults to 22 when zero
-	Sudo bool    // when true, commands are prefixed with "sudo "
+	Sudo bool   // when true, commands are prefixed with "sudo "
 }
 
 // SSHClient runs commands on remote hosts over SSH. Construct it once with
@@ -144,10 +144,17 @@ func hostCACallback(caPath string) (ssh.HostKeyCallback, error) {
 	return checker.CheckHostKey, nil
 }
 
-// Connect opens a connection to t. The caller must Close the returned SSHConn.
-// Multiple commands may be run sequentially on one connection, each in its own
-// session.
-func (c *SSHClient) Connect(t SSHTarget) (*SSHConn, error) {
+// Connect opens a connection to t for multi-step operations (file ops, Docker
+// prune). The caller must Close the returned RemoteHost. Multiple commands may
+// be run sequentially on one connection, each in its own session.
+func (c *SSHClient) Connect(t SSHTarget) (RemoteHost, error) {
+	return c.connect(t)
+}
+
+// connect dials t and returns the concrete connection. Internal callers that
+// need the full connection (RunContainer, the one-shot Run/DirSize helpers) use
+// this; external callers receive the RemoteHost interface via Connect.
+func (c *SSHClient) connect(t SSHTarget) (*sshConn, error) {
 	port := t.Port
 	if port == 0 {
 		port = 22
@@ -163,13 +170,13 @@ func (c *SSHClient) Connect(t SSHTarget) (*SSHConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ssh dial %s: %w", t.Host, err)
 	}
-	return &SSHConn{client: conn, sudo: t.Sudo}, nil
+	return &sshConn{client: conn, sudo: t.Sudo}, nil
 }
 
 // Run opens a connection to t, runs cmd, and closes the connection. Use Connect
 // when issuing several commands to the same host.
 func (c *SSHClient) Run(ctx context.Context, t SSHTarget, cmd string) (string, error) {
-	conn, err := c.Connect(t)
+	conn, err := c.connect(t)
 	if err != nil {
 		return "", err
 	}
@@ -180,7 +187,7 @@ func (c *SSHClient) Run(ctx context.Context, t SSHTarget, cmd string) (string, e
 // RunWithHeartbeat opens a connection to t, runs cmd while heartbeating, and
 // closes the connection.
 func (c *SSHClient) RunWithHeartbeat(ctx context.Context, t SSHTarget, cmd string, interval time.Duration) (string, error) {
-	conn, err := c.Connect(t)
+	conn, err := c.connect(t)
 	if err != nil {
 		return "", err
 	}
@@ -191,7 +198,7 @@ func (c *SSHClient) RunWithHeartbeat(ctx context.Context, t SSHTarget, cmd strin
 // DirSize opens a connection to t, measures dir over SFTP, and closes the
 // connection. The walk is aborted if ctx is cancelled.
 func (c *SSHClient) DirSize(ctx context.Context, t SSHTarget, dir string) (int64, error) {
-	conn, err := c.Connect(t)
+	conn, err := c.connect(t)
 	if err != nil {
 		return 0, err
 	}
@@ -201,16 +208,16 @@ func (c *SSHClient) DirSize(ctx context.Context, t SSHTarget, dir string) (int64
 	return conn.DirSize(dir)
 }
 
-// SSHConn is an open connection to one host. Run commands or do SFTP file
-// operations on it, then Close.
-type SSHConn struct {
+// sshConn is the concrete SSH-backed implementation of RemoteHost: an open
+// connection to one host for commands and SFTP file operations.
+type sshConn struct {
 	client *ssh.Client
 	sudo   bool
 	sftp   *sftp.Client // lazily opened by the SFTP helpers
 }
 
 // Close tears down the SFTP session (if any) and the underlying connection.
-func (s *SSHConn) Close() error {
+func (s *sshConn) Close() error {
 	if s.sftp != nil {
 		_ = s.sftp.Close()
 	}
@@ -218,7 +225,7 @@ func (s *SSHConn) Close() error {
 }
 
 // sftpClient lazily opens and caches an SFTP session on the connection.
-func (s *SSHConn) sftpClient() (*sftp.Client, error) {
+func (s *sshConn) sftpClient() (*sftp.Client, error) {
 	if s.sftp == nil {
 		c, err := sftp.NewClient(s.client)
 		if err != nil {
@@ -230,7 +237,7 @@ func (s *SSHConn) sftpClient() (*sftp.Client, error) {
 }
 
 // ReadDir lists the immediate entries of dir on the remote host over SFTP.
-func (s *SSHConn) ReadDir(dir string) ([]os.FileInfo, error) {
+func (s *sshConn) ReadDir(dir string) ([]os.FileInfo, error) {
 	c, err := s.sftpClient()
 	if err != nil {
 		return nil, err
@@ -239,7 +246,7 @@ func (s *SSHConn) ReadDir(dir string) ([]os.FileInfo, error) {
 }
 
 // RemoveAll deletes path and everything under it on the remote host over SFTP.
-func (s *SSHConn) RemoveAll(path string) error {
+func (s *sshConn) RemoveAll(path string) error {
 	c, err := s.sftpClient()
 	if err != nil {
 		return err
@@ -249,7 +256,7 @@ func (s *SSHConn) RemoveAll(path string) error {
 
 // DirSize returns the total size in bytes of the regular files under dir,
 // walked over SFTP. Unreadable entries are skipped.
-func (s *SSHConn) DirSize(dir string) (int64, error) {
+func (s *sshConn) DirSize(dir string) (int64, error) {
 	c, err := s.sftpClient()
 	if err != nil {
 		return 0, err
@@ -270,7 +277,7 @@ func (s *SSHConn) DirSize(dir string) (int64, error) {
 // Run executes cmd on the connection and returns its stdout. stderr is folded
 // into the returned error. The command is cancelled (its session torn down) if
 // ctx is done, which is more reliable than SSH signal forwarding.
-func (s *SSHConn) Run(ctx context.Context, cmd string) (string, error) {
+func (s *sshConn) Run(ctx context.Context, cmd string) (string, error) {
 	session, err := s.client.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("ssh session: %w", err)
@@ -297,7 +304,7 @@ func (s *SSHConn) Run(ctx context.Context, cmd string) (string, error) {
 // heartbeat every interval so a stall trips the HeartbeatTimeout. It returns
 // the combined stdout+stderr (long-running tools often log progress to stderr).
 // The session is torn down if ctx is cancelled.
-func (s *SSHConn) RunWithHeartbeat(ctx context.Context, cmd string, interval time.Duration) (string, error) {
+func (s *sshConn) RunWithHeartbeat(ctx context.Context, cmd string, interval time.Duration) (string, error) {
 	session, err := s.client.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("ssh session: %w", err)
@@ -330,7 +337,7 @@ func (s *SSHConn) RunWithHeartbeat(ctx context.Context, cmd string, interval tim
 // line applies the sudo prefix when the target requires it. It prefixes the
 // whole command, so callers should pass a single command rather than relying on
 // sudo to span a shell pipeline.
-func (s *SSHConn) line(cmd string) string {
+func (s *sshConn) line(cmd string) string {
 	if s.sudo {
 		return "sudo " + cmd
 	}
@@ -338,7 +345,7 @@ func (s *SSHConn) line(cmd string) string {
 }
 
 // ShellQuote single-quotes a string for safe inclusion in a remote command.
-// Embedded single quotes are escaped via the canonical '\'' sequence.
+// Embedded single quotes are escaped via the canonical '\” sequence.
 func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

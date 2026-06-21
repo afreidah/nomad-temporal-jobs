@@ -34,12 +34,12 @@ import (
 // an activity implementation; the generic saga steps come from a separate
 // nodes.SagaActivities registration.
 type Activities struct {
-	ssh *shared.SSHClient
+	runner shared.ContainerRunner
 }
 
 // New creates an Activities instance over the shared SSH client.
-func New(ssh *shared.SSHClient) *Activities {
-	return &Activities{ssh: ssh}
+func New(runner shared.ContainerRunner) *Activities {
+	return &Activities{runner: runner}
 }
 
 // -------------------------------------------------------------------------
@@ -90,7 +90,7 @@ func (a *Activities) RunAptlyDBCleanup(ctx context.Context, node nodes.NodeInfo,
 	logger.Info("Running aptly db cleanup (one-shot)", "node", node.Name, "image", image, "data_dir", dataDir)
 
 	inner := `printf '{"rootDir":"/opt/aptly"}' > /etc/aptly.conf && aptly db cleanup`
-	out, err := a.ssh.RunContainer(ctx, nodes.Target(node), &container.Config{
+	out, err := a.runner.RunContainer(ctx, nodes.Target(node), &container.Config{
 		Image:      image,
 		Entrypoint: []string{"sh"},
 		Cmd:        []string{"-c", inner},

@@ -32,12 +32,11 @@ import (
 
 const remoteDockerSocket = "/var/run/docker.sock"
 
-// DockerClient returns a Docker API client tunneled to this connection's host
+// dockerClient returns a Docker API client tunneled to this connection's host
 // daemon over the SSH connection. The caller closes the returned client;
-// closing the SSHConn tears down the underlying transport. Prefer RunContainer
-// for one-shot container runs; use this directly for other Docker operations
-// (e.g. prune).
-func (s *SSHConn) DockerClient() (*client.Client, error) {
+// closing the connection tears down the underlying transport. Internal: callers
+// use the higher-level RunContainer / DockerSystemPrune instead.
+func (s *sshConn) dockerClient() (*client.Client, error) {
 	// The dialer ignores the requested network/addr and instead dials the
 	// remote unix socket through the SSH connection.
 	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -54,6 +53,44 @@ func (s *SSHConn) DockerClient() (*client.Client, error) {
 	return cli, nil
 }
 
+// DockerSystemPrune reclaims unused containers, images, networks, and build
+// cache on the connection's host daemon -- the moby equivalent of
+// `docker system prune -af`. It returns the total bytes reclaimed and a
+// per-step warning list; an individual prune that fails is reported as a
+// warning rather than aborting the rest. Only a failure to reach the daemon is
+// returned as an error.
+func (s *sshConn) DockerSystemPrune(ctx context.Context) (uint64, []string, error) {
+	cli, err := s.dockerClient()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = cli.Close() }()
+
+	var reclaimed uint64
+	var warnings []string
+
+	if cp, perr := cli.ContainerPrune(ctx, client.ContainerPruneOptions{}); perr != nil {
+		warnings = append(warnings, fmt.Sprintf("container prune: %v", perr))
+	} else {
+		reclaimed += cp.Report.SpaceReclaimed
+	}
+	// dangling=false prunes all unused images, matching `prune -a`.
+	if ip, perr := cli.ImagePrune(ctx, client.ImagePruneOptions{Filters: client.Filters{}.Add("dangling", "false")}); perr != nil {
+		warnings = append(warnings, fmt.Sprintf("image prune: %v", perr))
+	} else {
+		reclaimed += ip.Report.SpaceReclaimed
+	}
+	if _, perr := cli.NetworkPrune(ctx, client.NetworkPruneOptions{}); perr != nil {
+		warnings = append(warnings, fmt.Sprintf("network prune: %v", perr))
+	}
+	if bp, perr := cli.BuildCachePrune(ctx, client.BuildCachePruneOptions{All: true}); perr != nil {
+		warnings = append(warnings, fmt.Sprintf("build cache prune: %v", perr))
+	} else {
+		reclaimed += bp.Report.SpaceReclaimed
+	}
+	return reclaimed, warnings, nil
+}
+
 // RunContainer runs a one-shot container on t's Docker daemon (tunneled over
 // SSH), waits for it to exit while heartbeating, and returns its combined
 // stdout+stderr. It returns an error if the container exits non-zero. The image
@@ -61,12 +98,12 @@ func (s *SSHConn) DockerClient() (*client.Client, error) {
 // host:container volume bindings; heartbeat is the activity-heartbeat interval
 // while the container runs.
 func (c *SSHClient) RunContainer(ctx context.Context, t SSHTarget, cfg *container.Config, binds []string, heartbeat time.Duration) (string, error) {
-	conn, err := c.Connect(t)
+	conn, err := c.connect(t)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = conn.Close() }()
-	cli, err := conn.DockerClient()
+	cli, err := conn.dockerClient()
 	if err != nil {
 		return "", err
 	}
