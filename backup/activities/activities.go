@@ -134,9 +134,23 @@ type consulSnapshotter interface {
 type Activities struct {
 	config Config
 	store  s3Store
-	nomad  *nomadapi.Client
+	nomad  nomadSnapshotter
 	pg     databaseLister
 	consul consulSnapshotter
+}
+
+// nomadSnapshotter is the narrow Nomad surface TakeNomadSnapshot needs: stream a
+// raft snapshot. The concrete *nomadapi.Client is wrapped (nomadSnap) so a fake
+// can drive the snapshot path in tests.
+type nomadSnapshotter interface {
+	Snapshot(ctx context.Context) (io.ReadCloser, error)
+}
+
+// nomadSnap adapts *nomadapi.Client to nomadSnapshotter.
+type nomadSnap struct{ c *nomadapi.Client }
+
+func (n nomadSnap) Snapshot(ctx context.Context) (io.ReadCloser, error) {
+	return n.c.Operator().Snapshot((&nomadapi.QueryOptions{}).WithContext(ctx))
 }
 
 // New creates an Activities instance with a pre-configured S3 client and a
@@ -175,7 +189,7 @@ func New(cfg Config) (*Activities, error) {
 		return nil, fmt.Errorf("create consul client: %w", err)
 	}
 
-	return &Activities{config: cfg, store: store, nomad: nomad, pg: pg, consul: consul}, nil
+	return &Activities{config: cfg, store: store, nomad: nomadSnap{c: nomad}, pg: pg, consul: consul}, nil
 }
 
 // -------------------------------------------------------------------------
@@ -258,7 +272,7 @@ func (a *Activities) TakeNomadSnapshot(ctx context.Context) (string, error) {
 	timestamp := time.Now().Format("20060102150405")
 	filename := filepath.Join(a.config.NomadBackupDir, fmt.Sprintf("nomad-%s.snap", timestamp))
 
-	snap, err := a.nomad.Operator().Snapshot((&nomadapi.QueryOptions{}).WithContext(ctx))
+	snap, err := a.nomad.Snapshot(ctx)
 	if err != nil {
 		return "", fmt.Errorf("nomad snapshot: %w", err)
 	}

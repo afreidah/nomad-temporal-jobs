@@ -56,8 +56,8 @@ ENTRYPOINT ["worker"]
 FROM debian:bookworm-slim AS runtime-backup
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && curl -fsSL --proto '=https' --proto-redir '=https' https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client-18 \
     && apt-get purge -y curl gnupg \
@@ -81,8 +81,8 @@ RUN set -eux; \
     f="trivy_${TRIVY_VERSION}_Linux-${ta}.tar.gz"; \
     base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"; \
     cd /tmp; \
-    curl -fsSL "$base/$f" -o "$f"; \
-    curl -fsSL "$base/trivy_${TRIVY_VERSION}_checksums.txt" -o sums.txt; \
+    curl -fsSL --proto '=https' --proto-redir '=https' "$base/$f" -o "$f"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' "$base/trivy_${TRIVY_VERSION}_checksums.txt" -o sums.txt; \
     grep "Linux-${ta}.tar.gz\$" sums.txt | sha256sum -c -; \
     tar -xzf "$f" -C /usr/local/bin trivy
 
