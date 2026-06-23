@@ -35,8 +35,8 @@ COPY shared/ shared/
 COPY ${PKG}/ ${PKG}/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w" -o /out/worker ./${PKG}/worker
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath -ldflags="-s -w" -o /out/worker "./${PKG}/worker"
 
 # ---- profile: pure-Go, non-root (certacquirer + any future pure-Go worker) ----
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime-distroless-nonroot
