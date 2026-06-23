@@ -2,7 +2,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26.4 AS godoc
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-RUN go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest
+RUN go install github.com/princjef/gomarkdoc/cmd/gomarkdoc@v1.1.0
 # Whole tree so `go list ./...` in gen-godoc.sh sees every package; the package
 # set is discovered dynamically, never hardcoded here.
 COPY . .

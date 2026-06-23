@@ -20,15 +20,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-
 	"munchbox/temporal-workers/shared"
+	"strings"
 
 	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/certcrypto"
-	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/lego"
-	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
 	"github.com/go-acme/lego/v4/registration"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
@@ -75,6 +72,9 @@ type Config struct {
 // Activities implements the cert-acquirer Temporal activities.
 type Activities struct {
 	cfg Config
+	// newIssuer builds the ACME issuer for an account. Defaults to the lego-backed
+	// newLegoIssuer (acme.go); tests substitute a fake to cover IssueWildcardCert.
+	newIssuer func(ctx context.Context, user *acmeUser) (certIssuer, error)
 }
 
 // New constructs the activity set. The Vault client and CA URL are required;
@@ -98,7 +98,9 @@ func New(cfg Config) *Activities {
 	if cfg.CADirURL == "" {
 		cfg.CADirURL = lego.LEDirectoryProduction
 	}
-	return &Activities{cfg: cfg}
+	a := &Activities{cfg: cfg}
+	a.newIssuer = a.newLegoIssuer
+	return a
 }
 
 // -------------------------------------------------------------------------
@@ -171,10 +173,18 @@ type IssueRequest struct {
 	Email   string   `json:"email"`
 }
 
-// IssueWildcardCert ensures the ACME account, runs the Cloudflare DNS-01
-// challenge for the requested domains, and writes the issued cert+key to the
-// staging Vault path. Rate-limit responses are returned non-retryable so a
-// single run stops hammering Let's Encrypt.
+// certIssuer is the narrow ACME surface IssueWildcardCert drives: register the
+// account and obtain the certificate. The lego-backed implementation is in
+// acme.go (the untestable I/O); tests substitute a fake via Activities.newIssuer.
+type certIssuer interface {
+	Register(ctx context.Context) (*registration.Resource, error)
+	Obtain(ctx context.Context, domains []string) (certPEM, keyPEM []byte, err error)
+}
+
+// IssueWildcardCert ensures the ACME account, obtains the wildcard via the
+// configured issuer, and writes the cert+key to the staging Vault path. A
+// rate-limit response is returned non-retryable so a single run stops hammering
+// Let's Encrypt.
 func (a *Activities) IssueWildcardCert(ctx context.Context, req IssueRequest) error {
 	logger := activity.GetLogger(ctx)
 
@@ -186,26 +196,31 @@ func (a *Activities) IssueWildcardCert(ctx context.Context, req IssueRequest) er
 		return err
 	}
 
-	client, err := a.newACMEClient(ctx, user)
+	issuer, err := a.newIssuer(ctx, user)
 	if err != nil {
 		return err
 	}
 
 	if isNew {
-		if err := a.registerAccount(ctx, client, user); err != nil {
-			return err
+		reg, rerr := issuer.Register(ctx)
+		if rerr != nil {
+			return classifyACME(fmt.Errorf("register acme account: %w", rerr))
+		}
+		user.registration = reg
+		if serr := a.saveAccount(ctx, user); serr != nil {
+			return serr
 		}
 		logger.Info("Registered new ACME account", "email", req.Email)
 	}
 
-	res, err := client.Certificate.Obtain(certificate.ObtainRequest{Domains: req.Domains, Bundle: true})
+	certPEM, keyPEM, err := issuer.Obtain(ctx, req.Domains)
 	if err != nil {
 		return classifyACME(fmt.Errorf("obtain certificate: %w", err))
 	}
 
 	if werr := a.cfg.Vault.WriteKV(ctx, a.cfg.StagingPath, map[string]any{
-		"cert": string(res.Certificate),
-		"key":  string(res.PrivateKey),
+		"cert": string(certPEM),
+		"key":  string(keyPEM),
 	}); werr != nil {
 		return werr
 	}
@@ -229,47 +244,6 @@ func (a *Activities) ensureUser(ctx context.Context, email string) (user *acmeUs
 		return nil, false, fmt.Errorf("generate acme account key: %w", err)
 	}
 	return &acmeUser{email: email, key: key}, true, nil
-}
-
-// newACMEClient builds a lego client for user with the Cloudflare DNS-01
-// provider wired from the token in Vault. The leaf key is RSA2048 while the
-// account key is EC256 -- they are independent by design.
-func (a *Activities) newACMEClient(ctx context.Context, user *acmeUser) (*lego.Client, error) {
-	config := lego.NewConfig(user)
-	config.CADirURL = a.cfg.CADirURL
-	config.Certificate.KeyType = certcrypto.RSA2048
-
-	client, err := lego.NewClient(config)
-	if err != nil {
-		return nil, fmt.Errorf("create acme client: %w", err)
-	}
-
-	cfToken, err := a.cfg.Vault.ReadKVField(ctx, a.cfg.CFTokenPath, a.cfg.CFTokenField)
-	if err != nil {
-		return nil, fmt.Errorf("read cloudflare token: %w", err)
-	}
-	cfCfg := cloudflare.NewDefaultConfig()
-	cfCfg.AuthToken = cfToken
-	provider, err := cloudflare.NewDNSProviderConfig(cfCfg)
-	if err != nil {
-		return nil, fmt.Errorf("create cloudflare dns provider: %w", err)
-	}
-	if err := client.Challenge.SetDNS01Provider(provider); err != nil {
-		return nil, fmt.Errorf("set dns-01 provider: %w", err)
-	}
-	return client, nil
-}
-
-// registerAccount registers a new ACME account and persists it to Vault,
-// attaching the registration to user. The ACME error is classified so a
-// rate-limit response is non-retryable for the run.
-func (a *Activities) registerAccount(ctx context.Context, client *lego.Client, user *acmeUser) error {
-	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
-	if err != nil {
-		return classifyACME(fmt.Errorf("register acme account: %w", err))
-	}
-	user.registration = reg
-	return a.saveAccount(ctx, user)
 }
 
 // -------------------------------------------------------------------------
