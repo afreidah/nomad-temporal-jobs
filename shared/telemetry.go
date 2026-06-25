@@ -52,10 +52,17 @@ func InitTracer(ctx context.Context, serviceName string) func(context.Context) e
 		return func(context.Context) error { return nil }
 	}
 
+	// Merge the custom service.name onto the SDK's default resource. The custom
+	// attributes are intentionally schemaless (resource.NewSchemaless, not
+	// NewWithAttributes+semconv.SchemaURL): resource.Default() already carries
+	// the SDK's own semconv schema URL, and resource.Merge refuses to merge two
+	// resources with conflicting non-empty schema URLs. Passing our (older)
+	// semconv.SchemaURL here made Merge fail, and the old fallback dropped to a
+	// bare resource.Default() -- so traces exported as "unknown_service:*" and
+	// never showed up under the worker's name in Tempo.
 	res, err := resource.Merge(
 		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
+		resource.NewSchemaless(
 			semconv.ServiceName(serviceName),
 		),
 	)
