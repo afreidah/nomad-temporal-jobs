@@ -61,12 +61,9 @@ type Config struct {
 	SecretName  string
 
 	// --- SonarCloud (optional): set only when the worker is configured to
-	//     renew SonarCloud project tokens. When Sonar is nil the SonarCloud
-	//     activity is not registered. ---
+	//     renew SonarCloud tokens. When Sonar is nil the SonarCloud activity is
+	//     not registered. ---
 	Sonar sonarClient
-	// SonarOrg is the SonarCloud organization key used to derive each repo's
-	// project key as "<SonarOrg>_<repo>" (the GitHub-import default).
-	SonarOrg string
 	// SonarSecretName is the Actions secret the SonarCloud token is written to.
 	SonarSecretName string
 	// SonarTokenTTL is how long a minted SonarCloud token is valid. Zero mints a
