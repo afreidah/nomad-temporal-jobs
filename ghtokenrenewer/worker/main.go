@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"time"
 
 	"munchbox/temporal-workers/ghtokenrenewer/activities"
 	"munchbox/temporal-workers/ghtokenrenewer/workflows"
@@ -53,14 +54,24 @@ func main() {
 				return nil, err
 			}
 
-			acts := activities.New(activities.Config{
+			cfg := activities.Config{
 				GitHub:      gh,
 				Repos:       consul,
 				RepoListKey: os.Getenv("REPO_LIST_KEY"),
 				SecretName:  os.Getenv("SECRET_NAME"),
-			})
+			}
 
+			// SonarCloud renewal is additive and optional: enable it only when
+			// the master token and org are both available, so this image can ship
+			// before the Vault secret + policy exist without breaking GitHub
+			// renewal. When disabled, the workflow is simply not registered.
+			sonarEnabled := configureSonar(ctx, vc, &cfg, slogger)
+
+			acts := activities.New(cfg)
 			w.RegisterWorkflow(workflows.RenewTokens)
+			if sonarEnabled {
+				w.RegisterWorkflow(workflows.RenewSonarCloudTokens)
+			}
 			w.RegisterActivity(acts)
 			return nil, nil
 		},
@@ -68,6 +79,51 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
+}
+
+// configureSonar enables SonarCloud token renewal on cfg when both the master
+// token (Vault) and the org (env) are present, returning whether it was enabled.
+// A missing token or org disables the feature with a warning rather than an
+// error, so the worker still renews GitHub tokens when SonarCloud isn't wired up
+// yet. Defaults: secret SONAR_TOKEN, 90-day token TTL.
+func configureSonar(ctx context.Context, vc *shared.VaultClient, cfg *activities.Config, log *slog.Logger) bool {
+	org := os.Getenv("SONARCLOUD_ORG")
+	if org == "" {
+		log.Warn("SonarCloud token renewal disabled (SONARCLOUD_ORG not set)")
+		return false
+	}
+
+	path := cmp.Or(os.Getenv("SONARCLOUD_TOKEN_VAULT_PATH"), "sonarcloud/token")
+	data, found, err := vc.ReadKVMaybe(ctx, path)
+	if err != nil {
+		log.Warn("SonarCloud token renewal disabled (Vault read failed)", "path", path, "error", err)
+		return false
+	}
+	token := vaultString(data, "token")
+	if !found || token == "" {
+		log.Warn("SonarCloud token renewal disabled (no token in Vault)", "path", path)
+		return false
+	}
+
+	ttlDays := 90
+	if s := os.Getenv("SONARCLOUD_TOKEN_TTL_DAYS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			ttlDays = n
+		} else {
+			log.Warn("Invalid SONARCLOUD_TOKEN_TTL_DAYS, using default", "value", s, "default", ttlDays)
+		}
+	}
+
+	cfg.Sonar = shared.NewSonarCloud(shared.SonarCloudConfig{
+		Token:   token,
+		BaseURL: os.Getenv("SONARCLOUD_BASE_URL"),
+	})
+	cfg.SonarOrg = org
+	cfg.SonarSecretName = cmp.Or(os.Getenv("SONAR_SECRET_NAME"), "SONAR_TOKEN")
+	cfg.SonarTokenTTL = time.Duration(ttlDays) * 24 * time.Hour
+
+	log.Info("SonarCloud token renewal enabled", "org", org, "secret", cfg.SonarSecretName, "ttl_days", ttlDays)
+	return true
 }
 
 // newGitHub reads the GitHub App credentials from Vault and builds the App
