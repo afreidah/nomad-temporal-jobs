@@ -81,18 +81,12 @@ func main() {
 	}
 }
 
-// configureSonar enables SonarCloud token renewal on cfg when both the master
-// token (Vault) and the org (env) are present, returning whether it was enabled.
-// A missing token or org disables the feature with a warning rather than an
-// error, so the worker still renews GitHub tokens when SonarCloud isn't wired up
-// yet. Defaults: secret SONAR_TOKEN, 90-day token TTL.
+// configureSonar enables SonarCloud token renewal on cfg when the master token
+// is present in Vault, returning whether it was enabled. A missing token
+// disables the feature with a warning rather than an error, so the worker still
+// renews GitHub tokens when SonarCloud isn't wired up yet. Defaults: secret
+// SONAR_TOKEN, 90-day token TTL.
 func configureSonar(ctx context.Context, vc *shared.VaultClient, cfg *activities.Config, log *slog.Logger) bool {
-	org := os.Getenv("SONARCLOUD_ORG")
-	if org == "" {
-		log.Warn("SonarCloud token renewal disabled (SONARCLOUD_ORG not set)")
-		return false
-	}
-
 	path := cmp.Or(os.Getenv("SONARCLOUD_TOKEN_VAULT_PATH"), "sonarcloud/token")
 	data, found, err := vc.ReadKVMaybe(ctx, path)
 	if err != nil {
@@ -118,11 +112,10 @@ func configureSonar(ctx context.Context, vc *shared.VaultClient, cfg *activities
 		Token:   token,
 		BaseURL: os.Getenv("SONARCLOUD_BASE_URL"),
 	})
-	cfg.SonarOrg = org
 	cfg.SonarSecretName = cmp.Or(os.Getenv("SONAR_SECRET_NAME"), "SONAR_TOKEN")
 	cfg.SonarTokenTTL = time.Duration(ttlDays) * 24 * time.Hour
 
-	log.Info("SonarCloud token renewal enabled", "org", org, "secret", cfg.SonarSecretName, "ttl_days", ttlDays)
+	log.Info("SonarCloud token renewal enabled", "secret", cfg.SonarSecretName, "ttl_days", ttlDays)
 	return true
 }
 

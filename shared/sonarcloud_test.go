@@ -32,11 +32,11 @@ func sonarStub(t *testing.T) *httptest.Server {
 		switch r.URL.Path {
 		case "/api/user_tokens/generate":
 			_ = r.ParseForm()
-			if r.Form.Get("type") != "PROJECT_ANALYSIS_TOKEN" || r.Form.Get("projectKey") == "" {
+			if r.Form.Get("name") == "" {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			_, _ = w.Write([]byte(`{"login":"u","name":"` + r.Form.Get("name") + `","token":"sqp_minted"}`))
+			_, _ = w.Write([]byte(`{"login":"u","name":"` + r.Form.Get("name") + `","token":"sq_minted"}`))
 		case "/api/user_tokens/revoke":
 			w.WriteHeader(http.StatusNoContent)
 		case "/api/user_tokens/search":
@@ -55,17 +55,17 @@ func testSonar(ts *httptest.Server) *SonarCloud {
 	return NewSonarCloud(SonarCloudConfig{Token: "master-token", BaseURL: ts.URL})
 }
 
-func TestSonarCloud_MintProjectToken(t *testing.T) {
+func TestSonarCloud_MintToken(t *testing.T) {
 	ts := sonarStub(t)
 	defer ts.Close()
 	sc := testSonar(ts)
 
-	tok, err := sc.MintProjectToken(context.Background(), "org_repo", "munchbox-ci-org_repo-1", time.Now().Add(time.Hour))
+	tok, err := sc.MintToken(context.Background(), "munchbox-ci/o/r/1", time.Now().Add(time.Hour))
 	if err != nil {
-		t.Fatalf("MintProjectToken: %v", err)
+		t.Fatalf("MintToken: %v", err)
 	}
-	if tok != "sqp_minted" {
-		t.Errorf("token = %q, want sqp_minted", tok)
+	if tok != "sq_minted" {
+		t.Errorf("token = %q, want sq_minted", tok)
 	}
 }
 
@@ -74,7 +74,7 @@ func TestSonarCloud_RevokeToken(t *testing.T) {
 	defer ts.Close()
 	sc := testSonar(ts)
 
-	if err := sc.RevokeToken(context.Background(), "munchbox-ci-org_repo-1"); err != nil {
+	if err := sc.RevokeToken(context.Background(), "munchbox-ci/o/r/1"); err != nil {
 		t.Fatalf("RevokeToken: %v", err)
 	}
 }

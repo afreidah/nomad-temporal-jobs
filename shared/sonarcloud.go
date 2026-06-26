@@ -4,13 +4,16 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // SonarCloud (SonarQube Cloud) has no official Go SDK, so this is a thin native
-// HTTP client over the handful of user-token endpoints we need: mint a
-// project-scoped analysis token (sqp_...), revoke one, and list the
-// authenticated user's token names. One master user token -- held in Vault, with
-// Execute Analysis permission on the projects -- authenticates every call; the
-// token-renewer worker uses this to mint a fresh per-project token for each
-// managed repo and write it to that repo's SONAR_TOKEN secret, mirroring how the
-// GitHub App client renews CI tokens.
+// HTTP client over the handful of user-token endpoints we need: mint a token,
+// revoke one, and list the authenticated user's token names. One master user
+// token -- held in Vault -- authenticates every call; the token-renewer worker
+// uses this to mint a fresh token per managed repo and write it to that repo's
+// SONAR_TOKEN secret, mirroring how the GitHub App client renews CI tokens.
+//
+// Note: SonarCloud removed project-scoped analysis tokens from the API -- the
+// generate endpoint no longer accepts a projectKey, and every minted token is a
+// full-scope "standard" user token. Tokens are therefore not scoped to a single
+// project; rotation (not scoping) is what bounds exposure.
 // -------------------------------------------------------------------------------
 
 package shared
@@ -29,10 +32,6 @@ import (
 // defaultSonarCloudBaseURL is the public SonarCloud API host. A self-hosted
 // SonarQube server can be targeted by overriding BaseURL.
 const defaultSonarCloudBaseURL = "https://sonarcloud.io"
-
-// projectAnalysisTokenType is the SonarCloud token type scoped to a single
-// project: a leak only grants analysis of that one project.
-const projectAnalysisTokenType = "PROJECT_ANALYSIS_TOKEN"
 
 // SonarCloudConfig configures a SonarCloud client. Token is the master user
 // token (Execute Analysis permission) used to authenticate every request.
@@ -78,27 +77,24 @@ type searchResponse struct {
 	} `json:"userTokens"`
 }
 
-// MintProjectToken creates a PROJECT_ANALYSIS_TOKEN named name, scoped to
-// projectKey, and returns its value (returned only at creation). A non-zero
-// expiry sets an expiration date (day granularity, the API's resolution); a zero
-// expiry mints a non-expiring token. The name must be unique for the
-// authenticated user -- minting a name that already exists fails.
-func (s *SonarCloud) MintProjectToken(ctx context.Context, projectKey, name string, expiry time.Time) (string, error) {
-	form := url.Values{
-		"name":       {name},
-		"type":       {projectAnalysisTokenType},
-		"projectKey": {projectKey},
-	}
+// MintToken creates a standard user token named name and returns its value
+// (returned only at creation). A non-zero expiry sets an expiration date (day
+// granularity, the API's resolution); a zero expiry mints a non-expiring token.
+// The name must be unique for the authenticated user -- minting a name that
+// already exists fails. The token is full user scope: SonarCloud no longer
+// supports scoping a generated token to a single project.
+func (s *SonarCloud) MintToken(ctx context.Context, name string, expiry time.Time) (string, error) {
+	form := url.Values{"name": {name}}
 	if !expiry.IsZero() {
 		form.Set("expirationDate", expiry.UTC().Format("2006-01-02"))
 	}
 
 	var out generateResponse
 	if err := s.post(ctx, "/api/user_tokens/generate", form, &out); err != nil {
-		return "", fmt.Errorf("mint project token %q for %s: %w", name, projectKey, err)
+		return "", fmt.Errorf("mint token %q: %w", name, err)
 	}
 	if out.Token == "" {
-		return "", fmt.Errorf("mint project token %q for %s: empty token in response", name, projectKey)
+		return "", fmt.Errorf("mint token %q: empty token in response", name)
 	}
 	return out.Token, nil
 }

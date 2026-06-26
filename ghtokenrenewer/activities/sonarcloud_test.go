@@ -26,12 +26,12 @@ type fakeSonar struct {
 	listErr   error
 	revokeErr error
 
-	mintCalls []string // "projectKey:name"
+	mintCalls []string // token name
 	revoked   []string
 }
 
-func (f *fakeSonar) MintProjectToken(_ context.Context, projectKey, name string, _ time.Time) (string, error) {
-	f.mintCalls = append(f.mintCalls, projectKey+":"+name)
+func (f *fakeSonar) MintToken(_ context.Context, name string, _ time.Time) (string, error) {
+	f.mintCalls = append(f.mintCalls, name)
 	return f.token, f.mintErr
 }
 
@@ -48,7 +48,6 @@ func sonarConfig(gh *fakeGitHub, sc *fakeSonar) Config {
 	return Config{
 		GitHub:          gh,
 		Sonar:           sc,
-		SonarOrg:        "myorg",
 		SonarSecretName: "SONAR_TOKEN",
 		SonarTokenTTL:   90 * 24 * time.Hour,
 	}
@@ -57,8 +56,8 @@ func sonarConfig(gh *fakeGitHub, sc *fakeSonar) Config {
 func TestRenewSonarCloudToken(t *testing.T) {
 	gh := &fakeGitHub{}
 	sc := &fakeSonar{
-		token:     "sqp_minted",
-		listNames: []string{"munchbox-ci-myorg_myrepo-1", "munchbox-ci-other_repo-9", "user-token"},
+		token:     "sq_minted",
+		listNames: []string{"munchbox-ci/afreidah/myrepo/1", "munchbox-ci/afreidah/other/9", "user-token"},
 	}
 	a := New(sonarConfig(gh, sc))
 	env := actEnv()
@@ -73,21 +72,21 @@ func TestRenewSonarCloudToken(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	if res.ProjectKey != "myorg_myrepo" {
-		t.Errorf("ProjectKey = %q, want myorg_myrepo", res.ProjectKey)
+	if res.Repo != "afreidah/myrepo" {
+		t.Errorf("Repo = %q, want afreidah/myrepo", res.Repo)
 	}
-	// Minted one token for the derived project key.
-	if len(sc.mintCalls) != 1 || !strings.HasPrefix(sc.mintCalls[0], "myorg_myrepo:munchbox-ci-myorg_myrepo-") {
-		t.Errorf("mint calls = %v, want one for myorg_myrepo", sc.mintCalls)
+	// Minted one token under the repo's name prefix.
+	if len(sc.mintCalls) != 1 || !strings.HasPrefix(sc.mintCalls[0], "munchbox-ci/afreidah/myrepo/") {
+		t.Errorf("mint calls = %v, want one for afreidah/myrepo", sc.mintCalls)
 	}
 	// Wrote the minted token to the repo's SONAR_TOKEN secret.
-	want := "afreidah/myrepo:SONAR_TOKEN=sqp_minted"
+	want := "afreidah/myrepo:SONAR_TOKEN=sq_minted"
 	if len(gh.setCalls) != 1 || gh.setCalls[0] != want {
 		t.Errorf("SetRepoSecret calls = %v, want [%s]", gh.setCalls, want)
 	}
-	// Revoked only this project's prior token -- not other projects' or unrelated tokens.
-	if len(sc.revoked) != 1 || sc.revoked[0] != "munchbox-ci-myorg_myrepo-1" {
-		t.Errorf("revoked = %v, want [munchbox-ci-myorg_myrepo-1]", sc.revoked)
+	// Revoked only this repo's prior token -- not other repos' or unrelated tokens.
+	if len(sc.revoked) != 1 || sc.revoked[0] != "munchbox-ci/afreidah/myrepo/1" {
+		t.Errorf("revoked = %v, want [munchbox-ci/afreidah/myrepo/1]", sc.revoked)
 	}
 }
 
@@ -132,7 +131,7 @@ func TestRenewSonarCloudToken_SetFails(t *testing.T) {
 // failure must not fail the renewal.
 func TestRenewSonarCloudToken_RevokeIsBestEffort(t *testing.T) {
 	gh := &fakeGitHub{}
-	sc := &fakeSonar{token: "sqp_x", listNames: []string{"munchbox-ci-myorg_r-1"}, revokeErr: errors.New("revoke boom")}
+	sc := &fakeSonar{token: "sq_x", listNames: []string{"munchbox-ci/o/r/1"}, revokeErr: errors.New("revoke boom")}
 	a := New(sonarConfig(gh, sc))
 	env := actEnv()
 	env.RegisterActivity(a.RenewSonarCloudToken)
@@ -145,19 +144,14 @@ func TestRenewSonarCloudToken_RevokeIsBestEffort(t *testing.T) {
 	}
 }
 
-func TestSonarProjectKey(t *testing.T) {
-	if got := sonarProjectKey("myorg", "myrepo"); got != "myorg_myrepo" {
-		t.Errorf("sonarProjectKey = %q, want myorg_myrepo", got)
-	}
-}
-
 func TestSonarTokenNamePrefix(t *testing.T) {
-	name := sonarTokenName("myorg_myrepo", time.Unix(1700000000, 0))
-	if !strings.HasPrefix(name, sonarTokenPrefix("myorg_myrepo")) {
-		t.Errorf("name %q lacks project prefix %q", name, sonarTokenPrefix("myorg_myrepo"))
+	name := sonarTokenName("afreidah", "myrepo", time.Unix(1700000000, 0))
+	if !strings.HasPrefix(name, sonarTokenPrefix("afreidah", "myrepo")) {
+		t.Errorf("name %q lacks repo prefix %q", name, sonarTokenPrefix("afreidah", "myrepo"))
 	}
-	// The trailing dash keeps one project's prefix from matching a longer key.
-	if strings.HasPrefix(sonarTokenName("myorg_my", time.Unix(1, 0)), sonarTokenPrefix("myorg_myrepo")) {
-		t.Error("prefix of a shorter key should not match a longer key's prefix")
+	// The slash delimiter keeps one repo's prefix from matching a longer repo
+	// name (slashes can't appear within an owner or repo segment).
+	if strings.HasPrefix(sonarTokenName("afreidah", "my", time.Unix(1, 0)), sonarTokenPrefix("afreidah", "myrepo")) {
+		t.Error("prefix of a shorter repo name should not match a longer repo's prefix")
 	}
 }
