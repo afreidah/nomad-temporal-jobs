@@ -36,14 +36,18 @@ type GitHubConfig struct {
 	AppID          int64
 	InstallationID int64
 	PrivateKeyPEM  []byte
+	// BaseURL overrides the GitHub API endpoint (GitHub Enterprise, or an
+	// httptest server in unit tests). Empty means the public api.github.com.
+	BaseURL string
 }
 
 // GitHub is a GitHub App client. It mints short-lived installation access tokens
 // and writes repository Actions secrets. Construct it with NewGitHub; workers
 // consume it through their own narrow interfaces.
 type GitHub struct {
-	app    *github.Client // authenticated as the App (JWT); mints installation tokens
-	instID int64
+	app     *github.Client // authenticated as the App (JWT); mints installation tokens
+	instID  int64
+	baseURL string // non-empty only for GHE/tests; applied to per-call token clients
 }
 
 // NewGitHub builds an App-authenticated client from cfg, discovering the
@@ -54,7 +58,11 @@ func NewGitHub(ctx context.Context, cfg GitHubConfig) (*GitHub, error) {
 	if err != nil {
 		return nil, fmt.Errorf("github app transport: %w", err)
 	}
-	app, err := github.NewClient(github.WithTransport(appTransport))
+	appOpts := []github.ClientOptionsFunc{github.WithTransport(appTransport)}
+	if cfg.BaseURL != "" {
+		appOpts = append(appOpts, github.WithEnterpriseURLs(cfg.BaseURL, cfg.BaseURL))
+	}
+	app, err := github.NewClient(appOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("github app client: %w", err)
 	}
@@ -70,7 +78,7 @@ func NewGitHub(ctx context.Context, cfg GitHubConfig) (*GitHub, error) {
 		}
 		instID = insts[0].GetID()
 	}
-	return &GitHub{app: app, instID: instID}, nil
+	return &GitHub{app: app, instID: instID, baseURL: cfg.BaseURL}, nil
 }
 
 // workflowTokenPermissions are what the *stored* token grants a release/CI
@@ -102,19 +110,9 @@ func (g *GitHub) MintWorkflowToken(ctx context.Context, owner, repo string) (str
 // mints a secrets-scoped token for the repo, fetches the repo's public key,
 // seals value (NaCl anonymous sealed box), and stores the ciphertext.
 func (g *GitHub) SetRepoSecret(ctx context.Context, owner, repo, name, value string) error {
-	tok, _, err := g.app.Apps.CreateInstallationToken(ctx, g.instID, &github.InstallationTokenOptions{
-		Repositories: []string{repo},
-		Permissions:  &github.InstallationPermissions{Secrets: new("write")},
-	})
+	cli, err := g.installationClient(ctx, repo, &github.InstallationPermissions{Secrets: new("write")})
 	if err != nil {
-		return fmt.Errorf("mint secrets token for %s/%s: %w", owner, repo, err)
-	}
-	cli, err := github.NewClient(
-		github.WithTransport(shared.OTelTransport("github", nil)),
-		github.WithAuthToken(tok.GetToken()),
-	)
-	if err != nil {
-		return fmt.Errorf("github client for %s/%s: %w", owner, repo, err)
+		return fmt.Errorf("secrets client for %s/%s: %w", owner, repo, err)
 	}
 
 	pubKey, _, err := cli.Actions.GetRepoPublicKey(ctx, owner, repo)

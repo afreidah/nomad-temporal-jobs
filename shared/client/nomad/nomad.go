@@ -260,6 +260,29 @@ func (n *Nomad) WaitAllocCount(ctx context.Context, jobName string, target int, 
 	return WaitNomadAllocCount(ctx, n.client, jobName, target, interval, onPoll)
 }
 
+// DispatchJob dispatches a parameterized job, returning the concrete dispatched
+// job ID (e.g. "ci-runner/dispatch-1700000000-abcd") so callers can later target
+// or reap that exact instance. Each call creates a new instance, so dispatch is
+// not idempotent -- callers that must avoid duplicates should not retry blindly.
+func (n *Nomad) DispatchJob(ctx context.Context, jobID string, meta map[string]string) (string, error) {
+	resp, _, err := n.client.Jobs().Dispatch(jobID, meta, nil, "", (&api.WriteOptions{}).WithContext(ctx))
+	if err != nil {
+		return "", fmt.Errorf("dispatch job %q: %w", jobID, err)
+	}
+	return resp.DispatchedJobID, nil
+}
+
+// StopJob stops and purges the named job, removing it from Nomad state. Used to
+// reap an ephemeral dispatched runner. Idempotent enough for a reaper: a
+// not-found job is reported via IsJobNotFound so callers can treat it as already
+// gone.
+func (n *Nomad) StopJob(ctx context.Context, jobID string) error {
+	if _, _, err := n.client.Jobs().Deregister(jobID, true, (&api.WriteOptions{}).WithContext(ctx)); err != nil {
+		return fmt.Errorf("deregister job %q: %w", jobID, err)
+	}
+	return nil
+}
+
 // IsJobNotFound reports whether err indicates a Nomad job does not exist (the
 // API returns HTTP 404 / "job not found"). It prefers the typed
 // api.UnexpectedResponseError status code and falls back to string matching,

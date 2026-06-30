@@ -17,7 +17,6 @@ package main
 import (
 	"cmp"
 	"context"
-	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -48,7 +47,8 @@ func main() {
 				return nil, err
 			}
 
-			gh, err := newGitHub(ctx, vc)
+			appPath := cmp.Or(os.Getenv("GITHUB_APP_VAULT_PATH"), "github/token-renewer-app")
+			gh, err := git.NewGitHubFromVault(ctx, vc, appPath)
 			if err != nil {
 				return nil, err
 			}
@@ -122,38 +122,6 @@ func configureSonar(ctx context.Context, vc *vault.VaultClient, cfg *activities.
 
 	log.Info("SonarCloud token renewal enabled", "secret", cfg.SonarSecretName, "ttl_days", ttlDays)
 	return true
-}
-
-// newGitHub reads the GitHub App credentials from Vault and builds the App
-// client. The Vault KV path holds app_id, installation_id (optional, discovered
-// when absent), and private_key (PEM).
-func newGitHub(ctx context.Context, vc *vault.VaultClient) (*git.GitHub, error) {
-	path := cmp.Or(os.Getenv("GITHUB_APP_VAULT_PATH"), "github/token-renewer-app")
-	data, err := vc.ReadKV(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-
-	appID, err := strconv.ParseInt(vaultString(data, "app_id"), 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("github app_id from %s: %w", path, err)
-	}
-	var instID int64
-	if s := vaultString(data, "installation_id"); s != "" {
-		if instID, err = strconv.ParseInt(s, 10, 64); err != nil {
-			return nil, fmt.Errorf("github installation_id from %s: %w", path, err)
-		}
-	}
-	key := vaultString(data, "private_key")
-	if key == "" {
-		return nil, fmt.Errorf("github private_key missing at %s", path)
-	}
-
-	return git.NewGitHub(ctx, git.GitHubConfig{
-		AppID:          appID,
-		InstallationID: instID,
-		PrivateKeyPEM:  []byte(key),
-	})
 }
 
 // vaultString reads a string field from a Vault KV data map (the Vault KV CLI
