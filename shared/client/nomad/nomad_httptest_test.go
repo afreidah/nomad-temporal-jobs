@@ -64,6 +64,10 @@ func nomadStub(failPath string) *httptest.Server {
 			})
 		case strings.HasSuffix(p, "/scale"):
 			_ = enc.Encode(&api.JobRegisterResponse{EvalID: "e1"})
+		case strings.HasSuffix(p, "/dispatch"):
+			_ = enc.Encode(&api.JobDispatchResponse{DispatchedJobID: "ci-runner/dispatch-1-abc", EvalID: "e2"})
+		case r.Method == http.MethodDelete && strings.HasPrefix(p, "/v1/job/"):
+			_ = enc.Encode(&api.JobDeregisterResponse{EvalID: "e3"})
 		default:
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		}
@@ -149,6 +153,26 @@ func TestNomad_WaitAllocCount(t *testing.T) {
 	}
 	if got != 1 {
 		t.Errorf("onPoll running = %d, want 1", got)
+	}
+}
+
+func TestNomad_DispatchJob(t *testing.T) {
+	ts := nomadStub("")
+	defer ts.Close()
+	id, err := testNomad(t, ts).DispatchJob(context.Background(), "ci-runner", map[string]string{"repo_url": "https://github.com/octo/widget"})
+	if err != nil {
+		t.Fatalf("DispatchJob: %v", err)
+	}
+	if id != "ci-runner/dispatch-1-abc" {
+		t.Errorf("dispatched id = %q, want ci-runner/dispatch-1-abc", id)
+	}
+}
+
+func TestNomad_StopJob(t *testing.T) {
+	ts := nomadStub("")
+	defer ts.Close()
+	if err := testNomad(t, ts).StopJob(context.Background(), "ci-runner/dispatch-1-abc"); err != nil {
+		t.Fatalf("StopJob: %v", err)
 	}
 }
 

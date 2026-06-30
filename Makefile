@@ -51,14 +51,17 @@ push-cert: ## Build and push cert-acquirer-worker image
 push-ghtokens: ## Build and push github-token-renewer image
 	cd ghtokenrenewer && $(MAKE) push
 
-push-all: push-backup push-trivy push-cleanup push-cert push-ghtokens ## Build and push all images
+push-runnerscaler: ## Build and push ci-runner-scaler image
+	cd runnerscaler && $(MAKE) push
 
-# Recurses with -j so the five image builds run concurrently. They share one
+push-all: push-backup push-trivy push-cleanup push-cert push-ghtokens push-runnerscaler ## Build and push all images
+
+# Recurses with -j so the image builds run concurrently. They share one
 # buildx builder + BuildKit cache mounts, so the Go-compile phases partly
 # serialize (cache-mount locks); the registry pushes, runtime stages, and the
-# emulated arm64 legs overlap. Net speedup, not a clean 5x.
+# emulated arm64 legs overlap. Net speedup, not a clean linear scale.
 push-all-parallel: ## Build and push all images concurrently (make -j)
-	$(MAKE) -j5 push-backup push-trivy push-cleanup push-cert push-ghtokens
+	$(MAKE) -j6 push-backup push-trivy push-cleanup push-cert push-ghtokens push-runnerscaler
 
 changelog: ## Generate CHANGELOG.md from git history
 	git cliff -o CHANGELOG.md
@@ -111,5 +114,5 @@ web-push: builder ## Build and push multi-arch website image to registry
 	  --output type=image,push=true \
 	  .
 
-.PHONY: help builder build test vet lint govulncheck push-backup push-trivy push-cleanup push-cert push-ghtokens push-all push-all-parallel changelog release web-tools web-godoc web-serve web-build web-docker web-push
+.PHONY: help builder build test vet lint govulncheck push-backup push-trivy push-cleanup push-cert push-ghtokens push-runnerscaler push-all push-all-parallel changelog release web-tools web-godoc web-serve web-build web-docker web-push
 .DEFAULT_GOAL := help

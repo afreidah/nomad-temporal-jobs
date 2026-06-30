@@ -13,7 +13,7 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-Temporal workflow workers for automated infrastructure operations. **Five worker binaries host eight scheduled jobs.** Four workers map to one job each — backup, vulnerability scanning, certificate acquisition, and GitHub token renewal — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
+Temporal workflow workers for automated infrastructure operations. **Six worker binaries host nine scheduled jobs.** Five workers map to one job each — backup, vulnerability scanning, certificate acquisition, GitHub token renewal, and on-demand CI runner scaling — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
 
 ```
   Temporal Schedules            Temporal Server
@@ -39,6 +39,10 @@ Temporal workflow workers for automated infrastructure operations. **Five worker
                             | github-token-renewer   |
                             | (github-token-renewer- |
                             |  task-queue)           |
+                            +------------------------+
+                            | ci-runner-scaler       |
+                            | ci-runner-scaler-      |
+                            |  task-queue            |
                             +------------------------+
                                         |
                                         v
@@ -138,6 +142,15 @@ Keeps each managed repository's CI/release token secret continuously valid so it
 **Image:** `github-token-renewer`
 **Dependencies:** Vault (Workload Identity, holds the App key), Consul KV (repo list), GitHub API
 
+### Runner Scaler
+
+Scales self-hosted CI runners on demand (zero idle) instead of running them always-on. On a short schedule, the `PollAndDispatch` workflow reads the watched repos and runner profiles from Consul KV and, for each repo, lists the queued Actions jobs whose `runs-on` includes `self-hosted`. For each queued job it starts a child workflow keyed `runner-<repo>-<job_id>` with a reject-duplicate ID policy, so Temporal itself guarantees one runner per job — a job still queued on the next tick can't spawn a second runner, with no external state store. The child `HandleQueuedJob` mints a runner registration token and dispatches one ephemeral Nomad `ci-runner` carrying it; the token is minted inside the dispatch activity so it never enters workflow history. The runner is ephemeral (one job, then it self-deregisters); a backstop timer reaps a runner that never picked its job up. Profiles map a `runs-on` label to a runner image, so a workflow selects its toolchain via `runs-on: [self-hosted, <profile>]` and a bare `[self-hosted]` job gets the `default` profile. It reuses the token-renewer GitHub App, which additionally grants Administration (registration tokens) and Actions (queued-job discovery).
+
+**Task queue:** `ci-runner-scaler-task-queue`
+**Workflows:** `PollAndDispatch`, `HandleQueuedJob`
+**Image:** `ci-runner-scaler`
+**Dependencies:** Vault (Workload Identity, holds the App key), Consul KV (repos + profiles), GitHub API, Nomad (job dispatch)
+
 ## Maintenance Sagas
 
 The registry GC and aptly cleanup workflows share one saga skeleton so the job being maintained is never left stranded offline: scale it to 0, do the work while it's down, then always scale it back. The generic steps — locate the job's node, scale, wait for drain/running, measure the data dir — are the **shared saga activities** (`maintenance/internal/nodes`); only the middle "do the work" step is job-specific. Each step has its own retry policy:
@@ -201,6 +214,7 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 | `aptly-cleanup-weekly` | `AptlyCleanup` | `cleanup-task-queue` | `0 4 * * 0` | `AptlyCleanupConfig` (job/group/image, data dir) |
 | `postgres-maintenance-weekly` | `PostgresMaintenance` | `cleanup-task-queue` | `0 6 * * 0` | `PostgresMaintenanceConfig` (concurrency) |
 | `cert-acquirer-weekly` | `CertAcquirer` | `cert-task-queue` | `0 4 * * 1` | `IssueRequest` (domains, email) |
+| `ci-runner-scaler` | `PollAndDispatch` | `ci-runner-scaler-task-queue` | every ~30s (interval) | `PollConfig` (scan concurrency, reap backstop) |
 
 ## Retry and Error Handling
 
@@ -320,6 +334,18 @@ The cert worker carries no static service tokens: it reads its Vault token from 
 | `VAULT_KV_MOUNT` | `secret` | KV v2 mount holding the Cloudflare token, ACME account, and wildcard paths |
 | `ACME_CA_DIR_URL` | Let's Encrypt production | ACME directory endpoint (point at staging for testing) |
 
+### Runner Scaler Worker
+
+Authenticates to Vault with its Workload Identity and pulls the GitHub App key through it (reusing the token-renewer App); Consul uses the local agent token and Nomad uses `NOMAD_TOKEN`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GITHUB_APP_VAULT_PATH` | `github/token-renewer-app` | Vault KV path holding the App `app_id`, `installation_id`, `private_key` |
+| `RUNNERS_REPOS_KEY` | `runners/repos` | Consul KV key with the newline-separated `owner/repo` watch list |
+| `RUNNERS_PROFILES_KEY` | `runners/profiles` | Consul KV key with the JSON `label -> {image}` profile map |
+| `RUNNER_JOB_ID` | `ci-runner` | Parameterized Nomad job dispatched per runner |
+| `NOMAD_TOKEN` | -- | Nomad API token (dispatch/stop the runner job) |
+
 ## Observability
 
 ### Tracing
@@ -330,6 +356,7 @@ All workers initialize OpenTelemetry with OTLP gRPC export. The Temporal SDK tra
 - `trivy-scan-worker` -> nomad, trivy-server, postgres (via otelsql)
 - `cleanup-worker` -> nomad, postgres-primary
 - `cert-acquirer-worker` -> vault, acme, cloudflare
+- `ci-runner-scaler` -> vault, consul, github, nomad
 
 ### Metrics
 
@@ -416,6 +443,8 @@ Each domain is deployed as a separate Nomad service job. Workflows are started o
 | `trivy-scan-worker` | service | `trivy-scan-worker` | `trivy-task-queue` | `Scan` |
 | `cleanup-worker` | service | `cleanup-worker` | `cleanup-task-queue` | `Cleanup`, `RegistryGC`, `AptlyCleanup`, `PostgresMaintenance` |
 | `cert-acquirer-worker` | service | `cert-acquirer-worker` | `cert-task-queue` | `CertAcquirer` |
+| `github-token-renewer` | service | `github-token-renewer` | `github-token-renewer-task-queue` | `RenewTokens` |
+| `ci-runner-scaler` | service | `ci-runner-scaler` | `ci-runner-scaler-task-queue` | `PollAndDispatch`, `HandleQueuedJob` |
 
 ### Manual Runs
 
@@ -456,6 +485,11 @@ temporal workflow start --task-queue cleanup-task-queue --type PostgresMaintenan
 temporal workflow start --task-queue cert-task-queue --type CertAcquirer \
   --address temporal-server.service.consul:7233 \
   --input '{"domains":["*.munchbox.cc"],"email":"ops@munchbox.cc"}'
+
+# CI runner scaler (one poll tick)
+temporal workflow start --task-queue ci-runner-scaler-task-queue --type PollAndDispatch \
+  --address temporal-server.service.consul:7233 \
+  --input '{"concurrency":4}'
 ```
 
 ## Project Structure
@@ -525,6 +559,15 @@ nomad-temporal-jobs/
       cert_acquirer.go               Issue-then-publish orchestration with split retry policies
     worker/
       main.go                       Worker entry point (builds the shared Vault client)
+  runnerscaler/                      ci-runner-scaler: on-demand ephemeral CI runners
+    Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-nonroot), includes ../_common.mk
+    activities/
+      activities.go                  Activity struct: read repos/profiles, list queued jobs, dispatch + reap runners
+    workflows/
+      poll_dispatch.go               PollAndDispatch parent: scan repos, start one child per queued job
+      handle_job.go                  HandleQueuedJob child: dispatch one ephemeral runner + backstop reap timer
+    worker/
+      main.go                        Worker entry point (Vault App client, Consul, Nomad)
 ```
 
 ## License

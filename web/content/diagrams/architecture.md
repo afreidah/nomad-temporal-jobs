@@ -54,12 +54,14 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    TEMPORAL --> CTQ[cleanup\\ntask-queue]:::middleware',
     '    TEMPORAL --> CETQ[cert\\ntask-queue]:::middleware',
     '    TEMPORAL --> GTQ[github-token\\ntask-queue]:::middleware',
+    '    TEMPORAL --> RSTQ[runner-scaler\\ntask-queue]:::middleware',
     '',
     '    BTQ --> BWORKER[Backup\\nWorker]:::handler',
     '    TTQ --> TWORKER[Trivy Scan\\nWorker]:::handler',
     '    CTQ --> CWORKER[Cleanup\\nWorker]:::handler',
     '    CETQ --> CEWORKER[Cert Acquirer\\nWorker]:::handler',
     '    GTQ --> GWORKER[GitHub Token\\nRenewer Worker]:::handler',
+    '    RSTQ --> RSWORKER[Runner Scaler\\nWorker]:::handler',
     '',
     '    BWORKER --> NOMAD_API[Nomad API]:::data',
     '    BWORKER --> CONSUL_API[Consul API]:::data',
@@ -82,6 +84,11 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    GWORKER --> CONSUL_API',
     '    GWORKER --> GITHUB[GitHub\\nApp API]:::data',
     '',
+    '    RSWORKER --> VAULT',
+    '    RSWORKER --> CONSUL_API',
+    '    RSWORKER --> GITHUB',
+    '    RSWORKER --> NOMAD_API',
+    '',
     '    BWORKER --> TEMPO[Tempo\\nTracing]:::observability',
     '    BWORKER --> PROM[Prometheus\\nMetrics]:::observability',
     '    TWORKER --> TEMPO',
@@ -92,12 +99,15 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    CEWORKER --> PROM',
     '    GWORKER --> TEMPO',
     '    GWORKER --> PROM',
+    '    RSWORKER --> TEMPO',
+    '    RSWORKER --> PROM',
     '',
     '    BWORKER --> LOKI[Loki\\nLogging]:::observability',
     '    TWORKER --> LOKI',
     '    CWORKER --> LOKI',
     '    CEWORKER --> LOKI',
     '    GWORKER --> LOKI',
+    '    RSWORKER --> LOKI',
     '',
     '    classDef entry fill:#059669,stroke:#34d399,color:#fff,font-weight:bold',
     '    classDef middleware fill:#0d9488,stroke:#14b8a6,color:#fff',
@@ -121,7 +131,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     SCHED: {
       title: 'Temporal Schedules',
       badge: 'entry', badgeText: 'scheduler',
-      body: '<p>Temporal Schedules start each workflow on cron &mdash; one per workflow (backup, trivy scan, node cleanup, registry GC, aptly cleanup, postgres maintenance, cert acquirer, github token renewer). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
+      body: '<p>Temporal Schedules start each workflow &mdash; mostly on cron (backup, trivy scan, node cleanup, registry GC, aptly cleanup, postgres maintenance, cert acquirer, github token renewer), plus the runner scaler on a short interval (~30s). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron/interval, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
     },
     TEMPORAL: {
       title: 'Temporal Server',
@@ -172,6 +182,16 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
       title: 'Cert Acquirer Worker',
       badge: 'handler', badgeText: 'worker',
       body: '<p>Issues the <code>*.munchbox.cc</code> wildcard certificate via ACME DNS-01 (Cloudflare, go-acme/lego) and publishes it to Vault for Traefik to read.</p><p>Issuance and publish are separate activities: the issued cert+key are written to a Vault staging path so a publish retry never re-runs ACME (Let\'s Encrypt rate limits), and the private key never transits workflow history.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the Cloudflare token through Vault &mdash; no static secrets in the job.</p><p><a href="../cert-acquirer-workflow/">Cert acquirer workflow diagram &rarr;</a></p>'
+    },
+    RSTQ: {
+      title: 'ci-runner-scaler-task-queue',
+      badge: 'middleware', badgeText: 'task queue',
+      body: '<p>Temporal task queue for the runner-scaler workflows (<code>PollAndDispatch</code> parent + <code>HandleQueuedJob</code> children) and their activities. Only the runner-scaler worker polls this queue.</p><p>Fired on a short interval (~30s) rather than cron. Child workflows are keyed <code>runner-&lt;repo&gt;-&lt;job_id&gt;</code> with a reject-duplicate ID policy, so Temporal itself dedups one runner per job.</p>'
+    },
+    RSWORKER: {
+      title: 'Runner Scaler Worker',
+      badge: 'handler', badgeText: 'worker',
+      body: '<p>Scales self-hosted CI runners on demand (zero idle). Each tick reads the watched repos and runner profiles from Consul, lists each repo\'s queued <code>self-hosted</code> Actions jobs on GitHub, and starts one child per job &mdash; the reject-duplicate child ID is the entire state store (no external DB).</p><p>Each child mints a runner registration token and dispatches one ephemeral Nomad <code>ci-runner</code> carrying it (token minted inside the activity, so it never enters workflow history; dispatch runs NoRetry so it can\'t double up). A backstop timer reaps a runner that never picked its job up.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the GitHub App key through Vault (reusing the token-renewer App, which also grants Administration + Actions). <a href="../runnerscaler-workflow/">Runner scaler workflow diagram &rarr;</a></p>'
     },
     GWORKER: {
       title: 'GitHub Token Renewer Worker',
@@ -226,7 +246,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     GITHUB: {
       title: 'GitHub App API',
       badge: 'data', badgeText: 'external service',
-      body: '<p>GitHub REST API, reached as a GitHub App (one app installed across all managed repos) via the native <code>go-github</code> client &mdash; no <code>gh</code> CLI.</p><p>Mints short-lived, repo-scoped installation tokens and writes repository Actions secrets (sealed against the repo\'s public key). An App is the only way to mint PR-capable tokens programmatically. Produces <code>peer.service: github</code> service-graph edges.</p>'
+      body: '<p>GitHub REST API, reached as a GitHub App (one app installed across all managed repos) via the native <code>go-github</code> client &mdash; no <code>gh</code> CLI.</p><p>The token renewer mints short-lived, repo-scoped installation tokens and writes repository Actions secrets (sealed against the repo\'s public key). The runner scaler reuses the same App to discover queued self-hosted jobs and mint runner registration tokens. An App is the only way to mint PR-capable tokens programmatically. Produces <code>peer.service: github</code> service-graph edges.</p>'
     },
     TEMPO: {
       title: 'Tempo (Tracing)',

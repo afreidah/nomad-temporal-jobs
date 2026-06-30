@@ -27,6 +27,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/git"
 )
 
 // sonarClient is the SonarCloud surface the renewer uses: mint a user token,
@@ -60,7 +61,7 @@ func (a *Activities) RenewSonarCloudToken(ctx context.Context, repo string) (Son
 			"SonarCloud renewal not configured (no client)", "SonarNotConfigured", nil)
 	}
 
-	owner, name, ok := splitRepo(repo)
+	owner, name, ok := git.SplitRepo(repo)
 	if !ok {
 		return SonarRenewResult{}, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("invalid repo %q, want owner/repo", repo), "InvalidRepo", nil)
