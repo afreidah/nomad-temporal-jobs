@@ -9,7 +9,7 @@
 // and their error handling.
 // -------------------------------------------------------------------------------
 
-package shared
+package nomad
 
 import (
 	"context"

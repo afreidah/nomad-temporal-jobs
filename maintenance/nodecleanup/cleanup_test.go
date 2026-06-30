@@ -20,10 +20,10 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/maintenance/internal/nodes"
-	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/ssh"
 )
 
-func runCleanup(t *testing.T, host shared.RemoteHost) CleanupResult {
+func runCleanup(t *testing.T, host ssh.RemoteHost) CleanupResult {
 	t.Helper()
 	a := New(&fakeNomad{}, &fakeConnector{host: host})
 	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
@@ -83,11 +83,11 @@ func (f *fakeRemoteHost) DockerSystemPrune(context.Context) (uint64, []string, e
 }
 
 type fakeConnector struct {
-	host shared.RemoteHost
+	host ssh.RemoteHost
 	err  error
 }
 
-func (f *fakeConnector) Connect(shared.SSHTarget) (shared.RemoteHost, error) {
+func (f *fakeConnector) Connect(ssh.SSHTarget) (ssh.RemoteHost, error) {
 	return f.host, f.err
 }
 

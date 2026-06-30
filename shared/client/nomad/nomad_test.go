@@ -8,7 +8,7 @@
 // job-not-found classification.
 // -------------------------------------------------------------------------------
 
-package shared
+package nomad
 
 import (
 	"errors"

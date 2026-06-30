@@ -19,18 +19,19 @@ import (
 
 	"go.temporal.io/sdk/testsuite"
 
-	"munchbox/temporal-workers/shared"
+	nomadclient "munchbox/temporal-workers/shared/client/nomad"
+	"munchbox/temporal-workers/shared/client/ssh"
 )
 
 type fakeSagaNomad struct {
-	node     shared.NomadNode
+	node     nomadclient.NomadNode
 	findErr  error
 	scaleErr error
 	waitErr  error
 	polls    []int // running counts reported to onPoll before WaitAllocCount returns
 }
 
-func (f *fakeSagaNomad) FindJobNode(_ context.Context, _ string) (shared.NomadNode, error) {
+func (f *fakeSagaNomad) FindJobNode(_ context.Context, _ string) (nomadclient.NomadNode, error) {
 	return f.node, f.findErr
 }
 
@@ -54,7 +55,7 @@ type fakeDirMeasurer struct {
 	err  error
 }
 
-func (f *fakeDirMeasurer) DirSize(_ context.Context, _ shared.SSHTarget, _ string) (int64, error) {
+func (f *fakeDirMeasurer) DirSize(_ context.Context, _ ssh.SSHTarget, _ string) (int64, error) {
 	return f.size, f.err
 }
 
@@ -87,7 +88,7 @@ func TestSagaMeasureDataDir_Error(t *testing.T) {
 
 func TestSagaFindJobNode(t *testing.T) {
 	a := NewSagaActivities(&fakeSagaNomad{
-		node: shared.NomadNode{ID: "n1", Name: "oracle-arm-1", Address: "10.0.0.9", HTTPAddr: "10.0.0.9:4646"},
+		node: nomadclient.NomadNode{ID: "n1", Name: "oracle-arm-1", Address: "10.0.0.9", HTTPAddr: "10.0.0.9:4646"},
 	}, nil)
 	env := sagaEnv()
 	env.RegisterActivity(a.FindJobNode)
@@ -109,7 +110,7 @@ func TestSagaFindJobNode(t *testing.T) {
 }
 
 func TestSagaFindJobNode_NoRunningAlloc(t *testing.T) {
-	a := NewSagaActivities(&fakeSagaNomad{findErr: shared.ErrNoRunningAlloc}, nil)
+	a := NewSagaActivities(&fakeSagaNomad{findErr: nomadclient.ErrNoRunningAlloc}, nil)
 	env := sagaEnv()
 	env.RegisterActivity(a.FindJobNode)
 	if _, err := env.ExecuteActivity(a.FindJobNode, "myjob"); err == nil {

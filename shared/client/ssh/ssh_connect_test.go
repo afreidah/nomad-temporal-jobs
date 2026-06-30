@@ -8,7 +8,7 @@
 // Reuses testSigner/writeTemp from ssh_auth_test.go.
 // -------------------------------------------------------------------------------
 
-package shared
+package ssh
 
 import (
 	"context"

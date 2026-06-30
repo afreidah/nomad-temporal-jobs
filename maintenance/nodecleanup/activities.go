@@ -22,6 +22,9 @@ import (
 	"munchbox/temporal-workers/maintenance/internal/nodes"
 	"munchbox/temporal-workers/shared"
 
+	"munchbox/temporal-workers/shared/client/nomad"
+	"munchbox/temporal-workers/shared/client/ssh"
+
 	"go.temporal.io/sdk/activity"
 )
 
@@ -29,11 +32,11 @@ import (
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
-// nomadClient is this worker's view of shared.Nomad -- the node and alloc
-// operations the cleanup activities call. *shared.Nomad satisfies it
+// nomadClient is this worker's view of nomad.Nomad -- the node and alloc
+// operations the cleanup activities call. *nomad.Nomad satisfies it
 // structurally.
 type nomadClient interface {
-	ClientNodes(ctx context.Context) ([]shared.NomadNode, error)
+	ClientNodes(ctx context.Context) ([]nomad.NomadNode, error)
 	RunningJobIDs(ctx context.Context, nodeID string) (map[string]struct{}, error)
 }
 
@@ -42,13 +45,13 @@ type nomadClient interface {
 // activity implementations.
 type Activities struct {
 	nomad nomadClient
-	host  shared.HostConnector
+	host  ssh.HostConnector
 }
 
 // New creates an Activities instance over the shared Nomad client and a remote-
 // host connector (reused across activity invocations rather than rebuilt per
 // call).
-func New(nomad nomadClient, host shared.HostConnector) *Activities {
+func New(nomad nomadClient, host ssh.HostConnector) *Activities {
 	return &Activities{nomad: nomad, host: host}
 }
 
@@ -216,7 +219,7 @@ func (a *Activities) runningJobs(ctx context.Context, nodeID string) (map[string
 
 // listDataDirs returns the immediate subdirectories of dataDir on the remote
 // host with their modification times, over SFTP.
-func listDataDirs(conn shared.RemoteHost, dataDir string) ([]dirEntry, error) {
+func listDataDirs(conn ssh.RemoteHost, dataDir string) ([]dirEntry, error) {
 	infos, err := conn.ReadDir(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("list data dirs in %s: %w", dataDir, err)
@@ -271,7 +274,7 @@ func classifyEntry(e dirEntry, running map[string]struct{}, cfg CleanupConfig, n
 // API (tunneled over conn) -- the equivalent of `docker system prune -af`. In
 // dry-run it does nothing. Returns the reclaimed-space string and a log
 // fragment.
-func (a *Activities) dockerPrune(ctx context.Context, conn shared.RemoteHost, dryRun bool) (string, string) {
+func (a *Activities) dockerPrune(ctx context.Context, conn ssh.RemoteHost, dryRun bool) (string, string) {
 	if dryRun {
 		return "0B", "=== Docker Cleanup (dry run; skipped) ===\n"
 	}

@@ -8,7 +8,7 @@
 // settings, and span attributes so every worker connects the same way.
 // -------------------------------------------------------------------------------
 
-package shared
+package postgres
 
 import (
 	"context"

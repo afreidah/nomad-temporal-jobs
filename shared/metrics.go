@@ -18,8 +18,8 @@ import (
 	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/uber-go/tally/v4"
 	"github.com/uber-go/tally/v4/prometheus"
-	sdktally "go.temporal.io/sdk/contrib/tally"
 	tclient "go.temporal.io/sdk/client"
+	sdktally "go.temporal.io/sdk/contrib/tally"
 )
 
 // NewMetricsHandler creates a Temporal MetricsHandler backed by Prometheus.

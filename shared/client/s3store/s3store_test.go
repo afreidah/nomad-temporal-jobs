@@ -7,7 +7,7 @@
 // real S3), plus the pure oldestObject selector.
 // -------------------------------------------------------------------------------
 
-package shared
+package s3store
 
 import (
 	"context"

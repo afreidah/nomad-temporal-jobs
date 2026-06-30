@@ -32,7 +32,7 @@ import (
 // -------------------------------------------------------------------------
 
 // githubClient is the GitHub App surface the renewer uses: mint a
-// workflow-scoped token and write a repository Actions secret. *shared.GitHub
+// workflow-scoped token and write a repository Actions secret. *git.GitHub
 // satisfies it structurally.
 type githubClient interface {
 	MintWorkflowToken(ctx context.Context, owner, repo string) (token string, expiry time.Time, err error)
@@ -40,7 +40,7 @@ type githubClient interface {
 }
 
 // kvGetter is the Consul KV surface the renewer uses: read the repo-list key.
-// *shared.Consul satisfies it structurally.
+// *consul.Consul satisfies it structurally.
 type kvGetter interface {
 	KVGet(ctx context.Context, key string) (value []byte, found bool, err error)
 }

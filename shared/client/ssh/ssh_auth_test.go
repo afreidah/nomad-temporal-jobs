@@ -8,7 +8,7 @@
 // silent fall-through), and the host-CA verification callback.
 // -------------------------------------------------------------------------------
 
-package shared
+package ssh
 
 import (
 	"crypto/ed25519"

@@ -16,7 +16,7 @@
 // project; rotation (not scoping) is what bounds exposure.
 // -------------------------------------------------------------------------------
 
-package shared
+package sonarcloud
 
 import (
 	"context"
@@ -27,6 +27,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"munchbox/temporal-workers/shared"
 )
 
 // defaultSonarCloudBaseURL is the public SonarCloud API host. A self-hosted
@@ -60,7 +62,7 @@ func NewSonarCloud(cfg SonarCloudConfig) *SonarCloud {
 	return &SonarCloud{
 		base:  strings.TrimRight(base, "/"),
 		token: cfg.Token,
-		http:  &http.Client{Transport: otelTransport("sonarcloud", nil)},
+		http:  &http.Client{Transport: shared.OTelTransport("sonarcloud", nil)},
 	}
 }
 

@@ -7,7 +7,7 @@
 // responses, plus the token helpers. Hermetic -- no real Vault.
 // -------------------------------------------------------------------------------
 
-package shared
+package vault
 
 import (
 	"context"
@@ -16,12 +16,24 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
 )
+
+// writeTemp writes data to a temp file under t.TempDir() and returns its path.
+func writeTemp(t *testing.T, name string, data []byte) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+	return p
+}
 
 func vaultStub() *httptest.Server {
 	const kvRead = `{"data":{"data":{"username":"admin","password":"s3cr3t"},"metadata":{"version":1,"created_time":"2020-01-01T00:00:00Z"}}}`

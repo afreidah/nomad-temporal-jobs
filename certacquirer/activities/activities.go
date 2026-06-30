@@ -44,7 +44,7 @@ const errRateLimited = "ACMERateLimited"
 // -------------------------------------------------------------------------
 
 // vaultKV is the narrow Vault surface the cert activities use, declared here
-// so tests can substitute a fake. *shared.VaultClient satisfies it.
+// so tests can substitute a fake. *vault.VaultClient satisfies it.
 type vaultKV interface {
 	ReadKV(ctx context.Context, path string) (map[string]any, error)
 	ReadKVMaybe(ctx context.Context, path string) (map[string]any, bool, error)

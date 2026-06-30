@@ -22,15 +22,18 @@ import (
 
 	"munchbox/temporal-workers/shared"
 
+	nomadclient "munchbox/temporal-workers/shared/client/nomad"
+	"munchbox/temporal-workers/shared/client/ssh"
+
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 )
 
-// nomad is the saga's view of shared.Nomad -- the job-find, scale, and
-// alloc-wait operations these activities call. *shared.Nomad satisfies it
+// nomad is the saga's view of nomadclient.Nomad -- the job-find, scale, and
+// alloc-wait operations these activities call. *nomadclient.Nomad satisfies it
 // structurally.
 type nomad interface {
-	FindJobNode(ctx context.Context, jobName string) (shared.NomadNode, error)
+	FindJobNode(ctx context.Context, jobName string) (nomadclient.NomadNode, error)
 	ScaleJob(ctx context.Context, jobName, groupName string, count int, reason string) error
 	WaitAllocCount(ctx context.Context, jobName string, target int, interval time.Duration, onPoll func(running int)) error
 }
@@ -41,12 +44,12 @@ type nomad interface {
 // activity implementations used by every job-scaling saga.
 type SagaActivities struct {
 	nomad nomad
-	disk  shared.DirMeasurer
+	disk  ssh.DirMeasurer
 }
 
 // NewSagaActivities builds the shared saga activities over the given Nomad and
 // SSH clients (reused across invocations rather than rebuilt per call).
-func NewSagaActivities(n nomad, disk shared.DirMeasurer) *SagaActivities {
+func NewSagaActivities(n nomad, disk ssh.DirMeasurer) *SagaActivities {
 	return &SagaActivities{nomad: n, disk: disk}
 }
 
@@ -66,7 +69,7 @@ func (a *SagaActivities) FindJobNode(ctx context.Context, jobName string) (NodeI
 	defer span.End()
 
 	node, err := a.nomad.FindJobNode(ctx, jobName)
-	if errors.Is(err, shared.ErrNoRunningAlloc) {
+	if errors.Is(err, nomadclient.ErrNoRunningAlloc) {
 		// Fail fast: a terminally-misconfigured cluster shouldn't retry-storm.
 		return NodeInfo{}, temporal.NewNonRetryableApplicationError(err.Error(), "NoRunningAlloc", err)
 	}
@@ -119,7 +122,7 @@ func (a *SagaActivities) ScaleJob(ctx context.Context, jobName, groupName string
 
 	reason := fmt.Sprintf("temporal workflow: scale to %d", count)
 	if err := a.nomad.ScaleJob(ctx, jobName, groupName, count, reason); err != nil {
-		if shared.IsJobNotFound(err) {
+		if nomadclient.IsJobNotFound(err) {
 			return temporal.NewNonRetryableApplicationError(err.Error(), "JobNotFound", err)
 		}
 		return err

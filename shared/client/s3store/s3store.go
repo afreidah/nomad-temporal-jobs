@@ -13,7 +13,7 @@
 // satisfies in tests.
 // -------------------------------------------------------------------------------
 
-package shared
+package s3store
 
 import (
 	"context"
@@ -27,6 +27,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	"munchbox/temporal-workers/shared"
 )
 
 const (
@@ -84,7 +86,7 @@ func NewS3Store(cfg S3Config) *S3Store {
 		api:    client,
 		bucket: cfg.Bucket,
 		upload: func(ctx context.Context, in *s3.PutObjectInput) error {
-			_, err := WithHeartbeat(ctx, s3UploadHeartbeatInterval, func() (struct{}, error) {
+			_, err := shared.WithHeartbeat(ctx, s3UploadHeartbeatInterval, func() (struct{}, error) {
 				_, e := uploader.Upload(ctx, in) //nolint:staticcheck // SA1019: pending transfermanager migration
 				return struct{}{}, e
 			})

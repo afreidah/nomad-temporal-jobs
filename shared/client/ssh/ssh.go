@@ -15,7 +15,7 @@
 // transport that runs the resulting fixed commands.
 // -------------------------------------------------------------------------------
 
-package shared
+package ssh
 
 import (
 	"bytes"
@@ -29,6 +29,8 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+
+	"munchbox/temporal-workers/shared"
 )
 
 const defaultSSHTimeout = 30 * time.Second
@@ -322,7 +324,7 @@ func (s *sshConn) RunWithHeartbeat(ctx context.Context, cmd string, interval tim
 		return "", fmt.Errorf("ssh start %q: %w", cmd, err)
 	}
 
-	_, werr := WithHeartbeat(ctx, interval, func() (struct{}, error) {
+	_, werr := shared.WithHeartbeat(ctx, interval, func() (struct{}, error) {
 		return struct{}{}, session.Wait()
 	})
 	if werr != nil {

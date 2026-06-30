@@ -125,11 +125,11 @@ func StartPeerSpan(ctx context.Context, peer, op string, attrs ...attribute.KeyV
 	return StartClientSpan(ctx, op, append([]attribute.KeyValue{PeerServiceAttr(peer)}, attrs...)...)
 }
 
-// otelTransport wraps base with an OTel transport whose spans are named
+// OTelTransport wraps base with an OTel transport whose spans are named
 // "<service>." + request path, producing per-call edges in the service graph.
 // base may be nil (defaults to http.DefaultTransport); pass a pre-configured
 // transport (e.g. one already carrying TLS settings) to instrument it in place.
-func otelTransport(service string, base http.RoundTripper) http.RoundTripper {
+func OTelTransport(service string, base http.RoundTripper) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}

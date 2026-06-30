@@ -28,6 +28,11 @@ import (
 
 	"munchbox/temporal-workers/shared"
 
+	"munchbox/temporal-workers/shared/client/consul"
+	"munchbox/temporal-workers/shared/client/nomad"
+	"munchbox/temporal-workers/shared/client/postgres"
+	"munchbox/temporal-workers/shared/client/s3store"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -105,8 +110,8 @@ func (c *Config) Validate() error {
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
-// s3Store is the backup worker's view of shared.S3Store -- only the operations
-// the backup activities call. *shared.S3Store satisfies it structurally, so the
+// s3Store is the backup worker's view of s3store.S3Store -- only the operations
+// the backup activities call. *s3store.S3Store satisfies it structurally, so the
 // shared client can grow without widening this interface.
 type s3Store interface {
 	Put(ctx context.Context, key string, body io.Reader) error
@@ -115,15 +120,15 @@ type s3Store interface {
 	DeleteOldest(ctx context.Context, prefix, skipKey string) (string, error)
 }
 
-// databaseLister is the backup worker's view of shared.Postgres -- it only
-// enumerates databases for the per-database dump fan-out. *shared.Postgres
+// databaseLister is the backup worker's view of postgres.Postgres -- it only
+// enumerates databases for the per-database dump fan-out. *postgres.Postgres
 // satisfies it structurally.
 type databaseLister interface {
 	ListDatabases(ctx context.Context) ([]string, error)
 }
 
-// consulSnapshotter is the backup worker's view of shared.Consul -- it only
-// takes Raft snapshots. *shared.Consul satisfies it structurally.
+// consulSnapshotter is the backup worker's view of consul.Consul -- it only
+// takes Raft snapshots. *consul.Consul satisfies it structurally.
 type consulSnapshotter interface {
 	SaveSnapshot(ctx context.Context) (io.ReadCloser, error)
 }
@@ -162,19 +167,19 @@ func New(cfg Config) (*Activities, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	nomad, err := shared.NewNomadClient()
+	nomad, err := nomad.NewNomadClient()
 	if err != nil {
 		return nil, fmt.Errorf("create nomad client: %w", err)
 	}
 
-	store := shared.NewS3Store(shared.S3Config{
+	store := s3store.NewS3Store(s3store.S3Config{
 		Endpoint:  cfg.S3Endpoint,
 		Bucket:    cfg.S3Bucket,
 		AccessKey: cfg.S3AccessKey,
 		SecretKey: cfg.S3SecretKey,
 	})
 
-	pg := shared.NewPostgres(shared.PostgresConfig{
+	pg := postgres.NewPostgres(postgres.PostgresConfig{
 		Host:     cfg.PostgresHost,
 		Port:     "5432",
 		User:     cfg.PostgresUser,
@@ -184,7 +189,7 @@ func New(cfg Config) (*Activities, error) {
 
 	// nil Vault client: the Consul ACL token falls back to CONSUL_HTTP_TOKEN.
 	// Construction does no I/O for a nil client, so Background is fine here.
-	consul, err := shared.NewConsul(context.Background(), nil)
+	consul, err := consul.NewConsul(context.Background(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create consul client: %w", err)
 	}

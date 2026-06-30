@@ -23,6 +23,8 @@ import (
 	"munchbox/temporal-workers/certacquirer/workflows"
 	"munchbox/temporal-workers/shared"
 
+	"munchbox/temporal-workers/shared/client/vault"
+
 	"go.temporal.io/sdk/worker"
 )
 
@@ -32,7 +34,7 @@ func main() {
 		TaskQueue: "cert-task-queue",
 		Register: func(ctx context.Context, slogger *slog.Logger, w worker.Worker) (func(), error) {
 			// Vault client (Workload Identity); other creds are pulled through it.
-			vc, err := shared.NewVaultWithRefresher(ctx, slogger)
+			vc, err := vault.NewVaultWithRefresher(ctx, slogger)
 			if err != nil {
 				return nil, err
 			}

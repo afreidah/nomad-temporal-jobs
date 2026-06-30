@@ -27,6 +27,10 @@ import (
 	"munchbox/temporal-workers/maintenance/registrygc"
 	"munchbox/temporal-workers/shared"
 
+	"munchbox/temporal-workers/shared/client/nomad"
+	"munchbox/temporal-workers/shared/client/postgres"
+	"munchbox/temporal-workers/shared/client/ssh"
+
 	"go.temporal.io/sdk/worker"
 )
 
@@ -35,11 +39,11 @@ func main() {
 		Service:   "cleanup-worker",
 		TaskQueue: "cleanup-task-queue",
 		Register: func(_ context.Context, _ *slog.Logger, w worker.Worker) (func(), error) {
-			nomad, err := shared.NewNomad()
+			nomad, err := nomad.NewNomad()
 			if err != nil {
 				return nil, err
 			}
-			ssh, err := shared.NewSSHClient(shared.SSHConfig{
+			ssh, err := ssh.NewSSHClient(ssh.SSHConfig{
 				KeyPath:    cmp.Or(os.Getenv("SSH_KEY_PATH"), "/root/.ssh/id_ed25519"),
 				CertPath:   cmp.Or(os.Getenv("SSH_CERT_PATH"), "/root/.ssh/id_ed25519-cert.pub"),
 				HostCAPath: cmp.Or(os.Getenv("SSH_HOST_CA_PATH"), "/root/.ssh/ssh-host-ca.pub"),
@@ -47,7 +51,7 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			pg := shared.NewPostgres(shared.PostgresConfig{
+			pg := postgres.NewPostgres(postgres.PostgresConfig{
 				Host:        cmp.Or(os.Getenv("PG_HOST"), "postgres-primary.service.consul"),
 				Port:        cmp.Or(os.Getenv("PG_PORT"), "5432"),
 				User:        cmp.Or(os.Getenv("PG_USER"), "postgres"),

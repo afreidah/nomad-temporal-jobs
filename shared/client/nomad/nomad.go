@@ -8,7 +8,7 @@
 // trivyscan and nodecleanup workflows.
 // -------------------------------------------------------------------------------
 
-package shared
+package nomad
 
 import (
 	"context"
@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/nomad/api"
+
+	"munchbox/temporal-workers/shared"
 )
 
 // NewNomadClient creates a configured Nomad API client with OTel-instrumented
@@ -42,7 +44,7 @@ func NewNomadClient() (*api.Client, error) {
 		config.TLSConfig.CACert = caCert
 	}
 
-	config.HttpClient = &http.Client{Transport: otelTransport("nomad", nil)}
+	config.HttpClient = &http.Client{Transport: shared.OTelTransport("nomad", nil)}
 
 	return api.NewClient(config)
 }
