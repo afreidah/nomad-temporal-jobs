@@ -214,7 +214,7 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 | `aptly-cleanup-weekly` | `AptlyCleanup` | `cleanup-task-queue` | `0 4 * * 0` | `AptlyCleanupConfig` (job/group/image, data dir) |
 | `postgres-maintenance-weekly` | `PostgresMaintenance` | `cleanup-task-queue` | `0 6 * * 0` | `PostgresMaintenanceConfig` (concurrency) |
 | `cert-acquirer-weekly` | `CertAcquirer` | `cert-task-queue` | `0 4 * * 1` | `IssueRequest` (domains, email) |
-| `ci-runner-scaler` | `PollAndDispatch` | `ci-runner-scaler-task-queue` | every ~30s (interval) | `PollConfig` (scan concurrency, reap backstop) |
+| `ci-runner-scaler` | `PollAndDispatch` | `ci-runner-scaler-task-queue` | every ~30s (calendar, `second=0,30`) | `PollConfig` (scan concurrency, reap backstop) |
 
 ## Retry and Error Handling
 

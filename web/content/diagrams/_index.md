@@ -72,4 +72,11 @@ weight: 20
 </div>
 </a>
 
+<a class="landing-card" href="runnerscaler-workflow/">
+<div>
+<strong>CI Runner Scaler Workflow</strong>
+<p>Polls watched repos for queued self-hosted jobs and dispatches one ephemeral Nomad runner per job, deduped by Temporal workflow ID &mdash; on-demand runners with zero idle.</p>
+</div>
+</a>
+
 </div>
