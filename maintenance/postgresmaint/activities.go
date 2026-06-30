@@ -23,8 +23,8 @@ import (
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
-// pgMaintainer is this worker's view of shared.Postgres -- the database
-// maintenance operations these activities call. *shared.Postgres satisfies it
+// pgMaintainer is this worker's view of postgres.Postgres -- the database
+// maintenance operations these activities call. *postgres.Postgres satisfies it
 // structurally.
 type pgMaintainer interface {
 	ListDatabases(ctx context.Context) ([]string, error)

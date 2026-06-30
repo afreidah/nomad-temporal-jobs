@@ -8,7 +8,7 @@
 // malformed keys must error.
 // -------------------------------------------------------------------------------
 
-package shared
+package git
 
 import (
 	"crypto/rand"

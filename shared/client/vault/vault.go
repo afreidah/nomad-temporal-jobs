@@ -12,7 +12,7 @@
 // its file as Nomad rotates it.
 // -------------------------------------------------------------------------------
 
-package shared
+package vault
 
 import (
 	"context"
@@ -24,6 +24,8 @@ import (
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
+
+	"munchbox/temporal-workers/shared"
 )
 
 // -------------------------------------------------------------------------
@@ -69,7 +71,7 @@ func NewVaultClient() (*VaultClient, error) {
 	// default *http.Transport. Wrap that configured transport with OTel last:
 	// Vault's ConfigureTLS only understands a *http.Transport, so it must run
 	// before the otelhttp wrapper, not after.
-	cfg.HttpClient.Transport = otelTransport("vault", cfg.HttpClient.Transport)
+	cfg.HttpClient.Transport = shared.OTelTransport("vault", cfg.HttpClient.Transport)
 
 	c, err := vault.NewClient(cfg)
 	if err != nil {

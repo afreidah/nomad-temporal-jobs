@@ -7,7 +7,7 @@
 // a request), so the happy path is unit-coverable without a cluster.
 // -------------------------------------------------------------------------------
 
-package shared
+package nomad
 
 import "testing"
 

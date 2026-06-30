@@ -6,7 +6,7 @@
 // Covers the sudo-prefix helper applied to every command on a connection.
 // -------------------------------------------------------------------------------
 
-package shared
+package ssh
 
 import "testing"
 

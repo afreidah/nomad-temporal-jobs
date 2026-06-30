@@ -21,7 +21,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/maintenance/internal/nodes"
-	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/ssh"
 )
 
 type fakeRunner struct {
@@ -30,7 +30,7 @@ type fakeRunner struct {
 	gotCmd []string
 }
 
-func (f *fakeRunner) RunContainer(_ context.Context, _ shared.SSHTarget, cfg *container.Config, _ []string, _ time.Duration) (string, error) {
+func (f *fakeRunner) RunContainer(_ context.Context, _ ssh.SSHTarget, cfg *container.Config, _ []string, _ time.Duration) (string, error) {
 	f.gotCmd = cfg.Cmd
 	return f.out, f.err
 }

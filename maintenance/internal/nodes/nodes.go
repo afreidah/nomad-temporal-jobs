@@ -13,7 +13,7 @@ package nodes
 import (
 	"fmt"
 
-	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/ssh"
 )
 
 // NodeInfo contains information about a Nomad client node needed for SSH
@@ -30,8 +30,8 @@ type NodeInfo struct {
 // everywhere -- the Vault SSH CA issues a root principal the oracle hosts
 // accept too -- so there is no per-node user or sudo handling, and root reaches
 // root-owned data dirs and the docker socket directly.
-func Target(node NodeInfo) shared.SSHTarget {
-	return shared.SSHTarget{Host: node.Address, User: "root"}
+func Target(node NodeInfo) ssh.SSHTarget {
+	return ssh.SSHTarget{Host: node.Address, User: "root"}
 }
 
 // HumanBytes renders a byte count in a compact human-friendly form (KiB, MiB,

@@ -11,7 +11,7 @@
 // which keeps the worker testable with a fake and free of transport details.
 // -------------------------------------------------------------------------------
 
-package shared
+package ssh
 
 import (
 	"context"

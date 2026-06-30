@@ -19,7 +19,8 @@ import (
 	"time"
 
 	"munchbox/temporal-workers/maintenance/internal/nodes"
-	"munchbox/temporal-workers/shared"
+
+	"munchbox/temporal-workers/shared/client/ssh"
 
 	"github.com/moby/moby/api/types/container"
 	"go.temporal.io/sdk/activity"
@@ -34,11 +35,11 @@ import (
 // an activity implementation; the generic saga steps come from a separate
 // nodes.SagaActivities registration.
 type Activities struct {
-	runner shared.ContainerRunner
+	runner ssh.ContainerRunner
 }
 
 // New creates an Activities instance over the shared SSH client.
-func New(runner shared.ContainerRunner) *Activities {
+func New(runner ssh.ContainerRunner) *Activities {
 	return &Activities{runner: runner}
 }
 

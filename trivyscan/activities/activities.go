@@ -28,6 +28,8 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/nomad"
+	"munchbox/temporal-workers/shared/client/postgres"
 )
 
 // attrTrivyError is the span attribute key for a recorded Trivy scan error.
@@ -75,8 +77,8 @@ func (c Config) Validate() error {
 // ACTIVITY STRUCT
 // -------------------------------------------------------------------------
 
-// imageDiscoverer is the trivy worker's view of shared.Nomad -- it only discovers
-// running container images. *shared.Nomad satisfies it structurally.
+// imageDiscoverer is the trivy worker's view of nomad.Nomad -- it only discovers
+// running container images. *nomad.Nomad satisfies it structurally.
 type imageDiscoverer interface {
 	RunningImages(ctx context.Context) ([]string, error)
 }
@@ -98,12 +100,12 @@ func New(cfg Config) (*Activities, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	nomad, err := shared.NewNomad()
+	nomad, err := nomad.NewNomad()
 	if err != nil {
 		return nil, fmt.Errorf("create nomad client: %w", err)
 	}
 
-	db, err := shared.NewPostgresDB(shared.PostgresConfig{
+	db, err := postgres.NewPostgresDB(postgres.PostgresConfig{
 		Host:        cfg.DBHost,
 		Port:        cfg.DBPort,
 		User:        cfg.DBUser,

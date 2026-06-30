@@ -15,7 +15,7 @@
 // socket or be in the docker group. SSHTarget.Sudo does not apply to this path.
 // -------------------------------------------------------------------------------
 
-package shared
+package ssh
 
 import (
 	"bytes"
@@ -28,6 +28,8 @@ import (
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
+
+	"munchbox/temporal-workers/shared"
 )
 
 const remoteDockerSocket = "/var/run/docker.sock"
@@ -131,7 +133,7 @@ func (c *SSHClient) RunContainer(ctx context.Context, t SSHTarget, cfg *containe
 		Condition: container.WaitConditionNotRunning,
 	})
 	var statusCode int64
-	if _, werr := WithHeartbeat(ctx, heartbeat, func() (struct{}, error) {
+	if _, werr := shared.WithHeartbeat(ctx, heartbeat, func() (struct{}, error) {
 		select {
 		case e := <-wait.Error:
 			return struct{}{}, e

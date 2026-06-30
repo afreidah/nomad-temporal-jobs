@@ -30,7 +30,7 @@ import (
 )
 
 // sonarClient is the SonarCloud surface the renewer uses: mint a user token,
-// list the user's token names, and revoke a token. *shared.SonarCloud satisfies
+// list the user's token names, and revoke a token. *sonarcloud.SonarCloud satisfies
 // it structurally.
 type sonarClient interface {
 	MintToken(ctx context.Context, name string, expiry time.Time) (string, error)

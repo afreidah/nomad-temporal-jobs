@@ -28,6 +28,11 @@ import (
 	"munchbox/temporal-workers/ghtokenrenewer/workflows"
 	"munchbox/temporal-workers/shared"
 
+	"munchbox/temporal-workers/shared/client/consul"
+	"munchbox/temporal-workers/shared/client/git"
+	"munchbox/temporal-workers/shared/client/sonarcloud"
+	"munchbox/temporal-workers/shared/client/vault"
+
 	"go.temporal.io/sdk/worker"
 )
 
@@ -38,7 +43,7 @@ func main() {
 		Register: func(ctx context.Context, slogger *slog.Logger, w worker.Worker) (func(), error) {
 			// Vault (Workload Identity); the GitHub App key is pulled through it,
 			// so the Nomad job carries only its identity.
-			vc, err := shared.NewVaultWithRefresher(ctx, slogger)
+			vc, err := vault.NewVaultWithRefresher(ctx, slogger)
 			if err != nil {
 				return nil, err
 			}
@@ -49,7 +54,7 @@ func main() {
 			}
 			// Consul KV (the repo list) uses the local agent's default ACL token
 			// over host networking -- no per-worker Consul token to manage.
-			consul, err := shared.NewConsul(ctx, nil)
+			consul, err := consul.NewConsul(ctx, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -86,7 +91,7 @@ func main() {
 // disables the feature with a warning rather than an error, so the worker still
 // renews GitHub tokens when SonarCloud isn't wired up yet. Defaults: secret
 // SONAR_TOKEN, 90-day token TTL.
-func configureSonar(ctx context.Context, vc *shared.VaultClient, cfg *activities.Config, log *slog.Logger) bool {
+func configureSonar(ctx context.Context, vc *vault.VaultClient, cfg *activities.Config, log *slog.Logger) bool {
 	path := cmp.Or(os.Getenv("SONARCLOUD_TOKEN_VAULT_PATH"), "sonarcloud/token")
 	data, found, err := vc.ReadKVMaybe(ctx, path)
 	if err != nil {
@@ -108,7 +113,7 @@ func configureSonar(ctx context.Context, vc *shared.VaultClient, cfg *activities
 		}
 	}
 
-	cfg.Sonar = shared.NewSonarCloud(shared.SonarCloudConfig{
+	cfg.Sonar = sonarcloud.NewSonarCloud(sonarcloud.SonarCloudConfig{
 		Token:   token,
 		BaseURL: os.Getenv("SONARCLOUD_BASE_URL"),
 	})
@@ -122,7 +127,7 @@ func configureSonar(ctx context.Context, vc *shared.VaultClient, cfg *activities
 // newGitHub reads the GitHub App credentials from Vault and builds the App
 // client. The Vault KV path holds app_id, installation_id (optional, discovered
 // when absent), and private_key (PEM).
-func newGitHub(ctx context.Context, vc *shared.VaultClient) (*shared.GitHub, error) {
+func newGitHub(ctx context.Context, vc *vault.VaultClient) (*git.GitHub, error) {
 	path := cmp.Or(os.Getenv("GITHUB_APP_VAULT_PATH"), "github/token-renewer-app")
 	data, err := vc.ReadKV(ctx, path)
 	if err != nil {
@@ -144,7 +149,7 @@ func newGitHub(ctx context.Context, vc *shared.VaultClient) (*shared.GitHub, err
 		return nil, fmt.Errorf("github private_key missing at %s", path)
 	}
 
-	return shared.NewGitHub(ctx, shared.GitHubConfig{
+	return git.NewGitHub(ctx, git.GitHubConfig{
 		AppID:          appID,
 		InstallationID: instID,
 		PrivateKeyPEM:  []byte(key),

@@ -9,7 +9,7 @@
 // responses surface an error. Hermetic -- no real SonarCloud.
 // -------------------------------------------------------------------------------
 
-package shared
+package sonarcloud
 
 import (
 	"context"

@@ -13,7 +13,7 @@
 // expires.
 // -------------------------------------------------------------------------------
 
-package shared
+package git
 
 import (
 	"context"
@@ -25,6 +25,8 @@ import (
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v88/github"
 	"golang.org/x/crypto/nacl/box"
+
+	"munchbox/temporal-workers/shared"
 )
 
 // GitHubConfig configures a GitHub App-authenticated client. PrivateKeyPEM is
@@ -48,7 +50,7 @@ type GitHub struct {
 // installation ID when it isn't provided. The HTTP transport is
 // OTel-instrumented so GitHub calls appear as edges in the service graph.
 func NewGitHub(ctx context.Context, cfg GitHubConfig) (*GitHub, error) {
-	appTransport, err := ghinstallation.NewAppsTransport(otelTransport("github", nil), cfg.AppID, cfg.PrivateKeyPEM)
+	appTransport, err := ghinstallation.NewAppsTransport(shared.OTelTransport("github", nil), cfg.AppID, cfg.PrivateKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("github app transport: %w", err)
 	}
@@ -108,7 +110,7 @@ func (g *GitHub) SetRepoSecret(ctx context.Context, owner, repo, name, value str
 		return fmt.Errorf("mint secrets token for %s/%s: %w", owner, repo, err)
 	}
 	cli, err := github.NewClient(
-		github.WithTransport(otelTransport("github", nil)),
+		github.WithTransport(shared.OTelTransport("github", nil)),
 		github.WithAuthToken(tok.GetToken()),
 	)
 	if err != nil {

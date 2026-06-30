@@ -8,7 +8,7 @@
 // and a missing Workload Identity token surfaces ErrNoVaultToken.
 // -------------------------------------------------------------------------------
 
-package shared
+package vault
 
 import (
 	"crypto/ecdsa"

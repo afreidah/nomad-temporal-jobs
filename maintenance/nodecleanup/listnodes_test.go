@@ -17,17 +17,17 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/maintenance/internal/nodes"
-	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/nomad"
 )
 
 type fakeNomad struct {
-	nodes   []shared.NomadNode
+	nodes   []nomad.NomadNode
 	nodeErr error
 	jobs    map[string]struct{}
 	jobErr  error
 }
 
-func (f *fakeNomad) ClientNodes(_ context.Context) ([]shared.NomadNode, error) {
+func (f *fakeNomad) ClientNodes(_ context.Context) ([]nomad.NomadNode, error) {
 	return f.nodes, f.nodeErr
 }
 
@@ -36,7 +36,7 @@ func (f *fakeNomad) RunningJobIDs(_ context.Context, _ string) (map[string]struc
 }
 
 func TestGetAllNomadClientNodes(t *testing.T) {
-	a := &Activities{nomad: &fakeNomad{nodes: []shared.NomadNode{
+	a := &Activities{nomad: &fakeNomad{nodes: []nomad.NomadNode{
 		{ID: "n1", Name: "worker-1", Address: "10.0.0.1", HTTPAddr: "10.0.0.1:4646"},
 		{ID: "n2", Name: "oracle-arm-1", Address: "10.0.0.2", HTTPAddr: "10.0.0.2:4646"},
 	}}}

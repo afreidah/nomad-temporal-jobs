@@ -10,7 +10,7 @@
 // OTel-instrumented so Consul calls appear as edges in the Tempo service graph.
 // -------------------------------------------------------------------------------
 
-package shared
+package consul
 
 import (
 	"context"
@@ -20,6 +20,9 @@ import (
 	"os"
 
 	consulapi "github.com/hashicorp/consul/api"
+
+	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/vault"
 )
 
 // -------------------------------------------------------------------------
@@ -41,10 +44,10 @@ const (
 // token is read from Vault via vc. When vc is nil the token falls back to the
 // standard CONSUL_HTTP_TOKEN env var (local/test). Address and TLS come from
 // the CONSUL_* environment.
-func NewConsulClient(ctx context.Context, vc *VaultClient) (*consulapi.Client, error) {
+func NewConsulClient(ctx context.Context, vc *vault.VaultClient) (*consulapi.Client, error) {
 	cfg := consulapi.DefaultConfig()
 
-	cfg.HttpClient = &http.Client{Transport: otelTransport("consul", nil)}
+	cfg.HttpClient = &http.Client{Transport: shared.OTelTransport("consul", nil)}
 
 	if vc != nil {
 		path := os.Getenv("CONSUL_TOKEN_VAULT_PATH")
@@ -78,7 +81,7 @@ type Consul struct {
 
 // NewConsul builds a Consul service. Token sourcing follows NewConsulClient
 // (from Vault via vc, or CONSUL_HTTP_TOKEN when vc is nil).
-func NewConsul(ctx context.Context, vc *VaultClient) (*Consul, error) {
+func NewConsul(ctx context.Context, vc *vault.VaultClient) (*Consul, error) {
 	client, err := NewConsulClient(ctx, vc)
 	if err != nil {
 		return nil, err

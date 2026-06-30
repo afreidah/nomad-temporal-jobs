@@ -8,7 +8,7 @@
 // t.Context() cancels at test cleanup, stopping the goroutine.
 // -------------------------------------------------------------------------------
 
-package shared
+package vault
 
 import (
 	"log/slog"
