@@ -131,7 +131,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     SCHED: {
       title: 'Temporal Schedules',
       badge: 'entry', badgeText: 'scheduler',
-      body: '<p>Temporal Schedules start each workflow &mdash; mostly on cron (backup, trivy scan, node cleanup, registry GC, aptly cleanup, postgres maintenance, cert acquirer, github token renewer), plus the runner scaler on a short interval (~30s). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, cron/interval, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
+      body: '<p>Temporal Schedules start each workflow &mdash; all via calendar specs (backup, trivy scan, node cleanup, registry GC, aptly cleanup, postgres maintenance, cert acquirer, github token renewer on coarse crons; the runner scaler on a fine-grained <code>second=0,30</code> for a ~30s cadence). The server fires them; no trigger process is involved.</p><p>Defined as code in <code>infrastructure/terragrunt</code> (the <code>temporal-config</code> module via the <code>platacard/temporal</code> provider). Each schedule carries the workflow type, task queue, calendar spec, and a JSON <code>input</code> that deserializes into the workflow config struct.</p>'
     },
     TEMPORAL: {
       title: 'Temporal Server',
@@ -186,7 +186,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     RSTQ: {
       title: 'ci-runner-scaler-task-queue',
       badge: 'middleware', badgeText: 'task queue',
-      body: '<p>Temporal task queue for the runner-scaler workflows (<code>PollAndDispatch</code> parent + <code>HandleQueuedJob</code> children) and their activities. Only the runner-scaler worker polls this queue.</p><p>Fired on a short interval (~30s) rather than cron. Child workflows are keyed <code>runner-&lt;repo&gt;-&lt;job_id&gt;</code> with a reject-duplicate ID policy, so Temporal itself dedups one runner per job.</p>'
+      body: '<p>Temporal task queue for the runner-scaler workflows (<code>PollAndDispatch</code> parent + <code>HandleQueuedJob</code> children) and their activities. Only the runner-scaler worker polls this queue.</p><p>Fired ~every 30s via a fine-grained calendar spec (<code>second=0,30</code>). Child workflows are keyed <code>runner-&lt;repo&gt;-&lt;job_id&gt;</code> with a reject-duplicate ID policy, so Temporal itself dedups one runner per job.</p>'
     },
     RSWORKER: {
       title: 'Runner Scaler Worker',
