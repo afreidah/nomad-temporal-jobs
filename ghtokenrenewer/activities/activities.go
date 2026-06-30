@@ -17,7 +17,6 @@ package activities
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -25,6 +24,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/git"
 )
 
 // -------------------------------------------------------------------------
@@ -115,7 +115,7 @@ func (a *Activities) ListRepos(ctx context.Context) ([]string, error) {
 			fmt.Sprintf("consul kv key %q not found", a.cfg.RepoListKey), "RepoListMissing", nil)
 	}
 
-	repos := parseRepoList(string(raw))
+	repos := git.ParseRepoList(string(raw))
 	logger.Info("Loaded repo list", "key", a.cfg.RepoListKey, "count", len(repos))
 	return repos, nil
 }
@@ -131,7 +131,7 @@ func (a *Activities) RenewRepoToken(ctx context.Context, repo string) (RepoRenew
 		attribute.String("github.repo", repo))
 	defer span.End()
 
-	owner, name, ok := splitRepo(repo)
+	owner, name, ok := git.SplitRepo(repo)
 	if !ok {
 		return RepoRenewResult{}, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("invalid repo %q, want owner/repo", repo), "InvalidRepo", nil)
@@ -147,31 +147,4 @@ func (a *Activities) RenewRepoToken(ctx context.Context, repo string) (RepoRenew
 
 	logger.Info("Renewed repo token secret", "repo", repo, "secret", a.cfg.SecretName, "expires", expiry)
 	return RepoRenewResult{Repo: repo, ExpiresAt: expiry}, nil
-}
-
-// -------------------------------------------------------------------------
-// HELPERS
-// -------------------------------------------------------------------------
-
-// parseRepoList splits a newline-separated owner/repo list, dropping blank lines
-// and # comments and trimming surrounding whitespace.
-func parseRepoList(s string) []string {
-	var repos []string
-	for line := range strings.SplitSeq(s, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		repos = append(repos, line)
-	}
-	return repos
-}
-
-// splitRepo splits "owner/repo" into its two non-empty parts.
-func splitRepo(repo string) (owner, name string, ok bool) {
-	owner, name, ok = strings.Cut(strings.TrimSpace(repo), "/")
-	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-		return "", "", false
-	}
-	return owner, name, true
 }

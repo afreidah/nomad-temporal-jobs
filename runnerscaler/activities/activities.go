@@ -31,6 +31,9 @@ import (
 	"munchbox/temporal-workers/shared/client/nomad"
 )
 
+// attrGitHubRepo is the span attribute key for the owner/repo a call targets.
+const attrGitHubRepo = "github.repo"
+
 // -------------------------------------------------------------------------
 // CONSUMER INTERFACES
 // -------------------------------------------------------------------------
@@ -132,7 +135,7 @@ func (a *Activities) ListWatchedRepos(ctx context.Context) ([]string, error) {
 			fmt.Sprintf("consul kv key %q not found", a.cfg.RepoListKey), "RepoListMissing", nil)
 	}
 
-	repos := parseRepoList(string(raw))
+	repos := git.ParseRepoList(string(raw))
 	logger.Info("Loaded watched repos", "key", a.cfg.RepoListKey, "count", len(repos))
 	return repos, nil
 }
@@ -167,14 +170,14 @@ func (a *Activities) LoadProfiles(ctx context.Context) (map[string]Profile, erro
 // ListQueuedJobs returns the queued self-hosted Actions jobs for repo
 // ("owner/repo"). An unparseable repo is non-retryable.
 func (a *Activities) ListQueuedJobs(ctx context.Context, repo string) ([]git.QueuedJob, error) {
-	owner, name, ok := splitRepo(repo)
+	owner, name, ok := git.SplitRepo(repo)
 	if !ok {
 		return nil, temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("invalid repo %q, want owner/repo", repo), "InvalidRepo", nil)
 	}
 
 	ctx, span := shared.StartPeerSpan(ctx, "github", "github.list_queued_jobs",
-		attribute.String("github.repo", repo))
+		attribute.String(attrGitHubRepo, repo))
 	defer span.End()
 
 	jobs, err := a.cfg.GitHub.ListQueuedSelfHostedJobs(ctx, owner, name)
@@ -192,14 +195,14 @@ func (a *Activities) ListQueuedJobs(ctx context.Context, repo string) ([]git.Que
 func (a *Activities) DispatchRunner(ctx context.Context, spec DispatchSpec) (string, error) {
 	logger := activity.GetLogger(ctx)
 
-	owner, name, ok := splitRepo(spec.Repo)
+	owner, name, ok := git.SplitRepo(spec.Repo)
 	if !ok {
 		return "", temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("invalid repo %q, want owner/repo", spec.Repo), "InvalidRepo", nil)
 	}
 
 	tokCtx, span := shared.StartPeerSpan(ctx, "github", "github.create_runner_token",
-		attribute.String("github.repo", spec.Repo))
+		attribute.String(attrGitHubRepo, spec.Repo))
 	token, _, err := a.cfg.GitHub.CreateRunnerRegistrationToken(tokCtx, owner, name)
 	span.End()
 	if err != nil {
@@ -216,7 +219,7 @@ func (a *Activities) DispatchRunner(ctx context.Context, spec DispatchSpec) (str
 	}
 
 	dispCtx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.dispatch_job",
-		attribute.String("github.repo", spec.Repo))
+		attribute.String(attrGitHubRepo, spec.Repo))
 	defer span.End()
 
 	id, err := a.cfg.Nomad.DispatchJob(dispCtx, a.cfg.RunnerJobID, meta)
@@ -246,31 +249,4 @@ func (a *Activities) ReapRunner(ctx context.Context, dispatchedID string) error 
 	}
 	logger.Info("Reaped ephemeral runner", "job", dispatchedID)
 	return nil
-}
-
-// -------------------------------------------------------------------------
-// HELPERS
-// -------------------------------------------------------------------------
-
-// parseRepoList splits a newline-separated owner/repo list, dropping blank lines
-// and # comments and trimming surrounding whitespace.
-func parseRepoList(s string) []string {
-	var repos []string
-	for line := range strings.SplitSeq(s, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		repos = append(repos, line)
-	}
-	return repos
-}
-
-// splitRepo splits "owner/repo" into its two non-empty parts.
-func splitRepo(repo string) (owner, name string, ok bool) {
-	owner, name, ok = strings.Cut(strings.TrimSpace(repo), "/")
-	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-		return "", "", false
-	}
-	return owner, name, true
 }

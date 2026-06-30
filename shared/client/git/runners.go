@@ -93,41 +93,70 @@ func (g *GitHub) ListQueuedSelfHostedJobs(ctx context.Context, owner, repo strin
 		return nil, err
 	}
 
-	var out []QueuedJob
-	seen := make(map[int64]struct{})
+	var all []QueuedJob
 	for _, status := range []string{"queued", "in_progress"} {
-		runOpts := &github.ListWorkflowRunsOptions{
-			Status:      status,
-			ListOptions: github.ListOptions{PerPage: 100},
+		runIDs, err := listWorkflowRunIDs(ctx, cli, owner, repo, status)
+		if err != nil {
+			return nil, err
 		}
-		for run, err := range cli.Actions.ListRepositoryWorkflowRunsIter(ctx, owner, repo, runOpts) {
+		for _, runID := range runIDs {
+			jobs, err := queuedSelfHostedJobsForRun(ctx, cli, owner, repo, runID)
 			if err != nil {
-				return nil, fmt.Errorf("list %s runs for %s/%s: %w", status, owner, repo, err)
+				return nil, err
 			}
-			jobOpts := &github.ListWorkflowJobsOptions{
-				Filter:      "latest",
-				ListOptions: github.ListOptions{PerPage: 100},
-			}
-			for job, err := range cli.Actions.ListWorkflowJobsIter(ctx, owner, repo, run.GetID(), jobOpts) {
-				if err != nil {
-					return nil, fmt.Errorf("list jobs for run %d in %s/%s: %w", run.GetID(), owner, repo, err)
-				}
-				if job.GetStatus() != "queued" || !slices.Contains(job.Labels, selfHostedLabel) {
-					continue
-				}
-				id := job.GetID()
-				if _, dup := seen[id]; dup {
-					continue
-				}
-				seen[id] = struct{}{}
-				out = append(out, QueuedJob{
-					ID:     id,
-					RunID:  job.GetRunID(),
-					Name:   job.GetName(),
-					Labels: job.Labels,
-				})
-			}
+			all = append(all, jobs...)
 		}
 	}
-	return out, nil
+	return dedupByID(all), nil
+}
+
+// listWorkflowRunIDs returns the IDs of owner/repo's workflow runs in the given
+// status, following pagination.
+func listWorkflowRunIDs(ctx context.Context, cli *github.Client, owner, repo, status string) ([]int64, error) {
+	opts := &github.ListWorkflowRunsOptions{Status: status, ListOptions: github.ListOptions{PerPage: 100}}
+	var ids []int64
+	for run, err := range cli.Actions.ListRepositoryWorkflowRunsIter(ctx, owner, repo, opts) {
+		if err != nil {
+			return nil, fmt.Errorf("list %s runs for %s/%s: %w", status, owner, repo, err)
+		}
+		ids = append(ids, run.GetID())
+	}
+	return ids, nil
+}
+
+// queuedSelfHostedJobsForRun returns runID's jobs that are still queued and ask
+// for a self-hosted runner.
+func queuedSelfHostedJobsForRun(ctx context.Context, cli *github.Client, owner, repo string, runID int64) ([]QueuedJob, error) {
+	opts := &github.ListWorkflowJobsOptions{Filter: "latest", ListOptions: github.ListOptions{PerPage: 100}}
+	var jobs []QueuedJob
+	for job, err := range cli.Actions.ListWorkflowJobsIter(ctx, owner, repo, runID, opts) {
+		if err != nil {
+			return nil, fmt.Errorf("list jobs for run %d in %s/%s: %w", runID, owner, repo, err)
+		}
+		if job.GetStatus() != "queued" || !slices.Contains(job.Labels, selfHostedLabel) {
+			continue
+		}
+		jobs = append(jobs, QueuedJob{
+			ID:     job.GetID(),
+			RunID:  job.GetRunID(),
+			Name:   job.GetName(),
+			Labels: job.Labels,
+		})
+	}
+	return jobs, nil
+}
+
+// dedupByID drops jobs with a repeated ID, keeping first-seen order (the same
+// job can surface under both the queued and in_progress run sweeps).
+func dedupByID(jobs []QueuedJob) []QueuedJob {
+	seen := make(map[int64]struct{}, len(jobs))
+	out := jobs[:0]
+	for _, j := range jobs {
+		if _, dup := seen[j.ID]; dup {
+			continue
+		}
+		seen[j.ID] = struct{}{}
+		out = append(out, j)
+	}
+	return out
 }

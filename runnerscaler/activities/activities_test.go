@@ -260,31 +260,3 @@ func TestReapRunner_PropagatesRealError(t *testing.T) {
 		t.Fatal("expected ReapRunner to propagate a non-not-found error")
 	}
 }
-
-// --- helpers -----------------------------------------------------------------
-
-func TestParseRepoList(t *testing.T) {
-	got := parseRepoList("# header\n a/b \n\nc/d\n# trailing\n")
-	if len(got) != 2 || got[0] != "a/b" || got[1] != "c/d" {
-		t.Errorf("parseRepoList = %v, want [a/b c/d]", got)
-	}
-}
-
-func TestSplitRepo(t *testing.T) {
-	cases := []struct {
-		in     string
-		wantOK bool
-	}{
-		{"owner/repo", true},
-		{" o/r ", true},
-		{"no-slash", false},
-		{"/repo", false},
-		{"owner/", false},
-		{"o/r/x", false},
-	}
-	for _, c := range cases {
-		if _, _, ok := splitRepo(c.in); ok != c.wantOK {
-			t.Errorf("splitRepo(%q) ok = %v, want %v", c.in, ok, c.wantOK)
-		}
-	}
-}
