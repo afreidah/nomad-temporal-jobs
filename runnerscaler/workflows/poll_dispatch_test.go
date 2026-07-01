@@ -159,6 +159,7 @@ func TestHandleRunner_DispatchThenReap(t *testing.T) {
 
 	var reaped string
 	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("ci-runner/dispatch-1-abc", nil)
+	env.OnActivity(a.WaitRunnerDone, mock.Anything, mock.Anything).Return(nil) // runner finished cleanly
 	env.OnActivity(a.ReapRunner, mock.Anything, mock.Anything).Return(
 		func(_ context.Context, id string) error { reaped = id; return nil })
 
@@ -173,10 +174,34 @@ func TestHandleRunner_DispatchThenReap(t *testing.T) {
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// The test env auto-fires the backstop timer, so the reap runs against the
+	// Once WaitRunnerDone reports the runner terminal, the reap runs against the
 	// dispatched job ID.
 	if reaped != "ci-runner/dispatch-1-abc" {
 		t.Errorf("reaped %q, want the dispatched job id", reaped)
+	}
+}
+
+func TestHandleRunner_WaitBackstopStillReaps(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	// The wait ends in error (backstop deadline / wedged runner) -- the workflow
+	// must still reap and complete cleanly, never orphaning the Nomad job.
+	var reaped string
+	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("ci-runner/dispatch-1-abc", nil)
+	env.OnActivity(a.WaitRunnerDone, mock.Anything, mock.Anything).Return(errors.New("backstop deadline"))
+	env.OnActivity(a.ReapRunner, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, id string) error { reaped = id; return nil })
+
+	env.ExecuteWorkflow(HandleRunner, RunnerSpec{Repo: "octo/widget", Labels: []string{"self-hosted"}})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("a wait timeout should still reap, not fail the workflow: %v", err)
+	}
+	if reaped != "ci-runner/dispatch-1-abc" {
+		t.Errorf("reaped %q, want the dispatched job id even after a wait backstop", reaped)
 	}
 }
 
@@ -220,6 +245,7 @@ func TestHandleRunner_ReapError(t *testing.T) {
 	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
 
 	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("ci-runner/dispatch-1-abc", nil)
+	env.OnActivity(a.WaitRunnerDone, mock.Anything, mock.Anything).Return(nil)
 	env.OnActivity(a.ReapRunner, mock.Anything, mock.Anything).Return(errors.New("stop failed"))
 
 	env.ExecuteWorkflow(HandleRunner, RunnerSpec{Repo: "octo/widget", Labels: []string{"self-hosted"}})

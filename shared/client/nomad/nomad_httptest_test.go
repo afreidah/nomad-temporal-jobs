@@ -254,3 +254,50 @@ func TestNomad_ActiveRunnerSlots_ListError(t *testing.T) {
 		t.Fatal("expected an error when the allocation list call fails")
 	}
 }
+
+func TestNomad_RunnerTerminal(t *testing.T) {
+	h := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		p := r.URL.Path
+		switch {
+		case strings.Contains(p, "running-job/allocations"):
+			_ = enc.Encode([]*api.AllocationListStub{{ID: "a", ClientStatus: api.AllocClientStatusRunning}})
+		case strings.Contains(p, "done-job/allocations"):
+			_ = enc.Encode([]*api.AllocationListStub{{ID: "a", ClientStatus: api.AllocClientStatusComplete}})
+		case strings.Contains(p, "empty-job/allocations"):
+			_ = enc.Encode([]*api.AllocationListStub{})
+		case strings.Contains(p, "gone-job/allocations"):
+			http.Error(w, `{"error":"job not found"}`, http.StatusNotFound)
+		case strings.Contains(p, "boom-job/allocations"):
+			http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+		default:
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		}
+	}
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+	n := testNomad(t, ts)
+	ctx := context.Background()
+
+	cases := []struct {
+		job      string
+		wantDone bool
+		wantErr  bool
+	}{
+		{"running-job", false, false}, // an alloc still running
+		{"done-job", true, false},     // all allocs terminal
+		{"empty-job", false, false},   // dispatched, not scheduled yet
+		{"gone-job", true, false},     // job not found -> already gone
+		{"boom-job", false, true},     // API error surfaces
+	}
+	for _, c := range cases {
+		done, err := n.RunnerTerminal(ctx, c.job)
+		if (err != nil) != c.wantErr {
+			t.Errorf("%s: err = %v, wantErr %v", c.job, err, c.wantErr)
+		}
+		if err == nil && done != c.wantDone {
+			t.Errorf("%s: done = %v, want %v", c.job, done, c.wantDone)
+		}
+	}
+}

@@ -61,7 +61,12 @@ type jobDispatcher interface {
 	DispatchJob(ctx context.Context, jobID string, meta map[string]string) (dispatchedID string, err error)
 	StopJob(ctx context.Context, jobID string) error
 	ActiveRunnerSlots(ctx context.Context, parentJobID string) ([]nomad.RunnerSlot, error)
+	RunnerTerminal(ctx context.Context, jobID string) (done bool, err error)
 }
+
+// waitPollInterval is how often WaitRunnerDone re-checks the dispatched runner.
+// A var so tests can shorten it.
+var waitPollInterval = 5 * time.Second
 
 // -------------------------------------------------------------------------
 // CONFIG AND CONSTRUCTOR
@@ -276,6 +281,39 @@ func splitLabels(s string) []string {
 		return nil
 	}
 	return strings.Split(s, ",")
+}
+
+// WaitRunnerDone blocks until the dispatched runner job reaches a terminal state
+// (all allocations finished, or the job is gone), heartbeating while it polls,
+// so the caller can reap promptly instead of waiting out the whole backstop.
+// Transient poll errors are logged and retried -- only a terminal runner or a
+// cancelled/timed-out context ends the wait, so a blip never triggers an early
+// reap of a still-running runner. The activity's StartToCloseTimeout is the
+// backstop ceiling: a wedged runner times the activity out and the caller reaps
+// anyway.
+func (a *Activities) WaitRunnerDone(ctx context.Context, dispatchedID string) error {
+	logger := activity.GetLogger(ctx)
+
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.wait_runner",
+		attribute.String("nomad.job", dispatchedID))
+	defer span.End()
+
+	for {
+		done, err := a.cfg.Nomad.RunnerTerminal(ctx, dispatchedID)
+		switch {
+		case err != nil:
+			logger.Warn("Runner wait poll failed; retrying", "job", dispatchedID, "error", err)
+		case done:
+			logger.Info("Runner finished", "job", dispatchedID)
+			return nil
+		}
+		activity.RecordHeartbeat(ctx, dispatchedID)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(waitPollInterval):
+		}
+	}
 }
 
 // ReapRunner stops the dispatched runner job. A job that is already gone (picked

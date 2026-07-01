@@ -56,6 +56,14 @@ type fakeNomad struct {
 	slots          []nomad.RunnerSlot
 	slotsErr       error
 	dispatchErr    error
+	runnerTerminal func() (bool, error)
+}
+
+func (f *fakeNomad) RunnerTerminal(_ context.Context, _ string) (bool, error) {
+	if f.runnerTerminal != nil {
+		return f.runnerTerminal()
+	}
+	return true, nil
 }
 
 func (f *fakeNomad) DispatchJob(_ context.Context, jobID string, meta map[string]string) (string, error) {
@@ -293,6 +301,56 @@ func TestReapRunner_PropagatesRealError(t *testing.T) {
 	env.RegisterActivity(a.ReapRunner)
 	if _, err := env.ExecuteActivity(a.ReapRunner, "x"); err == nil {
 		t.Fatal("expected ReapRunner to propagate a non-not-found error")
+	}
+}
+
+// --- WaitRunnerDone ----------------------------------------------------------
+
+func TestWaitRunnerDone(t *testing.T) {
+	// Shorten the poll so the loop runs fast under test.
+	old := waitPollInterval
+	waitPollInterval = time.Millisecond
+	defer func() { waitPollInterval = old }()
+
+	calls := 0
+	nm := &fakeNomad{runnerTerminal: func() (bool, error) {
+		calls++
+		switch calls {
+		case 1:
+			return false, errors.New("nomad blip") // transient: skipped + retried
+		case 2:
+			return false, nil // scheduled but still running
+		default:
+			return true, nil // finished
+		}
+	}}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.WaitRunnerDone)
+
+	if _, err := env.ExecuteActivity(a.WaitRunnerDone, "ci-runner/dispatch-1-abc"); err != nil {
+		t.Fatalf("WaitRunnerDone: %v", err)
+	}
+	if calls < 3 {
+		t.Errorf("polled %d times, want >=3 (skip blip -> not done -> done)", calls)
+	}
+}
+
+func TestWaitRunnerDone_ContextCancelled(t *testing.T) {
+	old := waitPollInterval
+	waitPollInterval = time.Millisecond
+	defer func() { waitPollInterval = old }()
+
+	// Never terminal -> the wait runs until the (backstop) deadline cancels the
+	// context, and the activity surfaces that as an error so the caller reaps.
+	nm := &fakeNomad{runnerTerminal: func() (bool, error) { return false, nil }}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.SetTestTimeout(50 * time.Millisecond)
+	env.RegisterActivity(a.WaitRunnerDone)
+
+	if _, err := env.ExecuteActivity(a.WaitRunnerDone, "ci-runner/dispatch-1-abc"); err == nil {
+		t.Fatal("expected WaitRunnerDone to error when the context is cancelled (backstop deadline)")
 	}
 }
 

@@ -336,6 +336,30 @@ func metaString(m map[string]string, key string) string {
 	return m[key]
 }
 
+// RunnerTerminal reports whether a dispatched runner job has finished: every
+// allocation is in a terminal client status, or the job is already gone. A job
+// with no allocations yet (dispatched but not scheduled) is not terminal, so a
+// caller polling this waits for the runner to actually run before reaping --
+// never reaping one still pending or mid-job.
+func (n *Nomad) RunnerTerminal(ctx context.Context, jobID string) (bool, error) {
+	allocs, _, err := n.client.Jobs().Allocations(jobID, false, (&api.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		if IsJobNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if len(allocs) == 0 {
+		return false, nil
+	}
+	for _, al := range allocs {
+		if al.ClientStatus == api.AllocClientStatusPending || al.ClientStatus == api.AllocClientStatusRunning {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // IsJobNotFound reports whether err indicates a Nomad job does not exist (the
 // API returns HTTP 404 / "job not found"). It prefers the typed
 // api.UnexpectedResponseError status code and falls back to string matching,
