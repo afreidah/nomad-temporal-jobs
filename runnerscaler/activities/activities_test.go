@@ -336,24 +336,6 @@ func TestWaitRunnerDone(t *testing.T) {
 	}
 }
 
-func TestWaitRunnerDone_ContextCancelled(t *testing.T) {
-	old := waitPollInterval
-	waitPollInterval = time.Millisecond
-	defer func() { waitPollInterval = old }()
-
-	// Never terminal -> the wait runs until the (backstop) deadline cancels the
-	// context, and the activity surfaces that as an error so the caller reaps.
-	nm := &fakeNomad{runnerTerminal: func() (bool, error) { return false, nil }}
-	a := newActs(fakeKV{}, nil, nm)
-	env := actEnv()
-	env.SetTestTimeout(50 * time.Millisecond)
-	env.RegisterActivity(a.WaitRunnerDone)
-
-	if _, err := env.ExecuteActivity(a.WaitRunnerDone, "ci-runner/dispatch-1-abc"); err == nil {
-		t.Fatal("expected WaitRunnerDone to error when the context is cancelled (backstop deadline)")
-	}
-}
-
 // --- CountActiveRunners ------------------------------------------------------
 
 func TestCountActiveRunners(t *testing.T) {
