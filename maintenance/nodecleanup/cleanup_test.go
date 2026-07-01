@@ -53,6 +53,68 @@ func TestCleanupNodeViaSSH_DockerPruneError(t *testing.T) {
 	}
 }
 
+// runCleanupCfg runs CleanupNodeViaSSH with an explicit config against host.
+func runCleanupCfg(t *testing.T, host ssh.RemoteHost, cfg CleanupConfig) CleanupResult {
+	t.Helper()
+	a := New(&fakeNomad{}, &fakeConnector{host: host})
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(a.CleanupNodeViaSSH)
+	val, err := env.ExecuteActivity(a.CleanupNodeViaSSH, nodes.NodeInfo{Name: "n1"}, cfg)
+	if err != nil {
+		t.Fatalf("CleanupNodeViaSSH: %v", err)
+	}
+	var r CleanupResult
+	if err := val.Get(&r); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return r
+}
+
+// A successful containerd prune reports the reclaimed space.
+func TestCleanupNodeViaSSH_ContainerdPrune(t *testing.T) {
+	host := &fakeRemoteHost{ctrdResult: ssh.ContainerdPruneResult{Deleted: 3, Reclaimed: 2048}}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", ContainerdPrune: true})
+	if !host.ctrdCalled {
+		t.Fatal("ContainerdPrune was not called")
+	}
+	if r.ContainerdSpaceFreed == "0B" {
+		t.Errorf("ContainerdSpaceFreed = %q, want reclaimed size", r.ContainerdSpaceFreed)
+	}
+}
+
+// A store-aware skip is surfaced, not treated as an error.
+func TestCleanupNodeViaSSH_ContainerdPruneSkipped(t *testing.T) {
+	host := &fakeRemoteHost{ctrdResult: ssh.ContainerdPruneResult{Skipped: true, Reason: "containerd is live"}}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", ContainerdPrune: true})
+	if !r.ContainerdSkipped || r.ContainerdSkipReason != "containerd is live" {
+		t.Errorf("skip not surfaced: skipped=%v reason=%q", r.ContainerdSkipped, r.ContainerdSkipReason)
+	}
+	if r.ContainerdSpaceFreed != "0B" {
+		t.Errorf("skipped prune ContainerdSpaceFreed = %q, want 0B", r.ContainerdSpaceFreed)
+	}
+}
+
+// Dry-run passes dryRun through and frees nothing.
+func TestCleanupNodeViaSSH_ContainerdPruneDryRun(t *testing.T) {
+	host := &fakeRemoteHost{ctrdResult: ssh.ContainerdPruneResult{Candidates: 5}}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", DryRun: true, ContainerdPrune: true})
+	if !host.ctrdDryRun {
+		t.Error("ContainerdPrune should have been called with dryRun=true")
+	}
+	if r.ContainerdSpaceFreed != "0B" {
+		t.Errorf("dry-run ContainerdSpaceFreed = %q, want 0B", r.ContainerdSpaceFreed)
+	}
+}
+
+// A containerd client error is reported in the output, not fatal to the node.
+func TestCleanupNodeViaSSH_ContainerdPruneError(t *testing.T) {
+	host := &fakeRemoteHost{ctrdErr: errors.New("containerd unreachable")}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", ContainerdPrune: true})
+	if r.ContainerdSpaceFreed != "0B" {
+		t.Errorf("on error ContainerdSpaceFreed = %q, want 0B", r.ContainerdSpaceFreed)
+	}
+}
+
 // fakeFileInfo is a directory entry with a controllable name and mtime.
 type fakeFileInfo struct {
 	name  string
@@ -67,12 +129,16 @@ func (f fakeFileInfo) IsDir() bool        { return true }
 func (f fakeFileInfo) Sys() any           { return nil }
 
 type fakeRemoteHost struct {
-	entries   []os.FileInfo
-	readErr   error
-	removed   []string
-	reclaimed uint64
-	warnings  []string
-	pruneErr  error
+	entries    []os.FileInfo
+	readErr    error
+	removed    []string
+	reclaimed  uint64
+	warnings   []string
+	pruneErr   error
+	ctrdResult ssh.ContainerdPruneResult
+	ctrdErr    error
+	ctrdDryRun bool // records the dryRun arg ContainerdPrune was called with
+	ctrdCalled bool
 }
 
 func (f *fakeRemoteHost) Close() error                          { return nil }
@@ -80,6 +146,11 @@ func (f *fakeRemoteHost) ReadDir(string) ([]os.FileInfo, error) { return f.entri
 func (f *fakeRemoteHost) RemoveAll(p string) error              { f.removed = append(f.removed, p); return nil }
 func (f *fakeRemoteHost) DockerSystemPrune(context.Context) (uint64, []string, error) {
 	return f.reclaimed, f.warnings, f.pruneErr
+}
+func (f *fakeRemoteHost) ContainerdPrune(_ context.Context, dryRun bool) (ssh.ContainerdPruneResult, error) {
+	f.ctrdCalled = true
+	f.ctrdDryRun = dryRun
+	return f.ctrdResult, f.ctrdErr
 }
 
 type fakeConnector struct {

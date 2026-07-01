@@ -61,23 +61,27 @@ func New(nomad nomadClient, host ssh.HostConnector) *Activities {
 
 // CleanupConfig holds workflow-level configuration passed as input.
 type CleanupConfig struct {
-	DataDir     string `json:"data_dir"`     // Base directory to scan (default: /opt/nomad/data)
-	GraceDays   int    `json:"grace_days"`   // Only delete directories older than this (default: 7)
-	DryRun      bool   `json:"dry_run"`      // If true, only report what would be deleted
-	DockerPrune bool   `json:"docker_prune"` // If true, also prune unused Docker images
+	DataDir         string `json:"data_dir"`         // Base directory to scan (default: /opt/nomad/data)
+	GraceDays       int    `json:"grace_days"`       // Only delete directories older than this (default: 7)
+	DryRun          bool   `json:"dry_run"`          // If true, only report what would be deleted
+	DockerPrune     bool   `json:"docker_prune"`     // If true, also prune unused Docker images
+	ContainerdPrune bool   `json:"containerd_prune"` // If true, also reclaim the orphaned containerd moby image store
 }
 
 // CleanupResult holds the outcome of a cleanup operation on a single node.
 type CleanupResult struct {
-	NodeName         string   `json:"node_name"`
-	NodeAddr         string   `json:"node_addr"`
-	Scanned          int      `json:"scanned"`
-	Orphaned         int      `json:"orphaned"`
-	Deleted          int      `json:"deleted"`
-	Skipped          int      `json:"skipped"`
-	DockerSpaceFreed string   `json:"docker_space_freed"`
-	Errors           []string `json:"errors,omitempty"`
-	Output           string   `json:"output"`
+	NodeName             string   `json:"node_name"`
+	NodeAddr             string   `json:"node_addr"`
+	Scanned              int      `json:"scanned"`
+	Orphaned             int      `json:"orphaned"`
+	Deleted              int      `json:"deleted"`
+	Skipped              int      `json:"skipped"`
+	DockerSpaceFreed     string   `json:"docker_space_freed"`
+	ContainerdSpaceFreed string   `json:"containerd_space_freed"`
+	ContainerdSkipped    bool     `json:"containerd_skipped,omitempty"`
+	ContainerdSkipReason string   `json:"containerd_skip_reason,omitempty"`
+	Errors               []string `json:"errors,omitempty"`
+	Output               string   `json:"output"`
 }
 
 // -------------------------------------------------------------------------
@@ -121,7 +125,7 @@ func (a *Activities) GetAllNomadClientNodes(ctx context.Context) ([]nodes.NodeIn
 // would be deleted without removing anything.
 func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo, config CleanupConfig) (CleanupResult, error) {
 	logger := activity.GetLogger(ctx)
-	result := CleanupResult{NodeName: node.Name, NodeAddr: node.Address, DockerSpaceFreed: "0B"}
+	result := CleanupResult{NodeName: node.Name, NodeAddr: node.Address, DockerSpaceFreed: "0B", ContainerdSpaceFreed: "0B"}
 
 	// Running jobs on this node, straight from the Nomad API.
 	running, err := a.runningJobs(ctx, node.ID)
@@ -180,6 +184,14 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 		freed, dockerOut := a.dockerPrune(ctx, conn, config.DryRun)
 		result.DockerSpaceFreed = freed
 		out.WriteString(dockerOut)
+	}
+
+	if config.ContainerdPrune {
+		space, skipped, reason, note := a.containerdPrune(ctx, conn, config.DryRun)
+		result.ContainerdSpaceFreed = space
+		result.ContainerdSkipped = skipped
+		result.ContainerdSkipReason = reason
+		out.WriteString(note)
 	}
 
 	result.Output = out.String()
@@ -270,6 +282,18 @@ func classifyEntry(e dirEntry, running map[string]struct{}, cfg CleanupConfig, n
 	return entryOrphan, ageDays
 }
 
+// pruneHeartbeat keeps a long image prune under the activity's HeartbeatTimeout.
+// A multi-GB docker prune or a containerd store reclaim can run past the scan
+// loop's per-directory heartbeat, so the prune calls heartbeat on their own.
+const pruneHeartbeat = 30 * time.Second
+
+// dockerPruneOutput bundles DockerSystemPrune's results so the call can run
+// under a single-value heartbeat wrapper.
+type dockerPruneOutput struct {
+	reclaimed uint64
+	warnings  []string
+}
+
 // dockerPrune reclaims unused Docker resources on the node through the Docker
 // API (tunneled over conn) -- the equivalent of `docker system prune -af`. In
 // dry-run it does nothing. Returns the reclaimed-space string and a log
@@ -279,7 +303,11 @@ func (a *Activities) dockerPrune(ctx context.Context, conn ssh.RemoteHost, dryRu
 		return "0B", "=== Docker Cleanup (dry run; skipped) ===\n"
 	}
 
-	reclaimed, warnings, err := conn.DockerSystemPrune(ctx)
+	res, err := shared.WithHeartbeat(ctx, pruneHeartbeat, func() (dockerPruneOutput, error) {
+		reclaimed, warnings, e := conn.DockerSystemPrune(ctx)
+		return dockerPruneOutput{reclaimed: reclaimed, warnings: warnings}, e
+	})
+	reclaimed, warnings := res.reclaimed, res.warnings
 	if err != nil {
 		return "0B", "=== Docker Cleanup ===\ndocker client: " + err.Error() + "\n"
 	}
@@ -292,4 +320,35 @@ func (a *Activities) dockerPrune(ctx context.Context, conn ssh.RemoteHost, dryRu
 	freed := nodes.HumanBytes(int64(reclaimed))
 	fmt.Fprintf(&note, "reclaimed %s\n", freed)
 	return freed, note.String()
+}
+
+// containerdPrune reclaims the orphaned containerd moby image store on the node
+// through the containerd API (tunneled over conn). It is store-aware: the prune
+// skips itself when containerd is docker's live image store. In dry-run it
+// reports the candidate count without deleting. Returns the reclaimed-space
+// string, whether it was skipped, the skip reason, and a log fragment.
+func (a *Activities) containerdPrune(ctx context.Context, conn ssh.RemoteHost, dryRun bool) (space string, skipped bool, reason string, note string) {
+	res, err := shared.WithHeartbeat(ctx, pruneHeartbeat, func() (ssh.ContainerdPruneResult, error) {
+		return conn.ContainerdPrune(ctx, dryRun)
+	})
+	if err != nil {
+		return "0B", false, "", "=== Containerd Cleanup ===\ncontainerd client: " + err.Error() + "\n"
+	}
+
+	var out strings.Builder
+	out.WriteString("=== Containerd Cleanup ===\n")
+	if res.Skipped {
+		fmt.Fprintf(&out, "skipped: %s\n", res.Reason)
+		return "0B", true, res.Reason, out.String()
+	}
+	for _, w := range res.Warnings {
+		out.WriteString(w + "\n")
+	}
+	if dryRun {
+		fmt.Fprintf(&out, "dry run: %d image(s) would be deleted\n", res.Candidates)
+		return "0B", false, "", out.String()
+	}
+	freed := nodes.HumanBytes(int64(res.Reclaimed))
+	fmt.Fprintf(&out, "deleted %d image(s), reclaimed %s\n", res.Deleted, freed)
+	return freed, false, "", out.String()
 }

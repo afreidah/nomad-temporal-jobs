@@ -51,6 +51,13 @@ type RemoteHost interface {
 	// `docker system prune -af`. Returns the total bytes reclaimed and a
 	// per-step warning list (a failed individual prune is reported, not fatal).
 	DockerSystemPrune(ctx context.Context) (reclaimed uint64, warnings []string, err error)
+	// ContainerdPrune reclaims the orphaned containerd "moby"-namespace image
+	// store -- the duplicate left when docker runs on overlay2 while containerd
+	// still holds moby images that `docker system prune` can't reach. It is
+	// store-aware: it skips (Skipped=true) when docker's live store is not
+	// overlay2, so it never deletes a live image. dryRun reports candidates
+	// without deleting.
+	ContainerdPrune(ctx context.Context, dryRun bool) (ContainerdPruneResult, error)
 }
 
 // Compile-time proof the SSH transport implements every capability.

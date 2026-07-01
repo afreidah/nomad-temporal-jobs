@@ -36,7 +36,8 @@ func Cleanup(ctx workflow.Context, config CleanupConfig) ([]CleanupResult, error
 		"dataDir", config.DataDir,
 		"graceDays", config.GraceDays,
 		"dryRun", config.DryRun,
-		"dockerPrune", config.DockerPrune)
+		"dockerPrune", config.DockerPrune,
+		"containerdPrune", config.ContainerdPrune)
 
 	// Apply defaults
 	if config.DataDir == "" {
@@ -95,9 +96,9 @@ func Cleanup(ctx workflow.Context, config CleanupConfig) ([]CleanupResult, error
 	// --- Summary ---
 	totalOrphaned := 0
 	totalDeleted := 0
-	for _, r := range results {
-		totalOrphaned += r.Orphaned
-		totalDeleted += r.Deleted
+	for i := range results {
+		totalOrphaned += results[i].Orphaned
+		totalDeleted += results[i].Deleted
 	}
 
 	logger.Info("Cleanup workflow complete",
