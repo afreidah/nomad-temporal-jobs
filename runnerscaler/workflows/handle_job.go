@@ -3,14 +3,16 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// HandleQueuedJob backs a single queued self-hosted Actions job: dispatch one
-// ephemeral ci-runner for it, then arm a backstop timer that reaps the runner if
-// it is still around after the deadline. The runner is ephemeral, so on the
-// happy path it takes the job and self-deregisters long before the timer fires,
-// and the reap simply finds the Nomad job already gone. The dispatch runs under
-// NoRetry: it creates a new runner each call, so a retried dispatch would double
-// up. One child per job (keyed by the parent with a reject-duplicate ID) means a
-// job that stays queued across ticks never gets a second runner.
+// HandleRunner dispatches one ephemeral ci-runner for a (repo, labels) bucket,
+// waits for that runner's alloc to go terminal, then reaps it -- so the child
+// completes (and the dead dispatched job is purged) promptly after the CI job
+// finishes rather than lingering for the full backstop. reapAfter is now the
+// wait's ceiling: a runner that wedges or never claims a job times the wait out
+// and is reaped anyway. The dispatch runs under NoRetry: it creates a new runner
+// each call, so a retried dispatch would double up. The runner is NOT bound to a
+// specific job_id -- it takes whichever matching job is queued -- so the parent
+// poller decides how many of these to start by reconciling queued depth against
+// active runners, not by keying one child per job.
 // -------------------------------------------------------------------------------
 
 package workflows
@@ -25,26 +27,26 @@ import (
 	"munchbox/temporal-workers/shared"
 )
 
-// defaultReapAfter is the backstop runner lifetime: a generous upper bound on a
-// single CI job, after which a still-present runner is assumed wedged or never
-// claimed and is reaped. Sized as a ceiling, not a tight reap -- it must exceed
-// the longest legitimate job so a busy runner is never killed mid-build.
+// defaultReapAfter is the backstop ceiling on the terminal-wait: an upper bound
+// on a single CI job, after which a still-running runner is assumed wedged and is
+// reaped. On the happy path the wait returns as soon as the runner finishes, well
+// before this; it must exceed the longest legitimate job so a busy runner is
+// never killed mid-build.
 const defaultReapAfter = time.Hour
 
-// JobSpec is the child input: the repo and GitHub job it backs, the labels to
-// register the runner with, the profile image (empty => the Nomad job default),
-// and an optional reap override (0 => defaultReapAfter).
-type JobSpec struct {
+// RunnerSpec is the child input: the repo the runner serves, the labels to
+// register it with, the profile image (empty => the Nomad job default), and an
+// optional reap override (0 => defaultReapAfter).
+type RunnerSpec struct {
 	Repo      string        `json:"repo"`
-	JobID     int64         `json:"job_id"`
 	Labels    []string      `json:"labels"`
 	Image     string        `json:"image,omitempty"`
 	ReapAfter time.Duration `json:"reap_after,omitempty"`
 }
 
-// HandleQueuedJob dispatches an ephemeral runner for spec's queued job and reaps
-// it after the backstop deadline.
-func HandleQueuedJob(ctx workflow.Context, spec JobSpec) error {
+// HandleRunner dispatches one ephemeral runner for spec's (repo, labels) and
+// reaps it after the backstop deadline.
+func HandleRunner(ctx workflow.Context, spec RunnerSpec) error {
 	logger := workflow.GetLogger(ctx)
 
 	// Dispatch must not be retried: it creates a new runner each attempt, so a
@@ -58,22 +60,29 @@ func HandleQueuedJob(ctx workflow.Context, spec JobSpec) error {
 	var dispatchedID string
 	err := workflow.ExecuteActivity(dispatchCtx, a.DispatchRunner, activities.DispatchSpec{
 		Repo:   spec.Repo,
-		JobID:  spec.JobID,
 		Labels: spec.Labels,
 		Image:  spec.Image,
 	}).Get(dispatchCtx, &dispatchedID)
 	if err != nil {
-		return fmt.Errorf("dispatch runner for %s job %d: %w", spec.Repo, spec.JobID, err)
+		return fmt.Errorf("dispatch runner for %s: %w", spec.Repo, err)
 	}
 
 	reapAfter := spec.ReapAfter
 	if reapAfter <= 0 {
 		reapAfter = defaultReapAfter
 	}
-	// Wait out the backstop. A cancellation here (operator terminate) still falls
-	// through to the reap below so the dispatched runner is never orphaned.
-	if err := workflow.NewTimer(ctx, reapAfter).Get(ctx, nil); err != nil {
-		logger.Info("Reap timer interrupted; reaping now", "job", dispatchedID, "error", err)
+	// Wait until the runner's alloc goes terminal so we reap promptly, with
+	// reapAfter as the backstop ceiling (StartToCloseTimeout): a wedged runner
+	// times the wait out and we reap anyway. NoRetry -- a timeout means "reap
+	// now", not "wait another ceiling". A cancellation (operator terminate) also
+	// falls through to the reap below so the dispatched runner is never orphaned.
+	waitCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: reapAfter,
+		HeartbeatTimeout:    time.Minute,
+		RetryPolicy:         shared.NoRetry(),
+	})
+	if err := workflow.ExecuteActivity(waitCtx, a.WaitRunnerDone, dispatchedID).Get(waitCtx, nil); err != nil {
+		logger.Info("Runner wait ended early (backstop deadline or cancellation); reaping now", "job", dispatchedID, "error", err)
 	}
 
 	// Reap on a disconnected context so a closing/cancelled workflow can still

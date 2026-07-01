@@ -183,3 +183,121 @@ func TestNomad_ListError(t *testing.T) {
 		t.Fatal("expected an error when the node list call fails")
 	}
 }
+
+// activeRunnersStub serves an allocation list mixing dispatched runner children
+// (active and finished), an unrelated job, and children whose job info is either
+// meta-less or errors -- so ActiveRunnerSlots's filter, meta read, and skip
+// paths are all exercised.
+func activeRunnersStub() *httptest.Server {
+	h := func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		switch {
+		case p == "/v1/allocations":
+			_ = enc.Encode([]*api.AllocationListStub{
+				{ID: "r1", JobID: "ci-runner/dispatch-100-aaa", ClientStatus: api.AllocClientStatusRunning},
+				{ID: "r2", JobID: "ci-runner/dispatch-200-bbb", ClientStatus: api.AllocClientStatusPending},
+				{ID: "r3", JobID: "ci-runner/dispatch-300-ccc", ClientStatus: api.AllocClientStatusComplete}, // finished: skipped
+				{ID: "x1", JobID: "unrelated-job", ClientStatus: api.AllocClientStatusRunning},               // wrong prefix: skipped
+				{ID: "r4", JobID: "ci-runner/dispatch-400-ddd", ClientStatus: api.AllocClientStatusRunning},  // job info 500: skipped
+				{ID: "r5", JobID: "ci-runner/dispatch-500-eee", ClientStatus: api.AllocClientStatusRunning},  // no meta: empty slot
+			})
+		case strings.Contains(p, "dispatch-100"):
+			_ = enc.Encode(&api.Job{Meta: map[string]string{"repo_url": "https://github.com/octo/a", "labels": "self-hosted"}})
+		case strings.Contains(p, "dispatch-200"):
+			_ = enc.Encode(&api.Job{Meta: map[string]string{"repo_url": "https://github.com/octo/a", "labels": "self-hosted,amd64"}})
+		case strings.Contains(p, "dispatch-400"):
+			http.Error(w, `{"error":"gone"}`, http.StatusInternalServerError) // Info fails -> skipped
+		case strings.Contains(p, "dispatch-500"):
+			_ = enc.Encode(&api.Job{}) // nil Meta -> metaString returns ""
+		default:
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		}
+	}
+	return httptest.NewServer(http.HandlerFunc(h))
+}
+
+func TestNomad_ActiveRunnerSlots(t *testing.T) {
+	ts := activeRunnersStub()
+	defer ts.Close()
+
+	slots, err := testNomad(t, ts).ActiveRunnerSlots(context.Background(), "ci-runner")
+	if err != nil {
+		t.Fatalf("ActiveRunnerSlots: %v", err)
+	}
+	// Only the active children with fetchable job info: r1, r2, and r5 (meta-less
+	// -> empty slot). r3 (complete), x1 (wrong prefix) and r4 (info 500) drop out.
+	got := make(map[RunnerSlot]bool)
+	for _, s := range slots {
+		got[s] = true
+	}
+	want := []RunnerSlot{
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted"},
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted,amd64"},
+		{RepoURL: "", Labels: ""},
+	}
+	if len(slots) != len(want) {
+		t.Fatalf("got %d slots (%v), want %d", len(slots), slots, len(want))
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("missing slot %+v; got %v", w, slots)
+		}
+	}
+}
+
+func TestNomad_ActiveRunnerSlots_ListError(t *testing.T) {
+	ts := nomadStub("/v1/allocations")
+	defer ts.Close()
+	if _, err := testNomad(t, ts).ActiveRunnerSlots(context.Background(), "ci-runner"); err == nil {
+		t.Fatal("expected an error when the allocation list call fails")
+	}
+}
+
+func TestNomad_RunnerTerminal(t *testing.T) {
+	h := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		p := r.URL.Path
+		switch {
+		case strings.Contains(p, "running-job/allocations"):
+			_ = enc.Encode([]*api.AllocationListStub{{ID: "a", ClientStatus: api.AllocClientStatusRunning}})
+		case strings.Contains(p, "done-job/allocations"):
+			_ = enc.Encode([]*api.AllocationListStub{{ID: "a", ClientStatus: api.AllocClientStatusComplete}})
+		case strings.Contains(p, "empty-job/allocations"):
+			_ = enc.Encode([]*api.AllocationListStub{})
+		case strings.Contains(p, "gone-job/allocations"):
+			http.Error(w, `{"error":"job not found"}`, http.StatusNotFound)
+		case strings.Contains(p, "boom-job/allocations"):
+			http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+		default:
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		}
+	}
+	ts := httptest.NewServer(http.HandlerFunc(h))
+	defer ts.Close()
+	n := testNomad(t, ts)
+	ctx := context.Background()
+
+	cases := []struct {
+		job      string
+		wantDone bool
+		wantErr  bool
+	}{
+		{"running-job", false, false}, // an alloc still running
+		{"done-job", true, false},     // all allocs terminal
+		{"empty-job", false, false},   // dispatched, not scheduled yet
+		{"gone-job", true, false},     // job not found -> already gone
+		{"boom-job", false, true},     // API error surfaces
+	}
+	for _, c := range cases {
+		done, err := n.RunnerTerminal(ctx, c.job)
+		if (err != nil) != c.wantErr {
+			t.Errorf("%s: err = %v, wantErr %v", c.job, err, c.wantErr)
+		}
+		if err == nil && done != c.wantDone {
+			t.Errorf("%s: done = %v, want %v", c.job, done, c.wantDone)
+		}
+	}
+}

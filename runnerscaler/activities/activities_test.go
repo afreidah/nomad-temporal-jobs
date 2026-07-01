@@ -22,6 +22,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/shared/client/git"
+	"munchbox/temporal-workers/shared/client/nomad"
 )
 
 // --- fakes ---
@@ -34,8 +35,9 @@ func (f fakeKV) KVGet(_ context.Context, key string) ([]byte, bool, error) {
 }
 
 type fakeGitHub struct {
-	jobs  []git.QueuedJob
-	token string
+	jobs     []git.QueuedJob
+	token    string
+	tokenErr error
 }
 
 func (f *fakeGitHub) ListQueuedSelfHostedJobs(_ context.Context, _, _ string) ([]git.QueuedJob, error) {
@@ -43,7 +45,7 @@ func (f *fakeGitHub) ListQueuedSelfHostedJobs(_ context.Context, _, _ string) ([
 }
 
 func (f *fakeGitHub) CreateRunnerRegistrationToken(_ context.Context, _, _ string) (string, time.Time, error) {
-	return f.token, time.Now().Add(time.Hour), nil
+	return f.token, time.Now().Add(time.Hour), f.tokenErr
 }
 
 type fakeNomad struct {
@@ -51,17 +53,35 @@ type fakeNomad struct {
 	dispatchedJob  string
 	stopped        []string
 	stopErr        error
+	slots          []nomad.RunnerSlot
+	slotsErr       error
+	dispatchErr    error
+	runnerTerminal func() (bool, error)
+}
+
+func (f *fakeNomad) RunnerTerminal(_ context.Context, _ string) (bool, error) {
+	if f.runnerTerminal != nil {
+		return f.runnerTerminal()
+	}
+	return true, nil
 }
 
 func (f *fakeNomad) DispatchJob(_ context.Context, jobID string, meta map[string]string) (string, error) {
 	f.dispatchedJob = jobID
 	f.dispatchedMeta = meta
+	if f.dispatchErr != nil {
+		return "", f.dispatchErr
+	}
 	return "ci-runner/dispatch-1-abc", nil
 }
 
 func (f *fakeNomad) StopJob(_ context.Context, jobID string) error {
 	f.stopped = append(f.stopped, jobID)
 	return f.stopErr
+}
+
+func (f *fakeNomad) ActiveRunnerSlots(_ context.Context, _ string) ([]nomad.RunnerSlot, error) {
+	return f.slots, f.slotsErr
 }
 
 func actEnv() *testsuite.TestActivityEnvironment {
@@ -190,7 +210,6 @@ func TestDispatchRunner_BuildsMetaWithImage(t *testing.T) {
 
 	val, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
 		Repo:   "octo/widget",
-		JobID:  7,
 		Labels: []string{"self-hosted", "amd64"},
 		Image:  "reg/ci-amd64:latest",
 	})
@@ -237,6 +256,30 @@ func TestDispatchRunner_OmitsImageWhenUnset(t *testing.T) {
 	}
 }
 
+func TestDispatchRunner_TokenError(t *testing.T) {
+	a := newActs(fakeKV{}, &fakeGitHub{tokenErr: errors.New("422 forbidden")}, &fakeNomad{})
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:   "octo/widget",
+		Labels: []string{"self-hosted"},
+	}); err == nil {
+		t.Fatal("expected an error when registration-token minting fails")
+	}
+}
+
+func TestDispatchRunner_DispatchError(t *testing.T) {
+	a := newActs(fakeKV{}, &fakeGitHub{token: "t"}, &fakeNomad{dispatchErr: errors.New("403 permission denied")})
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:   "octo/widget",
+		Labels: []string{"self-hosted"},
+	}); err == nil {
+		t.Fatal("expected an error when the Nomad dispatch fails")
+	}
+}
+
 // --- ReapRunner --------------------------------------------------------------
 
 func TestReapRunner_ToleratesMissingJob(t *testing.T) {
@@ -258,5 +301,120 @@ func TestReapRunner_PropagatesRealError(t *testing.T) {
 	env.RegisterActivity(a.ReapRunner)
 	if _, err := env.ExecuteActivity(a.ReapRunner, "x"); err == nil {
 		t.Fatal("expected ReapRunner to propagate a non-not-found error")
+	}
+}
+
+// --- WaitRunnerDone ----------------------------------------------------------
+
+func TestWaitRunnerDone(t *testing.T) {
+	// Shorten the poll so the loop runs fast under test.
+	old := waitPollInterval
+	waitPollInterval = time.Millisecond
+	defer func() { waitPollInterval = old }()
+
+	calls := 0
+	nm := &fakeNomad{runnerTerminal: func() (bool, error) {
+		calls++
+		switch calls {
+		case 1:
+			return false, errors.New("nomad blip") // transient: skipped + retried
+		case 2:
+			return false, nil // scheduled but still running
+		default:
+			return true, nil // finished
+		}
+	}}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.WaitRunnerDone)
+
+	if _, err := env.ExecuteActivity(a.WaitRunnerDone, "ci-runner/dispatch-1-abc"); err != nil {
+		t.Fatalf("WaitRunnerDone: %v", err)
+	}
+	if calls < 3 {
+		t.Errorf("polled %d times, want >=3 (skip blip -> not done -> done)", calls)
+	}
+}
+
+// --- CountActiveRunners ------------------------------------------------------
+
+func TestCountActiveRunners(t *testing.T) {
+	// Active runners bucket by (repo, labels); label order is normalized so a
+	// runner's dispatch meta lands in the same bucket as the matching job.
+	nm := &fakeNomad{slots: []nomad.RunnerSlot{
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted"},
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted"},
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted,amd64"},
+		{RepoURL: "https://github.com/octo/b", Labels: "self-hosted"},
+		{RepoURL: "https://github.com/octo/c", Labels: ""}, // no-label runner -> "octo/c|" bucket
+	}}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.CountActiveRunners)
+
+	val, err := env.ExecuteActivity(a.CountActiveRunners)
+	if err != nil {
+		t.Fatalf("CountActiveRunners: %v", err)
+	}
+	var counts map[string]int
+	if err := val.Get(&counts); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if counts["octo/a|self-hosted"] != 2 {
+		t.Errorf("octo/a self-hosted = %d, want 2", counts["octo/a|self-hosted"])
+	}
+	if counts["octo/a|amd64,self-hosted"] != 1 {
+		t.Errorf("octo/a amd64 bucket = %d, want 1 (labels sorted)", counts["octo/a|amd64,self-hosted"])
+	}
+	if counts["octo/b|self-hosted"] != 1 {
+		t.Errorf("octo/b self-hosted = %d, want 1", counts["octo/b|self-hosted"])
+	}
+	if counts["octo/c|"] != 1 {
+		t.Errorf("octo/c no-label bucket = %d, want 1", counts["octo/c|"])
+	}
+}
+
+func TestCountActiveRunners_Error(t *testing.T) {
+	nm := &fakeNomad{slotsErr: errors.New("nomad down")}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.CountActiveRunners)
+	if _, err := env.ExecuteActivity(a.CountActiveRunners); err == nil {
+		t.Fatal("expected CountActiveRunners to propagate the Nomad error")
+	}
+}
+
+func TestDispatchRunner_InvalidRepo(t *testing.T) {
+	a := newActs(fakeKV{}, &fakeGitHub{}, &fakeNomad{})
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:   "no-slash",
+		Labels: []string{"self-hosted"},
+	}); err == nil {
+		t.Fatal("expected an error dispatching for an unparseable repo")
+	}
+}
+
+func TestSplitLabels(t *testing.T) {
+	if got := splitLabels(""); got != nil {
+		t.Errorf("splitLabels(\"\") = %v, want nil", got)
+	}
+	got := splitLabels("self-hosted,amd64")
+	if len(got) != 2 || got[0] != "self-hosted" || got[1] != "amd64" {
+		t.Errorf("splitLabels = %v, want [self-hosted amd64]", got)
+	}
+}
+
+func TestRunnerBucketKey(t *testing.T) {
+	// A runner dispatched with labels in one order and a job requesting them in
+	// another must reconcile in the same bucket.
+	if RunnerBucketKey("octo/a", []string{"self-hosted", "amd64"}) !=
+		RunnerBucketKey("octo/a", []string{"amd64", "self-hosted"}) {
+		t.Error("label order must not change the bucket key")
+	}
+	if RunnerBucketKey("octo/a", []string{"self-hosted"}) ==
+		RunnerBucketKey("octo/b", []string{"self-hosted"}) {
+		t.Error("different repos must have different bucket keys")
 	}
 }

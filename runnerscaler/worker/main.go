@@ -72,7 +72,7 @@ func main() {
 				RunnerJobID: os.Getenv("RUNNER_JOB_ID"),
 			})
 			w.RegisterWorkflow(workflows.PollAndDispatch)
-			w.RegisterWorkflow(workflows.HandleQueuedJob)
+			w.RegisterWorkflow(workflows.HandleRunner)
 			w.RegisterActivity(acts)
 			return nil, nil
 		},

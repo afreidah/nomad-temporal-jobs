@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,12 +54,19 @@ type kvGetter interface {
 }
 
 // jobDispatcher is the Nomad surface the scaler uses: dispatch a parameterized
-// runner job and stop (reap) a dispatched one. *nomad.Nomad satisfies it
+// runner job, stop (reap) a dispatched one, and list the active dispatched
+// runners so the poller can reconcile by depth. *nomad.Nomad satisfies it
 // structurally.
 type jobDispatcher interface {
 	DispatchJob(ctx context.Context, jobID string, meta map[string]string) (dispatchedID string, err error)
 	StopJob(ctx context.Context, jobID string) error
+	ActiveRunnerSlots(ctx context.Context, parentJobID string) ([]nomad.RunnerSlot, error)
+	RunnerTerminal(ctx context.Context, jobID string) (done bool, err error)
 }
+
+// waitPollInterval is how often WaitRunnerDone re-checks the dispatched runner.
+// A var so tests can shorten it.
+var waitPollInterval = 5 * time.Second
 
 // -------------------------------------------------------------------------
 // CONFIG AND CONSTRUCTOR
@@ -104,12 +112,13 @@ func New(cfg Config) *Activities {
 	return &Activities{cfg: cfg}
 }
 
-// DispatchSpec is the input to DispatchRunner: which repo's queued job to back,
-// the labels to register the runner with, and the image its profile selected
-// (empty means the Nomad job's default image).
+// DispatchSpec is the input to DispatchRunner: which repo to register the runner
+// against, the labels to register it with, and the image its profile selected
+// (empty means the Nomad job's default image). No job_id: an ephemeral runner
+// is not bound to a specific queued job -- it takes whichever matching job is
+// queued -- so the poller dispatches by (repo, labels) depth, not per job.
 type DispatchSpec struct {
 	Repo   string   `json:"repo"` // "owner/repo"
-	JobID  int64    `json:"job_id"`
 	Labels []string `json:"labels"`
 	Image  string   `json:"image,omitempty"`
 }
@@ -224,11 +233,87 @@ func (a *Activities) DispatchRunner(ctx context.Context, spec DispatchSpec) (str
 
 	id, err := a.cfg.Nomad.DispatchJob(dispCtx, a.cfg.RunnerJobID, meta)
 	if err != nil {
-		return "", fmt.Errorf("dispatch runner for %s job %d: %w", spec.Repo, spec.JobID, err)
+		return "", fmt.Errorf("dispatch runner for %s: %w", spec.Repo, err)
 	}
 	logger.Info("Dispatched ephemeral runner",
-		"repo", spec.Repo, "job_id", spec.JobID, "dispatched", id, "labels", spec.Labels)
+		"repo", spec.Repo, "dispatched", id, "labels", spec.Labels)
 	return id, nil
+}
+
+// CountActiveRunners returns the number of active (pending or running) ephemeral
+// runners bucketed by (repo, labels), keyed with RunnerBucketKey. The poller
+// subtracts these from the queued-job count per bucket and dispatches only the
+// shortfall: a runner isn't bound to a specific job_id, so reconciling by depth
+// -- not one runner per job -- is what lets a job stranded by a diverted or
+// failed runner get a fresh one on the next tick.
+func (a *Activities) CountActiveRunners(ctx context.Context) (map[string]int, error) {
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.active_runners")
+	defer span.End()
+
+	slots, err := a.cfg.Nomad.ActiveRunnerSlots(ctx, a.cfg.RunnerJobID)
+	if err != nil {
+		return nil, fmt.Errorf("list active runners: %w", err)
+	}
+	counts := make(map[string]int, len(slots))
+	for _, s := range slots {
+		counts[RunnerBucketKey(repoFromURL(s.RepoURL), splitLabels(s.Labels))]++
+	}
+	return counts, nil
+}
+
+// RunnerBucketKey is the reconciliation key for a (repo, labels) pair: the repo
+// plus its labels sorted and joined, so a runner's dispatch meta and a queued
+// job's runs-on labels bucket together regardless of label order.
+func RunnerBucketKey(repo string, labels []string) string {
+	ls := append([]string(nil), labels...)
+	sort.Strings(ls)
+	return repo + "|" + strings.Join(ls, ",")
+}
+
+// repoFromURL turns a runner's repo_url dispatch meta back into owner/repo.
+func repoFromURL(url string) string {
+	return strings.TrimPrefix(url, "https://github.com/")
+}
+
+// splitLabels parses a comma-joined dispatch labels meta into a slice ("" => nil).
+func splitLabels(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
+// WaitRunnerDone blocks until the dispatched runner job reaches a terminal state
+// (all allocations finished, or the job is gone), heartbeating while it polls,
+// so the caller can reap promptly instead of waiting out the whole backstop.
+// Transient poll errors are logged and retried -- only a terminal runner or a
+// cancelled/timed-out context ends the wait, so a blip never triggers an early
+// reap of a still-running runner. The activity's StartToCloseTimeout is the
+// backstop ceiling: a wedged runner times the activity out and the caller reaps
+// anyway.
+func (a *Activities) WaitRunnerDone(ctx context.Context, dispatchedID string) error {
+	logger := activity.GetLogger(ctx)
+
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.wait_runner",
+		attribute.String("nomad.job", dispatchedID))
+	defer span.End()
+
+	for {
+		done, err := a.cfg.Nomad.RunnerTerminal(ctx, dispatchedID)
+		switch {
+		case err != nil:
+			logger.Warn("Runner wait poll failed; retrying", "job", dispatchedID, "error", err)
+		case done:
+			logger.Info("Runner finished", "job", dispatchedID)
+			return nil
+		}
+		activity.RecordHeartbeat(ctx, dispatchedID)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(waitPollInterval):
+		}
+	}
 }
 
 // ReapRunner stops the dispatched runner job. A job that is already gone (picked

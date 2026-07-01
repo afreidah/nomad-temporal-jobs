@@ -283,6 +283,83 @@ func (n *Nomad) StopJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// RunnerSlot is the dispatch identity of one active ephemeral runner: the repo
+// it registered against and the labels it carries, both read back from the
+// dispatched job's meta. The scaler buckets these to reconcile how many more
+// runners each (repo, labels) still needs.
+type RunnerSlot struct {
+	RepoURL string
+	Labels  string
+}
+
+// ActiveRunnerSlots returns the dispatch identity of every active (pending or
+// running) dispatched child of parentJobID. It lists allocations, keeps those
+// whose job is a dispatched child still occupying a slot, and reads each child
+// job's repo_url + labels meta. A child whose job info can't be fetched (already
+// garbage-collected) is skipped -- it no longer occupies a slot. Ephemeral
+// runners aren't bound to a specific job, so the caller reconciles by counting
+// these against queued jobs rather than tracking a runner per job_id.
+func (n *Nomad) ActiveRunnerSlots(ctx context.Context, parentJobID string) ([]RunnerSlot, error) {
+	allocs, _, err := n.client.Allocations().List((&api.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("list allocations: %w", err)
+	}
+	prefix := parentJobID + "/dispatch-"
+	active := make(map[string]struct{})
+	for _, al := range allocs {
+		if !strings.HasPrefix(al.JobID, prefix) {
+			continue
+		}
+		if al.ClientStatus == api.AllocClientStatusPending || al.ClientStatus == api.AllocClientStatusRunning {
+			active[al.JobID] = struct{}{}
+		}
+	}
+	slots := make([]RunnerSlot, 0, len(active))
+	for jobID := range active {
+		job, _, err := n.client.Jobs().Info(jobID, (&api.QueryOptions{}).WithContext(ctx))
+		if err != nil {
+			continue
+		}
+		slots = append(slots, RunnerSlot{
+			RepoURL: metaString(job.Meta, "repo_url"),
+			Labels:  metaString(job.Meta, "labels"),
+		})
+	}
+	return slots, nil
+}
+
+// metaString reads key from a possibly-nil job meta map.
+func metaString(m map[string]string, key string) string {
+	if m == nil {
+		return ""
+	}
+	return m[key]
+}
+
+// RunnerTerminal reports whether a dispatched runner job has finished: every
+// allocation is in a terminal client status, or the job is already gone. A job
+// with no allocations yet (dispatched but not scheduled) is not terminal, so a
+// caller polling this waits for the runner to actually run before reaping --
+// never reaping one still pending or mid-job.
+func (n *Nomad) RunnerTerminal(ctx context.Context, jobID string) (bool, error) {
+	allocs, _, err := n.client.Jobs().Allocations(jobID, false, (&api.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		if IsJobNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if len(allocs) == 0 {
+		return false, nil
+	}
+	for _, al := range allocs {
+		if al.ClientStatus == api.AllocClientStatusPending || al.ClientStatus == api.AllocClientStatusRunning {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // IsJobNotFound reports whether err indicates a Nomad job does not exist (the
 // API returns HTTP 404 / "job not found"). It prefers the typed
 // api.UnexpectedResponseError status code and falls back to string matching,
