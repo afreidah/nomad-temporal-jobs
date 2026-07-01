@@ -35,8 +35,9 @@ func (f fakeKV) KVGet(_ context.Context, key string) ([]byte, bool, error) {
 }
 
 type fakeGitHub struct {
-	jobs  []git.QueuedJob
-	token string
+	jobs     []git.QueuedJob
+	token    string
+	tokenErr error
 }
 
 func (f *fakeGitHub) ListQueuedSelfHostedJobs(_ context.Context, _, _ string) ([]git.QueuedJob, error) {
@@ -44,7 +45,7 @@ func (f *fakeGitHub) ListQueuedSelfHostedJobs(_ context.Context, _, _ string) ([
 }
 
 func (f *fakeGitHub) CreateRunnerRegistrationToken(_ context.Context, _, _ string) (string, time.Time, error) {
-	return f.token, time.Now().Add(time.Hour), nil
+	return f.token, time.Now().Add(time.Hour), f.tokenErr
 }
 
 type fakeNomad struct {
@@ -53,11 +54,16 @@ type fakeNomad struct {
 	stopped        []string
 	stopErr        error
 	slots          []nomad.RunnerSlot
+	slotsErr       error
+	dispatchErr    error
 }
 
 func (f *fakeNomad) DispatchJob(_ context.Context, jobID string, meta map[string]string) (string, error) {
 	f.dispatchedJob = jobID
 	f.dispatchedMeta = meta
+	if f.dispatchErr != nil {
+		return "", f.dispatchErr
+	}
 	return "ci-runner/dispatch-1-abc", nil
 }
 
@@ -67,7 +73,7 @@ func (f *fakeNomad) StopJob(_ context.Context, jobID string) error {
 }
 
 func (f *fakeNomad) ActiveRunnerSlots(_ context.Context, _ string) ([]nomad.RunnerSlot, error) {
-	return f.slots, nil
+	return f.slots, f.slotsErr
 }
 
 func actEnv() *testsuite.TestActivityEnvironment {
@@ -242,6 +248,30 @@ func TestDispatchRunner_OmitsImageWhenUnset(t *testing.T) {
 	}
 }
 
+func TestDispatchRunner_TokenError(t *testing.T) {
+	a := newActs(fakeKV{}, &fakeGitHub{tokenErr: errors.New("422 forbidden")}, &fakeNomad{})
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:   "octo/widget",
+		Labels: []string{"self-hosted"},
+	}); err == nil {
+		t.Fatal("expected an error when registration-token minting fails")
+	}
+}
+
+func TestDispatchRunner_DispatchError(t *testing.T) {
+	a := newActs(fakeKV{}, &fakeGitHub{token: "t"}, &fakeNomad{dispatchErr: errors.New("403 permission denied")})
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:   "octo/widget",
+		Labels: []string{"self-hosted"},
+	}); err == nil {
+		t.Fatal("expected an error when the Nomad dispatch fails")
+	}
+}
+
 // --- ReapRunner --------------------------------------------------------------
 
 func TestReapRunner_ToleratesMissingJob(t *testing.T) {
@@ -276,6 +306,7 @@ func TestCountActiveRunners(t *testing.T) {
 		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted"},
 		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted,amd64"},
 		{RepoURL: "https://github.com/octo/b", Labels: "self-hosted"},
+		{RepoURL: "https://github.com/octo/c", Labels: ""}, // no-label runner -> "octo/c|" bucket
 	}}
 	a := newActs(fakeKV{}, nil, nm)
 	env := actEnv()
@@ -297,6 +328,41 @@ func TestCountActiveRunners(t *testing.T) {
 	}
 	if counts["octo/b|self-hosted"] != 1 {
 		t.Errorf("octo/b self-hosted = %d, want 1", counts["octo/b|self-hosted"])
+	}
+	if counts["octo/c|"] != 1 {
+		t.Errorf("octo/c no-label bucket = %d, want 1", counts["octo/c|"])
+	}
+}
+
+func TestCountActiveRunners_Error(t *testing.T) {
+	nm := &fakeNomad{slotsErr: errors.New("nomad down")}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.CountActiveRunners)
+	if _, err := env.ExecuteActivity(a.CountActiveRunners); err == nil {
+		t.Fatal("expected CountActiveRunners to propagate the Nomad error")
+	}
+}
+
+func TestDispatchRunner_InvalidRepo(t *testing.T) {
+	a := newActs(fakeKV{}, &fakeGitHub{}, &fakeNomad{})
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:   "no-slash",
+		Labels: []string{"self-hosted"},
+	}); err == nil {
+		t.Fatal("expected an error dispatching for an unparseable repo")
+	}
+}
+
+func TestSplitLabels(t *testing.T) {
+	if got := splitLabels(""); got != nil {
+		t.Errorf("splitLabels(\"\") = %v, want nil", got)
+	}
+	got := splitLabels("self-hosted,amd64")
+	if len(got) != 2 || got[0] != "self-hosted" || got[1] != "amd64" {
+		t.Errorf("splitLabels = %v, want [self-hosted amd64]", got)
 	}
 }
 

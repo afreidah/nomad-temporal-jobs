@@ -180,6 +180,58 @@ func TestHandleRunner_DispatchThenReap(t *testing.T) {
 	}
 }
 
+func TestPollAndDispatch_CountActiveRunnersError(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	env.OnActivity(a.ListWatchedRepos, mock.Anything).Return([]string{"octo/a"}, nil)
+	env.OnActivity(a.LoadProfiles, mock.Anything).Return(map[string]activities.Profile{}, nil)
+	env.OnActivity(a.ListQueuedJobs, mock.Anything, "octo/a").Return(
+		[]git.QueuedJob{{ID: 1, Labels: []string{"self-hosted"}}}, nil)
+	// Can't reconcile without the active count -> the whole tick fails rather than
+	// double-provisioning every queued job.
+	env.OnActivity(a.CountActiveRunners, mock.Anything).Return(nil, errors.New("nomad down"))
+
+	env.ExecuteWorkflow(PollAndDispatch, PollConfig{})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if env.GetWorkflowError() == nil {
+		t.Fatal("expected PollAndDispatch to fail when the active-runner count errors")
+	}
+}
+
+func TestHandleRunner_DispatchError(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("", errors.New("403 permission denied"))
+
+	env.ExecuteWorkflow(HandleRunner, RunnerSpec{Repo: "octo/widget", Labels: []string{"self-hosted"}})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if env.GetWorkflowError() == nil {
+		t.Fatal("expected HandleRunner to fail when the dispatch fails")
+	}
+}
+
+func TestHandleRunner_ReapError(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("ci-runner/dispatch-1-abc", nil)
+	env.OnActivity(a.ReapRunner, mock.Anything, mock.Anything).Return(errors.New("stop failed"))
+
+	env.ExecuteWorkflow(HandleRunner, RunnerSpec{Repo: "octo/widget", Labels: []string{"self-hosted"}})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if env.GetWorkflowError() == nil {
+		t.Fatal("expected HandleRunner to fail when the reap fails")
+	}
+}
+
 func TestProfileLabel(t *testing.T) {
 	cases := []struct {
 		labels []string
