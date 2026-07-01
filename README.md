@@ -90,7 +90,7 @@ Discovers all running Docker images from the Nomad API, scans them through the T
 
 ### Node Cleanup
 
-Removes Nomad job data directories that no longer correspond to a running allocation. The set of running jobs comes from the central Nomad API; the per-node directory work is done over SSH purely as native operations — directories are enumerated and deleted over **SFTP**, never a remote shell script. Removes only directories older than the grace period; optionally prunes unused Docker images through the Docker API (tunneled over SSH). Supports dry-run mode for safe previewing.
+Removes Nomad job data directories that no longer correspond to a running allocation. The set of running jobs comes from the central Nomad API; the per-node directory work is done over SSH purely as native operations — directories are enumerated and deleted over **SFTP**, never a remote shell script. Removes only directories older than the grace period; optionally prunes unused Docker images through the Docker API (tunneled over SSH), and optionally reclaims the orphaned containerd `moby` image store through the containerd API (also tunneled) — the duplicate copy `docker system prune` can't reach on hosts running overlay2. The containerd prune is **store-aware**: it reads docker's live storage driver and skips itself where containerd is the live store, so it never deletes a live image. Supports dry-run mode for safe previewing.
 
 **Task queue:** `cleanup-task-queue`
 **Schedule:** Nomad periodic job
@@ -194,6 +194,7 @@ The `shared/` package provides common functionality used by all workers:
 | `consul.go` | OTel-instrumented Consul client + `Consul` service (Raft snapshots), token sourced from Vault |
 | `ssh.go` | Certificate-authenticated SSH client with SFTP file operations (`ReadDir`/`RemoveAll`/`DirSize`) — no remote shell |
 | `docker.go` | Remote Docker daemon driven through the Docker API, tunneled over the SSH connection to `/var/run/docker.sock` (one-shot containers + prune) |
+| `containerd.go` | Remote containerd driven through its gRPC API, tunneled over the SSH connection to `/run/containerd/containerd.sock` (store-aware `moby` image-store reclamation) |
 
 Reusable clients (`Nomad`, `Postgres`, `Consul`, `S3Store`, `VaultClient`) are concrete `shared` services; each worker declares its own **narrow consumer interface** over the subset it calls (e.g. `nomadImages`, `pgMaintainer`, `s3Store`), satisfied structurally. Workers depend on small, testable surfaces and the shared client can grow without bloating existing consumers.
 
@@ -209,7 +210,7 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 |----------|----------|------------|------|-------|
 | `backup-daily` | `Backup` | `backup-task-queue` | `0 1 * * *` | `BackupConfig` (local/S3 days, dump concurrency) |
 | `trivy-daily` | `Scan` | `trivy-task-queue` | `0 3 * * *` | `ScanConfig` (scan concurrency) |
-| `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, dry-run, docker prune) |
+| `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, dry-run, docker prune, containerd prune) |
 | `registry-gc-weekly` | `RegistryGC` | `cleanup-task-queue` | `0 2 * * 0` | `RegistryGCConfig` (job/dir/image, dry-run, delete-untagged) |
 | `aptly-cleanup-weekly` | `AptlyCleanup` | `cleanup-task-queue` | `0 4 * * 0` | `AptlyCleanupConfig` (job/group/image, data dir) |
 | `postgres-maintenance-weekly` | `PostgresMaintenance` | `cleanup-task-queue` | `0 6 * * 0` | `PostgresMaintenanceConfig` (concurrency) |
@@ -464,7 +465,7 @@ temporal workflow start --task-queue trivy-task-queue --type Scan \
 # Node cleanup (dry run)
 temporal workflow start --task-queue cleanup-task-queue --type Cleanup \
   --address temporal-server.service.consul:7233 \
-  --input '{"data_dir":"/opt/nomad/data","grace_days":7,"dry_run":true,"docker_prune":false}'
+  --input '{"data_dir":"/opt/nomad/data","grace_days":7,"dry_run":true,"docker_prune":false,"containerd_prune":true}'
 
 # Registry garbage collection (dry run)
 temporal workflow start --task-queue cleanup-task-queue --type RegistryGC \
@@ -521,6 +522,7 @@ nomad-temporal-jobs/
     consul.go                        OTel-instrumented Consul client + Consul service (Raft snapshots)
     ssh.go                           Cert-auth SSH client with SFTP file ops (no remote shell)
     docker.go                        Docker API over an SSH socket tunnel (one-shot runs + prune)
+    containerd.go                    containerd gRPC API over an SSH socket tunnel (store-aware moby-store reclaim)
   backup/
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-backup), includes ../_common.mk
     activities/
@@ -541,7 +543,7 @@ nomad-temporal-jobs/
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-root), includes ../_common.mk
     internal/nodes/                  Shared primitives: NodeInfo, SSH target, HumanBytes,
                                        and the generic find/scale/wait/measure saga activities
-    nodecleanup/                     Orphaned data-dir removal over SSH/SFTP (+ optional Docker prune)
+    nodecleanup/                     Orphaned data-dir removal over SSH/SFTP (+ optional Docker + containerd prune)
       activities.go, workflow.go     node discovery, per-node cleanup, sequential orchestration
     registrygc/                      Docker registry GC saga
       activities.go, workflow.go     one-shot garbage-collect + deferred scale-back compensation
