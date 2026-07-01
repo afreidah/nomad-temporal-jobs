@@ -22,6 +22,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/shared/client/git"
+	"munchbox/temporal-workers/shared/client/nomad"
 )
 
 // --- fakes ---
@@ -51,6 +52,7 @@ type fakeNomad struct {
 	dispatchedJob  string
 	stopped        []string
 	stopErr        error
+	slots          []nomad.RunnerSlot
 }
 
 func (f *fakeNomad) DispatchJob(_ context.Context, jobID string, meta map[string]string) (string, error) {
@@ -62,6 +64,10 @@ func (f *fakeNomad) DispatchJob(_ context.Context, jobID string, meta map[string
 func (f *fakeNomad) StopJob(_ context.Context, jobID string) error {
 	f.stopped = append(f.stopped, jobID)
 	return f.stopErr
+}
+
+func (f *fakeNomad) ActiveRunnerSlots(_ context.Context, _ string) ([]nomad.RunnerSlot, error) {
+	return f.slots, nil
 }
 
 func actEnv() *testsuite.TestActivityEnvironment {
@@ -190,7 +196,6 @@ func TestDispatchRunner_BuildsMetaWithImage(t *testing.T) {
 
 	val, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
 		Repo:   "octo/widget",
-		JobID:  7,
 		Labels: []string{"self-hosted", "amd64"},
 		Image:  "reg/ci-amd64:latest",
 	})
@@ -258,5 +263,52 @@ func TestReapRunner_PropagatesRealError(t *testing.T) {
 	env.RegisterActivity(a.ReapRunner)
 	if _, err := env.ExecuteActivity(a.ReapRunner, "x"); err == nil {
 		t.Fatal("expected ReapRunner to propagate a non-not-found error")
+	}
+}
+
+// --- CountActiveRunners ------------------------------------------------------
+
+func TestCountActiveRunners(t *testing.T) {
+	// Active runners bucket by (repo, labels); label order is normalized so a
+	// runner's dispatch meta lands in the same bucket as the matching job.
+	nm := &fakeNomad{slots: []nomad.RunnerSlot{
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted"},
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted"},
+		{RepoURL: "https://github.com/octo/a", Labels: "self-hosted,amd64"},
+		{RepoURL: "https://github.com/octo/b", Labels: "self-hosted"},
+	}}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.CountActiveRunners)
+
+	val, err := env.ExecuteActivity(a.CountActiveRunners)
+	if err != nil {
+		t.Fatalf("CountActiveRunners: %v", err)
+	}
+	var counts map[string]int
+	if err := val.Get(&counts); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if counts["octo/a|self-hosted"] != 2 {
+		t.Errorf("octo/a self-hosted = %d, want 2", counts["octo/a|self-hosted"])
+	}
+	if counts["octo/a|amd64,self-hosted"] != 1 {
+		t.Errorf("octo/a amd64 bucket = %d, want 1 (labels sorted)", counts["octo/a|amd64,self-hosted"])
+	}
+	if counts["octo/b|self-hosted"] != 1 {
+		t.Errorf("octo/b self-hosted = %d, want 1", counts["octo/b|self-hosted"])
+	}
+}
+
+func TestRunnerBucketKey(t *testing.T) {
+	// A runner dispatched with labels in one order and a job requesting them in
+	// another must reconcile in the same bucket.
+	if RunnerBucketKey("octo/a", []string{"self-hosted", "amd64"}) !=
+		RunnerBucketKey("octo/a", []string{"amd64", "self-hosted"}) {
+		t.Error("label order must not change the bucket key")
+	}
+	if RunnerBucketKey("octo/a", []string{"self-hosted"}) ==
+		RunnerBucketKey("octo/b", []string{"self-hosted"}) {
+		t.Error("different repos must have different bucket keys")
 	}
 }

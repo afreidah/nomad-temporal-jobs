@@ -1,17 +1,20 @@
 // -------------------------------------------------------------------------------
-// Runner Scaler Parent Workflow - Poll Queued Jobs, Dispatch Runners
+// Runner Scaler Parent Workflow - Poll Queued Jobs, Top Up Runners
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // PollAndDispatch is the scheduled entry point. Each tick it loads the watched
 // repos and runner profiles, scans the repos (bounded concurrency) for queued
-// self-hosted Actions jobs, and starts one HandleQueuedJob child per job. Each
-// child is keyed runner-<repo>-<job_id> with a reject-duplicate ID policy, so a
-// job still queued on the next tick can't spawn a second runner -- Temporal's
-// workflow-ID dedup is the whole state store. Children are abandoned (they
-// outlive this tick) but the parent waits for each to *start* before returning,
-// so an abandoned child can't be lost. Pure orchestration; all I/O is in
-// activities.
+// self-hosted Actions jobs, and reconciles supply against demand: it buckets the
+// queued jobs by (repo, labels), counts the active (pending/running) ephemeral
+// runners in each bucket, and starts HandleRunner children only for the
+// shortfall. Ephemeral repo-scoped runners are not bound to a specific job_id --
+// GitHub hands any label-matching runner whichever job is queued -- so keying one
+// child per job (the old model) stranded a job whenever its runner was diverted
+// to another job and never retried it. Reconciling by depth self-heals: a job
+// left unserved is still queued next tick and simply tops the count back up.
+// Children are abandoned (they outlive this tick); the parent waits only for each
+// to *start*. Pure orchestration; all I/O is in activities.
 // -------------------------------------------------------------------------------
 
 package workflows
@@ -21,7 +24,6 @@ import (
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"munchbox/temporal-workers/runnerscaler/activities"
@@ -54,12 +56,21 @@ func (c *PollConfig) applyDefaults() {
 // PollResult summarizes one poll tick.
 type PollResult struct {
 	ReposScanned   int `json:"repos_scanned"`
-	RunnersStarted int `json:"runners_started"`
-	Skipped        int `json:"skipped"` // jobs already handled by a live/closed child
+	QueuedJobs     int `json:"queued_jobs"`     // queued self-hosted jobs seen across repos
+	ActiveRunners  int `json:"active_runners"`  // pending/running runners already covering queued buckets
+	RunnersStarted int `json:"runners_started"` // new runners dispatched this tick (the shortfall)
 }
 
-// PollAndDispatch scans every watched repo for queued self-hosted jobs and
-// starts a runner child for each new one.
+// runnerBucket is the demand side of one (repo, labels) reconciliation: the repo
+// and labels a runner would be dispatched with, and how many jobs are queued.
+type runnerBucket struct {
+	repo   string
+	labels []string
+	queued int
+}
+
+// PollAndDispatch scans every watched repo for queued self-hosted jobs and tops
+// up the runner count per (repo, labels) bucket to cover them.
 func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, error) {
 	logger := workflow.GetLogger(ctx)
 	config.applyDefaults()
@@ -77,7 +88,7 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 	logger.Info("Polling for queued runners", "repos", len(repos), "profiles", len(profiles), "concurrency", config.Concurrency)
 
 	// Scan repos with bounded concurrency; results land per-index so the
-	// post-barrier dispatch stays deterministic (no concurrent appends).
+	// post-barrier reconciliation stays deterministic (no concurrent appends).
 	queued := make([][]git.QueuedJob, len(repos))
 	sem := workflow.NewBufferedChannel(ctx, config.Concurrency)
 	wg := workflow.NewWaitGroup(ctx)
@@ -99,57 +110,81 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 	}
 	wg.Wait(ctx)
 
-	// Start a child per queued job after the barrier (deterministic order).
-	result := &PollResult{ReposScanned: len(repos)}
+	// Count the runners already in flight per (repo, labels) bucket so we top up
+	// only the shortfall. A failure here is fatal to the tick: dispatching without
+	// the active count would double-provision every queued job.
+	var activeCounts map[string]int
+	if err := workflow.ExecuteActivity(quickCtx, a.CountActiveRunners).Get(quickCtx, &activeCounts); err != nil {
+		return nil, fmt.Errorf("count active runners: %w", err)
+	}
+
+	// Bucket queued jobs by (repo, labels) in deterministic scan order.
+	buckets := make(map[string]*runnerBucket)
+	var order []string
 	for i, repo := range repos {
 		for _, job := range queued[i] {
-			started, err := startRunnerChild(ctx, repo, job, profiles, config.ReapAfter)
-			switch {
-			case err != nil:
-				logger.Warn("Failed to start runner child", "repo", repo, "job_id", job.ID, "error", err)
-			case started:
-				result.RunnersStarted++
-			default:
-				result.Skipped++
+			key := activities.RunnerBucketKey(repo, job.Labels)
+			b := buckets[key]
+			if b == nil {
+				b = &runnerBucket{repo: repo, labels: job.Labels}
+				buckets[key] = b
+				order = append(order, key)
 			}
+			b.queued++
+		}
+	}
+
+	// Top up each bucket to cover its queued jobs.
+	result := &PollResult{ReposScanned: len(repos)}
+	seq := 0
+	for _, key := range order {
+		b := buckets[key]
+		active := activeCounts[key]
+		result.QueuedJobs += b.queued
+		result.ActiveRunners += active
+
+		// range over a negative shortfall iterates zero times -- an over-covered
+		// bucket dispatches nothing.
+		needed := b.queued - active
+		for range needed {
+			if err := startRunnerChild(ctx, b.repo, b.labels, profiles, config.ReapAfter, seq); err != nil {
+				logger.Warn("Failed to start runner child", "repo", b.repo, "labels", b.labels, "error", err)
+			} else {
+				result.RunnersStarted++
+			}
+			seq++
 		}
 	}
 
 	logger.Info("Poll complete",
-		"repos", result.ReposScanned, "started", result.RunnersStarted, "skipped", result.Skipped)
+		"repos", result.ReposScanned, "queued", result.QueuedJobs,
+		"active", result.ActiveRunners, "started", result.RunnersStarted)
 	return result, nil
 }
 
-// startRunnerChild starts one HandleQueuedJob child for job. It returns
-// (false, nil) when the child ID already exists -- the expected dedup signal
-// that a runner for this job was already handled -- and (true, nil) when a new
-// child started. The parent waits only for the child to start (not complete):
-// the child is abandoned so it outlives this tick, but waiting for start ensures
-// an abandoned child is never dropped.
-func startRunnerChild(ctx workflow.Context, repo string, job git.QueuedJob, profiles map[string]activities.Profile, reapAfter time.Duration) (bool, error) {
+// startRunnerChild starts one HandleRunner child for a (repo, labels) bucket.
+// The child ID is unique per (parent run, seq) so tops-up never collide, and the
+// child is abandoned so it outlives this tick -- but the parent waits for it to
+// start so an abandoned child is never dropped. Unlike the old per-job model
+// there is no dedup: the parent already reconciled how many to start.
+func startRunnerChild(ctx workflow.Context, repo string, labels []string, profiles map[string]activities.Profile, reapAfter time.Duration, seq int) error {
+	runID := workflow.GetInfo(ctx).WorkflowExecution.RunID
 	childCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-		WorkflowID:            fmt.Sprintf("runner-%s-%d", repo, job.ID),
-		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		WorkflowID:            fmt.Sprintf("runner-%s-%d", runID, seq),
+		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 		ParentClosePolicy:     enumspb.PARENT_CLOSE_POLICY_ABANDON,
 	})
 
-	spec := JobSpec{
+	spec := RunnerSpec{
 		Repo:      repo,
-		JobID:     job.ID,
-		Labels:    job.Labels,
-		Image:     profiles[profileLabel(job.Labels)].Image,
+		Labels:    labels,
+		Image:     profiles[profileLabel(labels)].Image,
 		ReapAfter: reapAfter,
 	}
 
-	child := workflow.ExecuteChildWorkflow(childCtx, HandleQueuedJob, spec)
+	child := workflow.ExecuteChildWorkflow(childCtx, HandleRunner, spec)
 	var exec workflow.Execution
-	if err := child.GetChildWorkflowExecution().Get(childCtx, &exec); err != nil {
-		if temporal.IsWorkflowExecutionAlreadyStartedError(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+	return child.GetChildWorkflowExecution().Get(childCtx, &exec)
 }
 
 // profileLabel picks the runner profile for a job from its runs-on labels: the

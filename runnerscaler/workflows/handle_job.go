@@ -3,14 +3,15 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// HandleQueuedJob backs a single queued self-hosted Actions job: dispatch one
-// ephemeral ci-runner for it, then arm a backstop timer that reaps the runner if
-// it is still around after the deadline. The runner is ephemeral, so on the
-// happy path it takes the job and self-deregisters long before the timer fires,
-// and the reap simply finds the Nomad job already gone. The dispatch runs under
-// NoRetry: it creates a new runner each call, so a retried dispatch would double
-// up. One child per job (keyed by the parent with a reject-duplicate ID) means a
-// job that stays queued across ticks never gets a second runner.
+// HandleRunner dispatches one ephemeral ci-runner for a (repo, labels) bucket,
+// then arms a backstop timer that reaps the runner if it is still around after
+// the deadline. The runner is ephemeral, so on the happy path it takes a queued
+// job and self-deregisters long before the timer fires, and the reap simply
+// finds the Nomad job already gone. The dispatch runs under NoRetry: it creates
+// a new runner each call, so a retried dispatch would double up. The runner is
+// NOT bound to a specific job_id -- it takes whichever matching job is queued --
+// so the parent poller decides how many of these to start by reconciling queued
+// depth against active runners, not by keying one child per job.
 // -------------------------------------------------------------------------------
 
 package workflows
@@ -31,20 +32,19 @@ import (
 // the longest legitimate job so a busy runner is never killed mid-build.
 const defaultReapAfter = time.Hour
 
-// JobSpec is the child input: the repo and GitHub job it backs, the labels to
-// register the runner with, the profile image (empty => the Nomad job default),
-// and an optional reap override (0 => defaultReapAfter).
-type JobSpec struct {
+// RunnerSpec is the child input: the repo the runner serves, the labels to
+// register it with, the profile image (empty => the Nomad job default), and an
+// optional reap override (0 => defaultReapAfter).
+type RunnerSpec struct {
 	Repo      string        `json:"repo"`
-	JobID     int64         `json:"job_id"`
 	Labels    []string      `json:"labels"`
 	Image     string        `json:"image,omitempty"`
 	ReapAfter time.Duration `json:"reap_after,omitempty"`
 }
 
-// HandleQueuedJob dispatches an ephemeral runner for spec's queued job and reaps
-// it after the backstop deadline.
-func HandleQueuedJob(ctx workflow.Context, spec JobSpec) error {
+// HandleRunner dispatches one ephemeral runner for spec's (repo, labels) and
+// reaps it after the backstop deadline.
+func HandleRunner(ctx workflow.Context, spec RunnerSpec) error {
 	logger := workflow.GetLogger(ctx)
 
 	// Dispatch must not be retried: it creates a new runner each attempt, so a
@@ -58,12 +58,11 @@ func HandleQueuedJob(ctx workflow.Context, spec JobSpec) error {
 	var dispatchedID string
 	err := workflow.ExecuteActivity(dispatchCtx, a.DispatchRunner, activities.DispatchSpec{
 		Repo:   spec.Repo,
-		JobID:  spec.JobID,
 		Labels: spec.Labels,
 		Image:  spec.Image,
 	}).Get(dispatchCtx, &dispatchedID)
 	if err != nil {
-		return fmt.Errorf("dispatch runner for %s job %d: %w", spec.Repo, spec.JobID, err)
+		return fmt.Errorf("dispatch runner for %s: %w", spec.Repo, err)
 	}
 
 	reapAfter := spec.ReapAfter
