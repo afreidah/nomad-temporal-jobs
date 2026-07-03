@@ -4,7 +4,7 @@ linkTitle: "Node Cleanup"
 weight: 30
 ---
 
-Per-node cleanup orchestration: discover nodes via the Nomad API, read each node's running jobs from the API, then enumerate and remove orphaned directories over SFTP &mdash; with dry-run and grace-period safety. **Hover over any step** for implementation details.
+Per-node cleanup orchestration: discover nodes via the Nomad API, read each node's running jobs from the API, then enumerate and remove orphaned directories over SFTP &mdash; with dry-run and grace-period safety. Optionally prunes docker and reclaims the orphaned containerd `moby` image store (store-aware) through their tunneled APIs. **Hover over any step** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -67,8 +67,17 @@ Per-node cleanup orchestration: discover nodes via the Nomad API, read each node
     '    MORE -->|yes| EXCLUDE',
     '    MORE -->|no| DOCKER{Docker\\nPrune?}:::decision',
     '    DOCKER -->|yes| PRUNE[Docker Prune\\nDocker API]:::activity',
-    '    DOCKER -->|no| TRACK',
-    '    PRUNE --> TRACK{Node\\nFailed?}:::decision',
+    '    DOCKER -->|no| CTRD{Containerd\\nPrune?}:::decision',
+    '    PRUNE --> CTRD',
+    '    CTRD -->|yes| CTRDPRUNE[Containerd Prune\\nstore-aware]:::activity',
+    '    CTRD -->|no| ROOTFS{rootfs\\nSweep?}:::decision',
+    '    CTRDPRUNE --> ROOTFS',
+    '    ROOTFS -->|yes| ROOTFSPRUNE[Rootfs Sweep\\nSFTP + mounts]:::activity',
+    '    ROOTFS -->|no| BUILDX',
+    '    ROOTFSPRUNE --> BUILDX{buildx\\nVolumes?}:::decision',
+    '    BUILDX -->|yes| BUILDXPRUNE[Buildx Volume\\nPrune]:::activity',
+    '    BUILDX -->|no| TRACK',
+    '    BUILDXPRUNE --> TRACK{Node\\nFailed?}:::decision',
     '    TRACK -->|yes| FAIL[Track Failed\\nNode]:::error',
     '    TRACK -->|no| NEXT',
     '    FAIL --> NEXT{More\\nNodes?}:::decision',
@@ -97,12 +106,12 @@ Per-node cleanup orchestration: discover nodes via the Nomad API, read each node
     START: {
       title: 'Cleanup Workflow',
       badge: 'workflow', badgeText: 'workflow entry',
-      body: '<p>Orchestrates sequential cleanup of orphaned data directories across all Nomad client nodes.</p><p>Receives <code>CleanupConfig</code> with <code>DataDir</code>, <code>GraceDays</code>, <code>DryRun</code>, and <code>DockerPrune</code> settings from the schedule input.</p>'
+      body: '<p>Orchestrates sequential cleanup of orphaned data directories across all Nomad client nodes.</p><p>Receives <code>CleanupConfig</code> with <code>DataDir</code>, <code>GraceDays</code>, <code>DryRun</code>, <code>DockerPrune</code>, and <code>ContainerdPrune</code> settings from the schedule input.</p>'
     },
     DEFAULTS: {
       title: 'Apply Config Defaults',
       badge: 'workflow', badgeText: 'workflow logic',
-      body: '<p>Applies default configuration values if not provided:</p><p><code>DataDir</code>: <code>/opt/nomad/data</code><br><code>GraceDays</code>: 7<br><code>DryRun</code>: true (safe by default)<br><code>DockerPrune</code>: false</p><p>Configurable via environment variables on the trigger job.</p>'
+      body: '<p>Applies default configuration values if not provided:</p><p><code>DataDir</code>: <code>/opt/nomad/data</code><br><code>GraceDays</code>: 7<br><code>DryRun</code>: true (safe by default)<br><code>DockerPrune</code>: false<br><code>ContainerdPrune</code>: false<br><code>RootfsPrune</code>: false<br><code>BuildxVolumePrune</code>: false</p><p>Configurable via the schedule input in <code>infrastructure/terragrunt</code>.</p>'
     },
     DISCOVER: {
       title: 'Get Nomad Client Nodes',
@@ -183,6 +192,36 @@ Per-node cleanup orchestration: discover nodes via the Nomad API, read each node
       title: 'Docker Prune (Docker API)',
       badge: 'activity', badgeText: 'optional activity',
       body: '<p>Prunes unused containers, all unused images, networks, and build cache through the <b>Docker API</b> tunneled over the SSH connection (<code>ContainerPrune</code> + <code>ImagePrune</code> + <code>NetworkPrune</code> + <code>BuildCachePrune</code>) &mdash; not a <code>docker system prune</code> shell command.</p><p>Reports the reclaimed bytes (structured <code>SpaceReclaimed</code>) in <code>DockerSpaceFreed</code>.</p>'
+    },
+    CTRD: {
+      title: 'Containerd Prune?',
+      badge: 'decision', badgeText: 'optional',
+      body: '<p>If <code>ContainerdPrune=true</code>, reclaims the orphaned containerd <code>moby</code> image store after the docker prune. Disabled by default.</p><p>This is the duplicate copy <code>docker system prune</code> can\'t reach on hosts where docker runs on overlay2 but containerd still holds moby-namespace images.</p>'
+    },
+    CTRDPRUNE: {
+      title: 'Containerd Prune (store-aware)',
+      badge: 'activity', badgeText: 'optional activity',
+      body: '<p>Reclaims the containerd <code>moby</code> image store through the <b>containerd gRPC API</b> tunneled over the SSH connection &mdash; not a <code>ctr</code> shell command.</p><p><b>Store-aware safety:</b> first reads docker\'s live storage driver via the tunneled Docker API. Unless that driver is <code>overlay2</code> (meaning containerd is NOT docker\'s live image store) it <b>skips</b> rather than risk deleting live images. Otherwise it deletes every moby-namespace image not backing an existing container; the synchronous delete triggers containerd GC of the now-unreferenced content and snapshots. Reclaimed bytes (the drop in the containerd data dir) are reported in <code>ContainerdSpaceFreed</code>.</p>'
+    },
+    ROOTFS: {
+      title: 'Rootfs Sweep?',
+      badge: 'decision', badgeText: 'optional',
+      body: '<p>If <code>RootfsPrune=true</code>, sweeps orphaned entries under <code>/var/lib/docker/rootfs/overlayfs</code> &mdash; stale container root filesystems left behind by a storage-layout change (e.g. a move to the containerd image store) that <code>docker system prune</code> never reaches. A no-op on nodes without that directory. Disabled by default.</p>'
+    },
+    ROOTFSPRUNE: {
+      title: 'Rootfs Sweep (SFTP)',
+      badge: 'activity', badgeText: 'optional activity',
+      body: '<p>Removes orphaned <code>/var/lib/docker/rootfs/overlayfs</code> entries over <b>SFTP</b> only &mdash; no remote shell.</p><p><b>Mount-table guarded:</b> reads the host mount table (<code>/proc/self/mountinfo</code>) over SFTP and removes only entries whose path appears nowhere in it, so anything currently mounted (a live container\'s rootfs) is kept. Reclaimed bytes are reported in <code>RootfsSpaceFreed</code>.</p>'
+    },
+    BUILDX: {
+      title: 'Buildx Volumes?',
+      badge: 'decision', badgeText: 'optional',
+      body: '<p>If <code>BuildxVolumePrune=true</code>, removes dangling buildx builder-state volumes. Disabled by default.</p><p>A docker-container buildx builder keeps its cache in a <code>buildx_buildkit_&lt;builder&gt;_state</code> volume; removing the builder leaves the volume behind (often many GB), and <code>docker system prune</code> never removes volumes.</p>'
+    },
+    BUILDXPRUNE: {
+      title: 'Buildx Volume Prune',
+      badge: 'activity', badgeText: 'optional activity',
+      body: '<p>Lists dangling volumes (referenced by no container) named <code>buildx_buildkit_*_state</code> through the tunneled <b>Docker volume API</b> and removes them &mdash; never a volume in use, never a blanket volume prune, so no live builder or application data is at risk. Reclaimed bytes are reported in <code>BuildxSpaceFreed</code>.</p>'
     },
     TRACK: {
       title: 'Node Failed?',
