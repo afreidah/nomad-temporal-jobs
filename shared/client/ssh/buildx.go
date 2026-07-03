@@ -21,7 +21,6 @@ package ssh
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/moby/moby/client"
 )
@@ -31,23 +30,14 @@ const (
 	buildxVolumeSuffix = "_state"
 )
 
-// BuildxPruneResult reports the outcome of a buildx builder-cache volume sweep.
-type BuildxPruneResult struct {
-	Reclaimed   uint64   // bytes freed (real run)
-	Reclaimable uint64   // bytes that would be freed (dry run)
-	Deleted     int      // volumes removed (real run)
-	Candidates  int      // volumes that would be removed (dry run)
-	Warnings    []string // per-volume removal failures (non-fatal)
-}
-
 // BuildxVolumePrune removes dangling buildx builder-state volumes through the
 // tunneled Docker API. dryRun reports candidates without deleting. A per-volume
 // removal failure is a warning, not fatal; only failing to reach the daemon is
 // returned as an error.
-func (s *sshConn) BuildxVolumePrune(ctx context.Context, dryRun bool) (BuildxPruneResult, error) {
+func (s *sshConn) BuildxVolumePrune(ctx context.Context, dryRun bool) (ReclaimResult, error) {
 	cli, err := s.dockerClient()
 	if err != nil {
-		return BuildxPruneResult{}, err
+		return ReclaimResult{}, err
 	}
 	defer func() { _ = cli.Close() }()
 
@@ -57,33 +47,19 @@ func (s *sshConn) BuildxVolumePrune(ctx context.Context, dryRun bool) (BuildxPru
 		Filters: client.Filters{}.Add("dangling", "true").Add("name", buildxVolumePrefix),
 	})
 	if err != nil {
-		return BuildxPruneResult{}, fmt.Errorf("list volumes: %w", err)
+		return ReclaimResult{}, fmt.Errorf("list volumes: %w", err)
 	}
 
-	var result BuildxPruneResult
+	var candidates []pruneCandidate
 	for _, v := range list.Items {
 		if !isBuildxStateVolume(v.Name) {
 			continue
 		}
 		size, _ := s.DirSize(v.Mountpoint) // best-effort accounting
-		if dryRun {
-			result.Candidates++
-			result.Reclaimable += uint64(size)
-			continue
-		}
-		if _, derr := cli.VolumeRemove(ctx, v.Name, client.VolumeRemoveOptions{}); derr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("remove %s: %v", v.Name, derr))
-			continue
-		}
-		result.Deleted++
-		result.Reclaimed += uint64(size)
+		candidates = append(candidates, pruneCandidate{id: v.Name, size: size})
 	}
-	return result, nil
-}
-
-// isBuildxStateVolume reports whether name is a buildx builder-state volume
-// (buildx_buildkit_<builder>_state) -- a belt-and-suspenders check beyond the
-// name filter so only builder cache, never an unrelated volume, is removed.
-func isBuildxStateVolume(name string) bool {
-	return strings.HasPrefix(name, buildxVolumePrefix) && strings.HasSuffix(name, buildxVolumeSuffix)
+	return sweep(candidates, dryRun, func(name string) error {
+		_, derr := cli.VolumeRemove(ctx, name, client.VolumeRemoveOptions{})
+		return derr
+	}), nil
 }

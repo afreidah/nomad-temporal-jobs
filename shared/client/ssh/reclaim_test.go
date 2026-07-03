@@ -12,6 +12,7 @@
 package ssh
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -28,6 +29,30 @@ func (s stubFileInfo) Mode() os.FileMode  { return os.ModeDir }
 func (s stubFileInfo) ModTime() time.Time { return time.Time{} }
 func (s stubFileInfo) IsDir() bool        { return s.isDir }
 func (s stubFileInfo) Sys() any           { return nil }
+
+func TestSweep(t *testing.T) {
+	cands := []pruneCandidate{{id: "a", size: 10}, {id: "b", size: 20}, {id: "boom", size: 5}}
+
+	// Dry-run tallies candidates + reclaimable, deletes nothing.
+	dry := sweep(cands, true, func(string) error { t.Fatal("dry-run must not remove"); return nil })
+	if dry.Candidates != 3 || dry.Reclaimable != 35 || dry.Deleted != 0 {
+		t.Errorf("dry-run sweep = %+v, want 3 candidates / 35 reclaimable / 0 deleted", dry)
+	}
+
+	// Real run removes each; a per-item failure becomes a warning, not fatal.
+	got := sweep(cands, false, func(id string) error {
+		if id == "boom" {
+			return errors.New("busy")
+		}
+		return nil
+	})
+	if got.Deleted != 2 || got.Reclaimed != 30 {
+		t.Errorf("sweep deleted=%d reclaimed=%d, want 2 / 30", got.Deleted, got.Reclaimed)
+	}
+	if len(got.Warnings) != 1 {
+		t.Errorf("sweep warnings = %v, want 1 (the failed item)", got.Warnings)
+	}
+}
 
 func TestRootfsOrphans(t *testing.T) {
 	entries := []os.FileInfo{

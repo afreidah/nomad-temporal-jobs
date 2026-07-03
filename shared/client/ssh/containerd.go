@@ -172,14 +172,3 @@ func referencedImages(ctx context.Context, cli *containerd.Client) (map[string]s
 	}
 	return refs, nil
 }
-
-// containerdStoreIsSafe reports whether it is safe to prune the containerd moby
-// image store given docker's active storage driver. It is safe only when
-// docker's live store is overlay2; any other driver (e.g. overlayfs) means
-// containerd IS the live image store and pruning it would delete live images.
-func containerdStoreIsSafe(dockerStorageDriver string) (safe bool, reason string) {
-	if dockerStorageDriver == "overlay2" {
-		return true, ""
-	}
-	return false, fmt.Sprintf("docker storage driver is %q (containerd is the live image store)", dockerStorageDriver)
-}

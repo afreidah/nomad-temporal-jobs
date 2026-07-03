@@ -202,13 +202,17 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 	}
 
 	if config.RootfsPrune {
-		space, note := a.rootfsPrune(ctx, conn, config.DryRun)
+		space, note := a.reclaimStep(ctx, "Docker rootfs Cleanup", config.DryRun, func() (ssh.ReclaimResult, error) {
+			return conn.RootfsPrune(ctx, config.DryRun)
+		})
 		result.RootfsSpaceFreed = space
 		out.WriteString(note)
 	}
 
 	if config.BuildxVolumePrune {
-		space, note := a.buildxVolumePrune(ctx, conn, config.DryRun)
+		space, note := a.reclaimStep(ctx, "Buildx Volume Cleanup", config.DryRun, func() (ssh.ReclaimResult, error) {
+			return conn.BuildxVolumePrune(ctx, config.DryRun)
+		})
 		result.BuildxSpaceFreed = space
 		out.WriteString(note)
 	}
@@ -372,54 +376,27 @@ func (a *Activities) containerdPrune(ctx context.Context, conn ssh.RemoteHost, d
 	return freed, false, "", out.String()
 }
 
-// rootfsPrune sweeps orphaned /var/lib/docker/rootfs entries over conn. In
-// dry-run it reports what would be freed without deleting. Returns the
-// reclaimed-space string and a log fragment.
-func (a *Activities) rootfsPrune(ctx context.Context, conn ssh.RemoteHost, dryRun bool) (string, string) {
-	res, err := shared.WithHeartbeat(ctx, pruneHeartbeat, func() (ssh.RootfsPruneResult, error) {
-		return conn.RootfsPrune(ctx, dryRun)
-	})
+// reclaimStep runs a whole-item storage sweep (rootfs entries or buildx volumes)
+// under a heartbeat and formats its outcome under the given title. In dry-run it
+// reports what would be freed without deleting. Returns the reclaimed-space
+// string and a log fragment.
+func (a *Activities) reclaimStep(ctx context.Context, title string, dryRun bool, run func() (ssh.ReclaimResult, error)) (string, string) {
+	res, err := shared.WithHeartbeat(ctx, pruneHeartbeat, run)
 	if err != nil {
-		return "0B", "=== Docker rootfs Cleanup ===\nrootfs sweep: " + err.Error() + "\n"
+		return "0B", fmt.Sprintf("=== %s ===\n%v\n", title, err)
 	}
 
 	var out strings.Builder
-	out.WriteString("=== Docker rootfs Cleanup ===\n")
+	fmt.Fprintf(&out, "=== %s ===\n", title)
 	for _, w := range res.Warnings {
 		out.WriteString(w + "\n")
 	}
 	if dryRun {
 		freed := nodes.HumanBytes(int64(res.Reclaimable))
-		fmt.Fprintf(&out, "dry run: %d entry(ies) would be removed, freeing %s\n", res.Candidates, freed)
+		fmt.Fprintf(&out, "dry run: %d item(s) would be removed, freeing %s\n", res.Candidates, freed)
 		return "0B", out.String()
 	}
 	freed := nodes.HumanBytes(int64(res.Reclaimed))
-	fmt.Fprintf(&out, "removed %d entry(ies), reclaimed %s\n", res.Deleted, freed)
-	return freed, out.String()
-}
-
-// buildxVolumePrune removes dangling buildx builder-state volumes over conn. In
-// dry-run it reports what would be freed without deleting. Returns the
-// reclaimed-space string and a log fragment.
-func (a *Activities) buildxVolumePrune(ctx context.Context, conn ssh.RemoteHost, dryRun bool) (string, string) {
-	res, err := shared.WithHeartbeat(ctx, pruneHeartbeat, func() (ssh.BuildxPruneResult, error) {
-		return conn.BuildxVolumePrune(ctx, dryRun)
-	})
-	if err != nil {
-		return "0B", "=== Buildx Volume Cleanup ===\nbuildx volume prune: " + err.Error() + "\n"
-	}
-
-	var out strings.Builder
-	out.WriteString("=== Buildx Volume Cleanup ===\n")
-	for _, w := range res.Warnings {
-		out.WriteString(w + "\n")
-	}
-	if dryRun {
-		freed := nodes.HumanBytes(int64(res.Reclaimable))
-		fmt.Fprintf(&out, "dry run: %d volume(s) would be removed, freeing %s\n", res.Candidates, freed)
-		return "0B", out.String()
-	}
-	freed := nodes.HumanBytes(int64(res.Reclaimed))
-	fmt.Fprintf(&out, "removed %d volume(s), reclaimed %s\n", res.Deleted, freed)
+	fmt.Fprintf(&out, "removed %d item(s), reclaimed %s\n", res.Deleted, freed)
 	return freed, out.String()
 }

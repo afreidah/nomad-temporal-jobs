@@ -117,7 +117,7 @@ func TestCleanupNodeViaSSH_ContainerdPruneError(t *testing.T) {
 
 // A successful rootfs sweep reports reclaimed space and only runs when enabled.
 func TestCleanupNodeViaSSH_RootfsPrune(t *testing.T) {
-	host := &fakeRemoteHost{rootfsResult: ssh.RootfsPruneResult{Deleted: 4, Reclaimed: 9_700_000_000}}
+	host := &fakeRemoteHost{rootfsResult: ssh.ReclaimResult{Deleted: 4, Reclaimed: 9_700_000_000}}
 	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", RootfsPrune: true})
 	if !host.rootfsCalled {
 		t.Fatal("RootfsPrune was not called")
@@ -138,13 +138,24 @@ func TestCleanupNodeViaSSH_RootfsPruneDisabled(t *testing.T) {
 
 // A successful buildx volume sweep reports reclaimed space.
 func TestCleanupNodeViaSSH_BuildxVolumePrune(t *testing.T) {
-	host := &fakeRemoteHost{buildxResult: ssh.BuildxPruneResult{Deleted: 1, Reclaimed: 12_000_000_000}}
+	host := &fakeRemoteHost{buildxResult: ssh.ReclaimResult{Deleted: 1, Reclaimed: 12_000_000_000}}
 	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", BuildxVolumePrune: true})
 	if !host.buildxCalled {
 		t.Fatal("BuildxVolumePrune was not called")
 	}
 	if r.BuildxSpaceFreed == "0B" {
 		t.Errorf("BuildxSpaceFreed = %q, want reclaimed size", r.BuildxSpaceFreed)
+	}
+}
+
+// Dry-run reports candidates and frees nothing; warnings are surfaced.
+func TestCleanupNodeViaSSH_ReclaimStepDryRun(t *testing.T) {
+	host := &fakeRemoteHost{
+		rootfsResult: ssh.ReclaimResult{Candidates: 3, Reclaimable: 9_000_000_000, Warnings: []string{"remove x: busy"}},
+	}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", DryRun: true, RootfsPrune: true})
+	if r.RootfsSpaceFreed != "0B" {
+		t.Errorf("dry-run RootfsSpaceFreed = %q, want 0B", r.RootfsSpaceFreed)
 	}
 }
 
@@ -182,10 +193,10 @@ type fakeRemoteHost struct {
 	ctrdDryRun bool // records the dryRun arg ContainerdPrune was called with
 	ctrdCalled bool
 
-	rootfsResult ssh.RootfsPruneResult
+	rootfsResult ssh.ReclaimResult
 	rootfsErr    error
 	rootfsCalled bool
-	buildxResult ssh.BuildxPruneResult
+	buildxResult ssh.ReclaimResult
 	buildxErr    error
 	buildxCalled bool
 }
@@ -201,11 +212,11 @@ func (f *fakeRemoteHost) ContainerdPrune(_ context.Context, dryRun bool) (ssh.Co
 	f.ctrdDryRun = dryRun
 	return f.ctrdResult, f.ctrdErr
 }
-func (f *fakeRemoteHost) RootfsPrune(_ context.Context, _ bool) (ssh.RootfsPruneResult, error) {
+func (f *fakeRemoteHost) RootfsPrune(_ context.Context, _ bool) (ssh.ReclaimResult, error) {
 	f.rootfsCalled = true
 	return f.rootfsResult, f.rootfsErr
 }
-func (f *fakeRemoteHost) BuildxVolumePrune(_ context.Context, _ bool) (ssh.BuildxPruneResult, error) {
+func (f *fakeRemoteHost) BuildxVolumePrune(_ context.Context, _ bool) (ssh.ReclaimResult, error) {
 	f.buildxCalled = true
 	return f.buildxResult, f.buildxErr
 }
