@@ -61,11 +61,13 @@ func New(nomad nomadClient, host ssh.HostConnector) *Activities {
 
 // CleanupConfig holds workflow-level configuration passed as input.
 type CleanupConfig struct {
-	DataDir         string `json:"data_dir"`         // Base directory to scan (default: /opt/nomad/data)
-	GraceDays       int    `json:"grace_days"`       // Only delete directories older than this (default: 7)
-	DryRun          bool   `json:"dry_run"`          // If true, only report what would be deleted
-	DockerPrune     bool   `json:"docker_prune"`     // If true, also prune unused Docker images
-	ContainerdPrune bool   `json:"containerd_prune"` // If true, also reclaim the orphaned containerd moby image store
+	DataDir           string `json:"data_dir"`            // Base directory to scan (default: /opt/nomad/data)
+	GraceDays         int    `json:"grace_days"`          // Only delete directories older than this (default: 7)
+	DryRun            bool   `json:"dry_run"`             // If true, only report what would be deleted
+	DockerPrune       bool   `json:"docker_prune"`        // If true, also prune unused Docker images
+	ContainerdPrune   bool   `json:"containerd_prune"`    // If true, also reclaim the orphaned containerd moby image store
+	RootfsPrune       bool   `json:"rootfs_prune"`        // If true, also sweep orphaned /var/lib/docker/rootfs entries
+	BuildxVolumePrune bool   `json:"buildx_volume_prune"` // If true, also remove dangling buildx builder-state volumes
 }
 
 // CleanupResult holds the outcome of a cleanup operation on a single node.
@@ -80,6 +82,8 @@ type CleanupResult struct {
 	ContainerdSpaceFreed string   `json:"containerd_space_freed"`
 	ContainerdSkipped    bool     `json:"containerd_skipped,omitempty"`
 	ContainerdSkipReason string   `json:"containerd_skip_reason,omitempty"`
+	RootfsSpaceFreed     string   `json:"rootfs_space_freed"`
+	BuildxSpaceFreed     string   `json:"buildx_space_freed"`
 	Errors               []string `json:"errors,omitempty"`
 	Output               string   `json:"output"`
 }
@@ -125,7 +129,10 @@ func (a *Activities) GetAllNomadClientNodes(ctx context.Context) ([]nodes.NodeIn
 // would be deleted without removing anything.
 func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo, config CleanupConfig) (CleanupResult, error) {
 	logger := activity.GetLogger(ctx)
-	result := CleanupResult{NodeName: node.Name, NodeAddr: node.Address, DockerSpaceFreed: "0B", ContainerdSpaceFreed: "0B"}
+	result := CleanupResult{
+		NodeName: node.Name, NodeAddr: node.Address,
+		DockerSpaceFreed: "0B", ContainerdSpaceFreed: "0B", RootfsSpaceFreed: "0B", BuildxSpaceFreed: "0B",
+	}
 
 	// Running jobs on this node, straight from the Nomad API.
 	running, err := a.runningJobs(ctx, node.ID)
@@ -191,6 +198,18 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 		result.ContainerdSpaceFreed = space
 		result.ContainerdSkipped = skipped
 		result.ContainerdSkipReason = reason
+		out.WriteString(note)
+	}
+
+	if config.RootfsPrune {
+		space, note := a.rootfsPrune(ctx, conn, config.DryRun)
+		result.RootfsSpaceFreed = space
+		out.WriteString(note)
+	}
+
+	if config.BuildxVolumePrune {
+		space, note := a.buildxVolumePrune(ctx, conn, config.DryRun)
+		result.BuildxSpaceFreed = space
 		out.WriteString(note)
 	}
 
@@ -351,4 +370,56 @@ func (a *Activities) containerdPrune(ctx context.Context, conn ssh.RemoteHost, d
 	freed := nodes.HumanBytes(int64(res.Reclaimed))
 	fmt.Fprintf(&out, "deleted %d image(s), reclaimed %s\n", res.Deleted, freed)
 	return freed, false, "", out.String()
+}
+
+// rootfsPrune sweeps orphaned /var/lib/docker/rootfs entries over conn. In
+// dry-run it reports what would be freed without deleting. Returns the
+// reclaimed-space string and a log fragment.
+func (a *Activities) rootfsPrune(ctx context.Context, conn ssh.RemoteHost, dryRun bool) (string, string) {
+	res, err := shared.WithHeartbeat(ctx, pruneHeartbeat, func() (ssh.RootfsPruneResult, error) {
+		return conn.RootfsPrune(ctx, dryRun)
+	})
+	if err != nil {
+		return "0B", "=== Docker rootfs Cleanup ===\nrootfs sweep: " + err.Error() + "\n"
+	}
+
+	var out strings.Builder
+	out.WriteString("=== Docker rootfs Cleanup ===\n")
+	for _, w := range res.Warnings {
+		out.WriteString(w + "\n")
+	}
+	if dryRun {
+		freed := nodes.HumanBytes(int64(res.Reclaimable))
+		fmt.Fprintf(&out, "dry run: %d entry(ies) would be removed, freeing %s\n", res.Candidates, freed)
+		return "0B", out.String()
+	}
+	freed := nodes.HumanBytes(int64(res.Reclaimed))
+	fmt.Fprintf(&out, "removed %d entry(ies), reclaimed %s\n", res.Deleted, freed)
+	return freed, out.String()
+}
+
+// buildxVolumePrune removes dangling buildx builder-state volumes over conn. In
+// dry-run it reports what would be freed without deleting. Returns the
+// reclaimed-space string and a log fragment.
+func (a *Activities) buildxVolumePrune(ctx context.Context, conn ssh.RemoteHost, dryRun bool) (string, string) {
+	res, err := shared.WithHeartbeat(ctx, pruneHeartbeat, func() (ssh.BuildxPruneResult, error) {
+		return conn.BuildxVolumePrune(ctx, dryRun)
+	})
+	if err != nil {
+		return "0B", "=== Buildx Volume Cleanup ===\nbuildx volume prune: " + err.Error() + "\n"
+	}
+
+	var out strings.Builder
+	out.WriteString("=== Buildx Volume Cleanup ===\n")
+	for _, w := range res.Warnings {
+		out.WriteString(w + "\n")
+	}
+	if dryRun {
+		freed := nodes.HumanBytes(int64(res.Reclaimable))
+		fmt.Fprintf(&out, "dry run: %d volume(s) would be removed, freeing %s\n", res.Candidates, freed)
+		return "0B", out.String()
+	}
+	freed := nodes.HumanBytes(int64(res.Reclaimed))
+	fmt.Fprintf(&out, "removed %d volume(s), reclaimed %s\n", res.Deleted, freed)
+	return freed, out.String()
 }

@@ -58,6 +58,15 @@ type RemoteHost interface {
 	// overlay2, so it never deletes a live image. dryRun reports candidates
 	// without deleting.
 	ContainerdPrune(ctx context.Context, dryRun bool) (ContainerdPruneResult, error)
+	// RootfsPrune removes orphaned entries under /var/lib/docker/rootfs/overlayfs
+	// -- stale container root filesystems left by a storage-layout change that no
+	// live mount references. A no-op when the directory is absent. dryRun reports
+	// candidates without deleting.
+	RootfsPrune(ctx context.Context, dryRun bool) (RootfsPruneResult, error)
+	// BuildxVolumePrune removes dangling buildx builder-state volumes
+	// (buildx_buildkit_*_state referenced by no container) through the Docker
+	// API. dryRun reports candidates without deleting.
+	BuildxVolumePrune(ctx context.Context, dryRun bool) (BuildxPruneResult, error)
 }
 
 // Compile-time proof the SSH transport implements every capability.

@@ -115,6 +115,48 @@ func TestCleanupNodeViaSSH_ContainerdPruneError(t *testing.T) {
 	}
 }
 
+// A successful rootfs sweep reports reclaimed space and only runs when enabled.
+func TestCleanupNodeViaSSH_RootfsPrune(t *testing.T) {
+	host := &fakeRemoteHost{rootfsResult: ssh.RootfsPruneResult{Deleted: 4, Reclaimed: 9_700_000_000}}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", RootfsPrune: true})
+	if !host.rootfsCalled {
+		t.Fatal("RootfsPrune was not called")
+	}
+	if r.RootfsSpaceFreed == "0B" {
+		t.Errorf("RootfsSpaceFreed = %q, want reclaimed size", r.RootfsSpaceFreed)
+	}
+}
+
+// The rootfs sweep is skipped entirely when its flag is off.
+func TestCleanupNodeViaSSH_RootfsPruneDisabled(t *testing.T) {
+	host := &fakeRemoteHost{}
+	runCleanupCfg(t, host, CleanupConfig{DataDir: "/data"})
+	if host.rootfsCalled {
+		t.Error("RootfsPrune should not run when RootfsPrune=false")
+	}
+}
+
+// A successful buildx volume sweep reports reclaimed space.
+func TestCleanupNodeViaSSH_BuildxVolumePrune(t *testing.T) {
+	host := &fakeRemoteHost{buildxResult: ssh.BuildxPruneResult{Deleted: 1, Reclaimed: 12_000_000_000}}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", BuildxVolumePrune: true})
+	if !host.buildxCalled {
+		t.Fatal("BuildxVolumePrune was not called")
+	}
+	if r.BuildxSpaceFreed == "0B" {
+		t.Errorf("BuildxSpaceFreed = %q, want reclaimed size", r.BuildxSpaceFreed)
+	}
+}
+
+// A sweep client error is reported in the output, not fatal to the node.
+func TestCleanupNodeViaSSH_RootfsPruneError(t *testing.T) {
+	host := &fakeRemoteHost{rootfsErr: errors.New("sftp down")}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", RootfsPrune: true})
+	if r.RootfsSpaceFreed != "0B" {
+		t.Errorf("on error RootfsSpaceFreed = %q, want 0B", r.RootfsSpaceFreed)
+	}
+}
+
 // fakeFileInfo is a directory entry with a controllable name and mtime.
 type fakeFileInfo struct {
 	name  string
@@ -139,6 +181,13 @@ type fakeRemoteHost struct {
 	ctrdErr    error
 	ctrdDryRun bool // records the dryRun arg ContainerdPrune was called with
 	ctrdCalled bool
+
+	rootfsResult ssh.RootfsPruneResult
+	rootfsErr    error
+	rootfsCalled bool
+	buildxResult ssh.BuildxPruneResult
+	buildxErr    error
+	buildxCalled bool
 }
 
 func (f *fakeRemoteHost) Close() error                          { return nil }
@@ -151,6 +200,14 @@ func (f *fakeRemoteHost) ContainerdPrune(_ context.Context, dryRun bool) (ssh.Co
 	f.ctrdCalled = true
 	f.ctrdDryRun = dryRun
 	return f.ctrdResult, f.ctrdErr
+}
+func (f *fakeRemoteHost) RootfsPrune(_ context.Context, _ bool) (ssh.RootfsPruneResult, error) {
+	f.rootfsCalled = true
+	return f.rootfsResult, f.rootfsErr
+}
+func (f *fakeRemoteHost) BuildxVolumePrune(_ context.Context, _ bool) (ssh.BuildxPruneResult, error) {
+	f.buildxCalled = true
+	return f.buildxResult, f.buildxErr
 }
 
 type fakeConnector struct {

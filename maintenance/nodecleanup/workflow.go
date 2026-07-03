@@ -37,7 +37,9 @@ func Cleanup(ctx workflow.Context, config CleanupConfig) ([]CleanupResult, error
 		"graceDays", config.GraceDays,
 		"dryRun", config.DryRun,
 		"dockerPrune", config.DockerPrune,
-		"containerdPrune", config.ContainerdPrune)
+		"containerdPrune", config.ContainerdPrune,
+		"rootfsPrune", config.RootfsPrune,
+		"buildxVolumePrune", config.BuildxVolumePrune)
 
 	// Apply defaults
 	if config.DataDir == "" {
