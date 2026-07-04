@@ -90,7 +90,7 @@ Discovers all running Docker images from the Nomad API, scans them through the T
 
 ### Node Cleanup
 
-Removes Nomad job data directories that no longer correspond to a running allocation. The set of running jobs comes from the central Nomad API; the per-node directory work is done over SSH purely as native operations — directories are enumerated and deleted over **SFTP**, never a remote shell script. Removes only directories older than the grace period; optionally prunes unused Docker images through the Docker API (tunneled over SSH), and optionally reclaims the orphaned containerd `moby` image store through the containerd API (also tunneled) — the duplicate copy `docker system prune` can't reach on hosts running overlay2. The containerd prune is **store-aware**: it reads docker's live storage driver and skips itself where containerd is the live store, so it never deletes a live image. Two further optional sweeps reclaim leftovers that neither prune reaches: orphaned `/var/lib/docker/rootfs` entries (stale container root filesystems from a storage-layout change, removed over SFTP only when no live mount references them) and dangling buildx builder-state volumes (`buildx_buildkit_*_state` referenced by no container, removed through the Docker volume API). Supports dry-run mode for safe previewing.
+Removes Nomad job data directories that no longer correspond to a running allocation. Nodes are cleaned concurrently, bounded by a `concurrency` knob (each node is independent — its own host and daemon). The set of running jobs comes from the central Nomad API; the per-node directory work is done over SSH purely as native operations — directories are enumerated and deleted over **SFTP**, never a remote shell script. Removes only directories older than the grace period; optionally prunes unused Docker images through the Docker API (tunneled over SSH), and optionally reclaims the orphaned containerd `moby` image store through the containerd API (also tunneled) — the duplicate copy `docker system prune` can't reach on hosts running overlay2. The containerd prune is **store-aware**: it reads docker's live storage driver and skips itself where containerd is the live store, so it never deletes a live image. Two further optional sweeps reclaim leftovers that neither prune reaches: orphaned `/var/lib/docker/rootfs` entries (stale container root filesystems from a storage-layout change, removed over SFTP only when no live mount references them) and dangling buildx builder-state volumes (`buildx_buildkit_*_state` referenced by no container, removed through the Docker volume API). Supports dry-run mode for safe previewing.
 
 **Task queue:** `cleanup-task-queue`
 **Schedule:** Nomad periodic job
@@ -212,7 +212,7 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 |----------|----------|------------|------|-------|
 | `backup-daily` | `Backup` | `backup-task-queue` | `0 1 * * *` | `BackupConfig` (local/S3 days, dump concurrency) |
 | `trivy-daily` | `Scan` | `trivy-task-queue` | `0 3 * * *` | `ScanConfig` (scan concurrency) |
-| `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, dry-run, docker prune, containerd prune, rootfs prune, buildx volume prune) |
+| `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, concurrency, dry-run, docker prune, containerd prune, rootfs prune, buildx volume prune) |
 | `registry-gc-weekly` | `RegistryGC` | `cleanup-task-queue` | `0 2 * * 0` | `RegistryGCConfig` (job/dir/image, dry-run, delete-untagged) |
 | `aptly-cleanup-weekly` | `AptlyCleanup` | `cleanup-task-queue` | `0 4 * * 0` | `AptlyCleanupConfig` (job/group/image, data dir) |
 | `postgres-maintenance-weekly` | `PostgresMaintenance` | `cleanup-task-queue` | `0 6 * * 0` | `PostgresMaintenanceConfig` (concurrency) |
@@ -548,7 +548,7 @@ nomad-temporal-jobs/
     internal/nodes/                  Shared primitives: NodeInfo, SSH target, HumanBytes,
                                        and the generic find/scale/wait/measure saga activities
     nodecleanup/                     Orphaned data-dir removal over SSH/SFTP (+ optional docker/containerd/rootfs/buildx-volume reclaim)
-      activities.go, workflow.go     node discovery, per-node cleanup, sequential orchestration
+      activities.go, workflow.go     node discovery, per-node cleanup, bounded-concurrent orchestration
     registrygc/                      Docker registry GC saga
       activities.go, workflow.go     one-shot garbage-collect + deferred scale-back compensation
     aptlycleanup/                    aptly `db cleanup` saga (same skeleton as registry GC)

@@ -27,9 +27,9 @@ import (
 var a *Activities
 
 // Cleanup discovers all Nomad client nodes and performs orphaned data
-// directory removal on each via SSH. Nodes are processed sequentially to
-// avoid overwhelming the cluster. Returns results for all nodes and an
-// error if any node fails.
+// directory removal on each via SSH. Nodes are cleaned concurrently, bounded by
+// config.Concurrency (each node is independent -- its own host and daemon).
+// Returns results for all nodes and an error if any node fails.
 func Cleanup(ctx workflow.Context, config CleanupConfig) ([]CleanupResult, error) {
 	logger := workflow.GetLogger(ctx)
 	logger.Info("Starting orphaned data cleanup workflow",
@@ -48,6 +48,9 @@ func Cleanup(ctx workflow.Context, config CleanupConfig) ([]CleanupResult, error
 	if config.GraceDays == 0 {
 		config.GraceDays = 7
 	}
+	if config.Concurrency <= 0 {
+		config.Concurrency = 4
+	}
 
 	ao := workflow.ActivityOptions{
 		StartToCloseTimeout:    10 * time.Minute,
@@ -58,47 +61,49 @@ func Cleanup(ctx workflow.Context, config CleanupConfig) ([]CleanupResult, error
 
 	// CleanupNodeViaSSH heartbeats per directory, so a HeartbeatTimeout catches a
 	// hung SSH/SFTP/Docker call instead of waiting out the full StartToClose.
-	cleanupCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+	nodeActOpts := workflow.ActivityOptions{
 		StartToCloseTimeout:    10 * time.Minute,
 		ScheduleToCloseTimeout: 30 * time.Minute,
 		HeartbeatTimeout:       2 * time.Minute,
 		RetryPolicy:            shared.StandardRetry(),
-	})
+	}
 
 	// --- Discover nodes ---
 	var clientNodes []nodes.NodeInfo
 	if err := workflow.ExecuteActivity(ctx, a.GetAllNomadClientNodes).Get(ctx, &clientNodes); err != nil {
 		return nil, fmt.Errorf("failed to get Nomad nodes: %w", err)
 	}
-	logger.Info("Found Nomad client nodes", "count", len(clientNodes))
+	logger.Info("Found Nomad client nodes", "count", len(clientNodes), "concurrency", config.Concurrency)
 
-	// --- Clean each node sequentially ---
-	var results []CleanupResult
-	var failedNodes []string
+	// --- Clean nodes with bounded concurrency; each node is independent ---
+	results := make([]CleanupResult, len(clientNodes))
+	sem := workflow.NewBufferedChannel(ctx, config.Concurrency)
+	wg := workflow.NewWaitGroup(ctx)
+	for i, node := range clientNodes {
+		wg.Add(1)
+		workflow.Go(ctx, func(gctx workflow.Context) {
+			defer wg.Done()
+			sem.Send(gctx, nil) // acquire a slot
+			defer sem.Receive(gctx, nil)
 
-	for _, node := range clientNodes {
-		logger.Info("Cleaning up node", "node", node.Name, "address", node.Address)
-
-		var result CleanupResult
-		err := workflow.ExecuteActivity(cleanupCtx, a.CleanupNodeViaSSH, node, config).Get(ctx, &result)
-		if err != nil {
-			logger.Error("Failed to cleanup node", "node", node.Name, "error", err)
-			result = CleanupResult{
-				NodeName: node.Name,
-				NodeAddr: node.Address,
-				Errors:   []string{err.Error()},
+			logger.Info("Cleaning up node", "node", node.Name, "address", node.Address)
+			nctx := workflow.WithActivityOptions(gctx, nodeActOpts)
+			if err := workflow.ExecuteActivity(nctx, a.CleanupNodeViaSSH, node, config).Get(gctx, &results[i]); err != nil {
+				logger.Error("Failed to cleanup node", "node", node.Name, "error", err)
+				results[i] = CleanupResult{NodeName: node.Name, NodeAddr: node.Address, Errors: []string{err.Error()}}
 			}
-			failedNodes = append(failedNodes, node.Name)
-		} else if len(result.Errors) > 0 {
-			failedNodes = append(failedNodes, node.Name)
-		}
-		results = append(results, result)
+		})
 	}
+	wg.Wait(ctx)
 
-	// --- Summary ---
+	// --- Summary: partition after the barrier (deterministic, no concurrent writes) ---
+	var failedNodes []string
 	totalOrphaned := 0
 	totalDeleted := 0
 	for i := range results {
+		if len(results[i].Errors) > 0 {
+			failedNodes = append(failedNodes, results[i].NodeName)
+		}
 		totalOrphaned += results[i].Orphaned
 		totalDeleted += results[i].Deleted
 	}

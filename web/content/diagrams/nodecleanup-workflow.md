@@ -106,12 +106,12 @@ Per-node cleanup orchestration: discover nodes via the Nomad API, read each node
     START: {
       title: 'Cleanup Workflow',
       badge: 'workflow', badgeText: 'workflow entry',
-      body: '<p>Orchestrates sequential cleanup of orphaned data directories across all Nomad client nodes.</p><p>Receives <code>CleanupConfig</code> with <code>DataDir</code>, <code>GraceDays</code>, <code>DryRun</code>, <code>DockerPrune</code>, and <code>ContainerdPrune</code> settings from the schedule input.</p>'
+      body: '<p>Orchestrates cleanup of orphaned data directories across all Nomad client nodes, run with bounded concurrency (each node is independent).</p><p>Receives <code>CleanupConfig</code> with <code>DataDir</code>, <code>GraceDays</code>, <code>Concurrency</code>, <code>DryRun</code>, and the per-sweep prune flags from the schedule input.</p>'
     },
     DEFAULTS: {
       title: 'Apply Config Defaults',
       badge: 'workflow', badgeText: 'workflow logic',
-      body: '<p>Applies default configuration values if not provided:</p><p><code>DataDir</code>: <code>/opt/nomad/data</code><br><code>GraceDays</code>: 7<br><code>DryRun</code>: true (safe by default)<br><code>DockerPrune</code>: false<br><code>ContainerdPrune</code>: false<br><code>RootfsPrune</code>: false<br><code>BuildxVolumePrune</code>: false</p><p>Configurable via the schedule input in <code>infrastructure/terragrunt</code>.</p>'
+      body: '<p>Applies default configuration values if not provided:</p><p><code>DataDir</code>: <code>/opt/nomad/data</code><br><code>GraceDays</code>: 7<br><code>Concurrency</code>: 4<br><code>DryRun</code>: true (safe by default)<br><code>DockerPrune</code>: false<br><code>ContainerdPrune</code>: false<br><code>RootfsPrune</code>: false<br><code>BuildxVolumePrune</code>: false</p><p>Configurable via the schedule input in <code>infrastructure/terragrunt</code>.</p>'
     },
     DISCOVER: {
       title: 'Get Nomad Client Nodes',
@@ -124,9 +124,9 @@ Per-node cleanup orchestration: discover nodes via the Nomad API, read each node
       body: '<p>If no ready nodes are found, the workflow completes immediately. This is unlikely but handled gracefully.</p>'
     },
     LOOP: {
-      title: 'Process Next Node',
-      badge: 'workflow', badgeText: 'sequential loop',
-      body: '<p>Nodes are processed one at a time (not in parallel) to avoid overwhelming SSH connections and to make cleanup output easier to follow.</p><p>Activity timeout: 10 min start-to-close, 30 min schedule-to-close per node.</p>'
+      title: 'Fan Out Over Nodes',
+      badge: 'workflow', badgeText: 'bounded fan-out',
+      body: '<p>Nodes are cleaned concurrently, bounded by <code>Concurrency</code> (a <code>BufferedChannel</code> semaphore + <code>WaitGroup</code>). Each node is independent &mdash; its own host and daemon &mdash; so wall-clock is the slowest node, not the sum.</p><p>Activity timeout: 10 min start-to-close, 30 min schedule-to-close, 2 min heartbeat per node.</p>'
     },
     RUNJOBS: {
       title: 'Get Running Jobs (Nomad API)',

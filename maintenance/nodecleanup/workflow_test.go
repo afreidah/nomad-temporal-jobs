@@ -4,8 +4,8 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Tests workflow orchestration using the Temporal test suite. Activities are
-// mocked to verify the workflow discovers nodes, cleans each sequentially,
-// applies defaults, and reports failures correctly.
+// mocked to verify the workflow discovers nodes, cleans them with bounded
+// concurrency, applies defaults, and reports failures correctly.
 // -------------------------------------------------------------------------------
 
 package nodecleanup
@@ -40,8 +40,8 @@ func TestCleanup_Success(t *testing.T) {
 	result2 := CleanupResult{NodeName: "node2", NodeAddr: "10.0.0.2", Scanned: 3, Orphaned: 0}
 
 	env.OnActivity(a.GetAllNomadClientNodes, mock.Anything).Return(clientNodes, nil)
-	env.OnActivity(a.CleanupNodeViaSSH, mock.Anything, clientNodes[0], config).Return(result1, nil)
-	env.OnActivity(a.CleanupNodeViaSSH, mock.Anything, clientNodes[1], config).Return(result2, nil)
+	env.OnActivity(a.CleanupNodeViaSSH, mock.Anything, clientNodes[0], mock.Anything).Return(result1, nil)
+	env.OnActivity(a.CleanupNodeViaSSH, mock.Anything, clientNodes[1], mock.Anything).Return(result2, nil)
 
 	env.ExecuteWorkflow(Cleanup, config)
 
@@ -114,7 +114,7 @@ func TestCleanup_NodeFailureReported(t *testing.T) {
 	goodResult := CleanupResult{NodeName: "good-node", NodeAddr: "10.0.0.1", Scanned: 3}
 
 	env.OnActivity(a.GetAllNomadClientNodes, mock.Anything).Return(clientNodes, nil)
-	env.OnActivity(a.CleanupNodeViaSSH, mock.Anything, clientNodes[0], config).Return(goodResult, nil)
+	env.OnActivity(a.CleanupNodeViaSSH, mock.Anything, clientNodes[0], mock.Anything).Return(goodResult, nil)
 	env.OnActivity(a.CleanupNodeViaSSH, mock.Anything, clientNodes[1], config).
 		Return(CleanupResult{}, testsuite.ErrMockStartChildWorkflowFailed)
 

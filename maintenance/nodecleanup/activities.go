@@ -63,6 +63,7 @@ func New(nomad nomadClient, host ssh.HostConnector) *Activities {
 type CleanupConfig struct {
 	DataDir           string `json:"data_dir"`            // Base directory to scan (default: /opt/nomad/data)
 	GraceDays         int    `json:"grace_days"`          // Only delete directories older than this (default: 7)
+	Concurrency       int    `json:"concurrency"`         // Max nodes cleaned in parallel (default: 4)
 	DryRun            bool   `json:"dry_run"`             // If true, only report what would be deleted
 	DockerPrune       bool   `json:"docker_prune"`        // If true, also prune unused Docker images
 	ContainerdPrune   bool   `json:"containerd_prune"`    // If true, also reclaim the orphaned containerd moby image store
