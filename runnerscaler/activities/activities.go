@@ -3,14 +3,18 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// Activities that turn a queued self-hosted Actions job into a running runner:
-// read the watched repos and runner profiles from Consul KV, list each repo's
-// queued self-hosted jobs on GitHub, and for each one mint a registration token
-// and dispatch a single ephemeral Nomad ci-runner with it. The token is minted
-// inside DispatchRunner so it is never returned to the workflow (and so never
-// lands in Temporal history); only the dispatched job ID comes back, which the
-// reaper uses to stop a runner that never picked its job up. All external I/O is
-// reached through narrow consumer interfaces so the activities test with fakes.
+// Activities that turn a queued self-hosted Actions job into a running runner,
+// with a per-repo provisioning strategy read from Consul KV. Each repo picks a
+// mode: "app" (the default) polls the GitHub App installation and mints a fresh
+// registration token per dispatch; "vault" polls with a personal access token
+// read from the secret store and mints nothing -- the dispatched job carries its
+// own credential and self-registers, for repos the App can't be installed on.
+// Either way the poller lists queued jobs, reconciles them against the active
+// runners across every dispatched job, and dispatches the shortfall. A minted
+// token is built inside DispatchRunner so it never returns to the workflow (and
+// never lands in Temporal history); only the dispatched job ID comes back. All
+// external I/O is reached through narrow consumer interfaces so the activities
+// test with fakes.
 // -------------------------------------------------------------------------------
 
 package activities
@@ -35,22 +39,46 @@ import (
 // attrGitHubRepo is the span attribute key for the owner/repo a call targets.
 const attrGitHubRepo = "github.repo"
 
+// Provisioning modes. An empty mode is treated as ModeApp.
+const (
+	// ModeApp polls the GitHub App installation and mints a registration token
+	// per dispatch (App must grant Administration + Actions on the repo).
+	ModeApp = "app"
+	// ModeVault polls with a PAT from the secret store and mints nothing -- the
+	// dispatched job self-registers from its own stored credential.
+	ModeVault = "vault"
+)
+
 // -------------------------------------------------------------------------
 // CONSUMER INTERFACES
 // -------------------------------------------------------------------------
 
-// githubRunners is the GitHub App surface the scaler uses: discover queued
-// self-hosted jobs and mint a runner registration token. *git.GitHub satisfies
-// it structurally.
-type githubRunners interface {
+// githubApp is the App surface the scaler uses for app-mode repos: discover
+// queued self-hosted jobs and mint a runner registration token. *git.GitHub
+// satisfies it structurally, and it is also a githubLister (it has the list
+// method), so listerFor can return it directly for app-mode.
+type githubApp interface {
 	ListQueuedSelfHostedJobs(ctx context.Context, owner, repo string) ([]git.QueuedJob, error)
 	CreateRunnerRegistrationToken(ctx context.Context, owner, repo string) (token string, expiry time.Time, err error)
 }
 
-// kvGetter is the Consul KV surface the scaler uses: read the repo list and the
-// profiles map. *consul.Consul satisfies it structurally.
+// githubLister is the job-discovery surface shared by both modes: the App client
+// and a PAT client both satisfy it. app-mode reuses the App client; vault-mode
+// builds a PAT lister per call.
+type githubLister interface {
+	ListQueuedSelfHostedJobs(ctx context.Context, owner, repo string) ([]git.QueuedJob, error)
+}
+
+// kvGetter is the Consul KV surface the scaler uses: read the per-repo config.
+// *consul.Consul satisfies it structurally.
 type kvGetter interface {
 	KVGet(ctx context.Context, key string) (value []byte, found bool, err error)
+}
+
+// secretReader is the secret-store surface vault-mode uses: read a runner PAT by
+// path. *vault.VaultClient satisfies it structurally.
+type secretReader interface {
+	ReadKV(ctx context.Context, path string) (map[string]any, error)
 }
 
 // jobDispatcher is the Nomad surface the scaler uses: dispatch a parameterized
@@ -72,24 +100,47 @@ var waitPollInterval = 5 * time.Second
 // CONFIG AND CONSTRUCTOR
 // -------------------------------------------------------------------------
 
-// Profile maps a runs-on label to the runner image to dispatch for it. Resources
-// are fixed in the parameterized Nomad job (the resources stanza can't be driven
-// by dispatch meta); per-profile resourcing would be a per-profile job.
-type Profile struct {
-	Image string `json:"image"`
+// RepoConfig is one repo's provisioning strategy, read from the config JSON.
+type RepoConfig struct {
+	// Mode is "app" (default) or "vault"; see the mode constants.
+	Mode string `json:"mode,omitempty"`
+	// VaultPath is the secret-store KV path (field "token") the scaler *polls*
+	// with in vault-mode -- only Actions:read is needed, so a write-collaborator
+	// PAT suffices.
+	VaultPath string `json:"vaultPath,omitempty"`
+	// RegisterVaultPath is the KV path (field "token") the dispatched job
+	// *registers* with. Registration needs admin on the repo, which the poll
+	// token may lack, so it can be a separate, higher-privilege PAT. Empty means
+	// reuse VaultPath (one token does both).
+	RegisterVaultPath string `json:"registerVaultPath,omitempty"`
+	// Profiles maps a distinguishing runs-on label to the parameterized Nomad
+	// job (and optional image) dispatched for jobs carrying it. Rules are
+	// evaluated in order; the first whose Label is among a queued job's labels
+	// wins. Empty means the default job (RunnerJobID) with the job's own image.
+	Profiles []ProfileRule `json:"profiles,omitempty"`
 }
 
-// Config holds the scaler activities' dependencies and Consul/Nomad locations.
-type Config struct {
-	GitHub githubRunners
-	KV     kvGetter
-	Nomad  jobDispatcher
+// ProfileRule maps a runs-on label to the runner job dispatched for it.
+type ProfileRule struct {
+	Label string `json:"label"`
+	Job   string `json:"job,omitempty"`
+	Image string `json:"image,omitempty"`
+}
 
-	// RepoListKey holds the newline-separated owner/repo list; ProfilesKey holds
-	// the JSON label->Profile map; RunnerJobID is the parameterized Nomad job
-	// dispatched for each runner.
-	RepoListKey string
-	ProfilesKey string
+// Config holds the scaler activities' dependencies and Consul locations.
+type Config struct {
+	GitHub githubApp     // app-mode poll + mint (the App client)
+	KV     kvGetter      // per-repo config
+	Nomad  jobDispatcher // dispatch + reap + active-runner listing
+	Vault  secretReader  // vault-mode PAT reads
+
+	// NewPATLister builds a token-authenticated job lister for vault-mode repos.
+	// Injected so the git package stays out of the activity's test surface.
+	NewPATLister func(token string) (githubLister, error)
+
+	// ConfigKey holds the JSON repo->RepoConfig map; RunnerJobID is the
+	// parameterized Nomad job dispatched when a repo/profile names none.
+	ConfigKey   string
 	RunnerJobID string
 }
 
@@ -100,107 +151,139 @@ type Activities struct {
 
 // New constructs the activity set, applying defaults for empty locations.
 func New(cfg Config) *Activities {
-	if cfg.RepoListKey == "" {
-		cfg.RepoListKey = "runners/repos"
-	}
-	if cfg.ProfilesKey == "" {
-		cfg.ProfilesKey = "runners/profiles"
+	if cfg.ConfigKey == "" {
+		cfg.ConfigKey = "runners/config"
 	}
 	if cfg.RunnerJobID == "" {
 		cfg.RunnerJobID = "ci-runner"
 	}
+	if cfg.NewPATLister == nil {
+		cfg.NewPATLister = func(token string) (githubLister, error) {
+			return git.NewGitHubPAT(token, "")
+		}
+	}
 	return &Activities{cfg: cfg}
 }
 
+// PollRepo is the ListQueuedJobs input: the repo to poll and the strategy fields
+// that decide which GitHub client discovers its queued jobs.
+type PollRepo struct {
+	Repo      string `json:"repo"` // "owner/repo"
+	Mode      string `json:"mode,omitempty"`
+	VaultPath string `json:"vault_path,omitempty"`
+}
+
 // DispatchSpec is the input to DispatchRunner: which repo to register the runner
-// against, the labels to register it with, and the image its profile selected
-// (empty means the Nomad job's default image). No job_id: an ephemeral runner
-// is not bound to a specific queued job -- it takes whichever matching job is
-// queued -- so the poller dispatches by (repo, labels) depth, not per job.
+// against, the labels to register it with, the parameterized job to dispatch
+// (empty => RunnerJobID), the image its profile selected (empty => the job's
+// default), and whether to mint a registration token. No job_id: an ephemeral
+// runner is not bound to a specific queued job -- it takes whichever matching
+// job is queued -- so the poller dispatches by (repo, labels) depth, not per job.
 type DispatchSpec struct {
 	Repo   string   `json:"repo"` // "owner/repo"
 	Labels []string `json:"labels"`
+	Job    string   `json:"job,omitempty"`
 	Image  string   `json:"image,omitempty"`
+	// MintToken (app-mode) mints a registration token and passes it as
+	// runner_token. VaultSecret (vault-mode) is the secret-store path the
+	// dispatched job reads its own PAT from, passed as runner_secret so a
+	// self-registering job needs no minted token. They are mutually exclusive.
+	MintToken   bool   `json:"mint_token"`
+	VaultSecret string `json:"vault_secret,omitempty"`
 }
 
 // -------------------------------------------------------------------------
 // ACTIVITIES
 // -------------------------------------------------------------------------
 
-// ListWatchedRepos reads the watched repo list from Consul KV. Blank lines and
-// # comments are ignored. A missing key is non-retryable (the operator seeds it).
-func (a *Activities) ListWatchedRepos(ctx context.Context) ([]string, error) {
+// LoadConfig reads the JSON repo->RepoConfig map from Consul KV. A missing key
+// is non-retryable (the operator seeds it); malformed JSON is non-retryable.
+func (a *Activities) LoadConfig(ctx context.Context) (map[string]RepoConfig, error) {
 	logger := activity.GetLogger(ctx)
 
 	ctx, span := shared.StartPeerSpan(ctx, "consul", "consul.kv_get")
 	defer span.End()
 
-	raw, found, err := a.cfg.KV.KVGet(ctx, a.cfg.RepoListKey)
+	raw, found, err := a.cfg.KV.KVGet(ctx, a.cfg.ConfigKey)
 	if err != nil {
 		return nil, err
 	}
 	if !found {
 		return nil, temporal.NewNonRetryableApplicationError(
-			fmt.Sprintf("consul kv key %q not found", a.cfg.RepoListKey), "RepoListMissing", nil)
+			fmt.Sprintf("consul kv key %q not found", a.cfg.ConfigKey), "ConfigMissing", nil)
 	}
 
-	repos := git.ParseRepoList(string(raw))
-	logger.Info("Loaded watched repos", "key", a.cfg.RepoListKey, "count", len(repos))
-	return repos, nil
-}
-
-// LoadProfiles reads the JSON label->Profile map from Consul KV. A missing key
-// is not an error: with no profiles, runners are dispatched on the job's default
-// image. Malformed JSON is non-retryable.
-func (a *Activities) LoadProfiles(ctx context.Context) (map[string]Profile, error) {
-	logger := activity.GetLogger(ctx)
-
-	ctx, span := shared.StartPeerSpan(ctx, "consul", "consul.kv_get")
-	defer span.End()
-
-	raw, found, err := a.cfg.KV.KVGet(ctx, a.cfg.ProfilesKey)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		logger.Info("No runner profiles configured; using job default image", "key", a.cfg.ProfilesKey)
-		return map[string]Profile{}, nil
-	}
-
-	var profiles map[string]Profile
-	if err := json.Unmarshal(raw, &profiles); err != nil {
+	var cfg map[string]RepoConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, temporal.NewNonRetryableApplicationError(
-			fmt.Sprintf("parse profiles at %q", a.cfg.ProfilesKey), "InvalidProfiles", err)
+			fmt.Sprintf("parse config at %q", a.cfg.ConfigKey), "InvalidConfig", err)
 	}
-	logger.Info("Loaded runner profiles", "key", a.cfg.ProfilesKey, "count", len(profiles))
-	return profiles, nil
+	logger.Info("Loaded runner config", "key", a.cfg.ConfigKey, "repos", len(cfg))
+	return cfg, nil
 }
 
-// ListQueuedJobs returns the queued self-hosted Actions jobs for repo
-// ("owner/repo"). An unparseable repo is non-retryable.
-func (a *Activities) ListQueuedJobs(ctx context.Context, repo string) ([]git.QueuedJob, error) {
-	owner, name, ok := git.SplitRepo(repo)
+// ListQueuedJobs returns the queued self-hosted Actions jobs for r.Repo, polling
+// through the GitHub client its mode selects: the App installation for app-mode,
+// or a PAT read from the secret store for vault-mode. An unparseable repo, a
+// vault-mode repo with no vaultPath, or a missing token are non-retryable.
+func (a *Activities) ListQueuedJobs(ctx context.Context, r PollRepo) ([]git.QueuedJob, error) {
+	owner, name, ok := git.SplitRepo(r.Repo)
 	if !ok {
 		return nil, temporal.NewNonRetryableApplicationError(
-			fmt.Sprintf("invalid repo %q, want owner/repo", repo), "InvalidRepo", nil)
+			fmt.Sprintf("invalid repo %q, want owner/repo", r.Repo), "InvalidRepo", nil)
+	}
+
+	lister, err := a.listerFor(ctx, r)
+	if err != nil {
+		return nil, err
 	}
 
 	ctx, span := shared.StartPeerSpan(ctx, "github", "github.list_queued_jobs",
-		attribute.String(attrGitHubRepo, repo))
+		attribute.String(attrGitHubRepo, r.Repo))
 	defer span.End()
 
-	jobs, err := a.cfg.GitHub.ListQueuedSelfHostedJobs(ctx, owner, name)
+	jobs, err := lister.ListQueuedSelfHostedJobs(ctx, owner, name)
 	if err != nil {
-		return nil, fmt.Errorf("list queued jobs for %s: %w", repo, err)
+		return nil, fmt.Errorf("list queued jobs for %s: %w", r.Repo, err)
 	}
 	return jobs, nil
 }
 
-// DispatchRunner mints a fresh registration token for spec.Repo and dispatches
-// one ephemeral ci-runner carrying it, returning the dispatched Nomad job ID.
-// The token is built and consumed here so it never returns to the workflow.
-// Because each call creates a new runner, this activity must not be retried
-// (the workflow runs it under NoRetry).
+// listerFor picks the job-discovery client for r's mode: the shared App client
+// for app-mode, or a PAT lister built from the repo's secret-store token for
+// vault-mode. The PAT is read fresh each call so a rotated token is picked up.
+func (a *Activities) listerFor(ctx context.Context, r PollRepo) (githubLister, error) {
+	if !strings.EqualFold(r.Mode, ModeVault) {
+		return a.cfg.GitHub, nil // app-mode (default): the App client is a githubLister
+	}
+
+	if r.VaultPath == "" {
+		return nil, temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("repo %q is vault-mode but sets no vaultPath", r.Repo), "MissingVaultPath", nil)
+	}
+	rctx, span := shared.StartPeerSpan(ctx, "vault", "vault.read_kv")
+	data, err := a.cfg.Vault.ReadKV(rctx, r.VaultPath)
+	span.End()
+	if err != nil {
+		return nil, fmt.Errorf("read runner token for %s at %s: %w", r.Repo, r.VaultPath, err)
+	}
+	token, _ := data["token"].(string)
+	if token == "" {
+		return nil, temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("no token field at %s for %s", r.VaultPath, r.Repo), "MissingRunnerToken", nil)
+	}
+	return a.cfg.NewPATLister(token)
+}
+
+// DispatchRunner dispatches one ephemeral runner for spec's (repo, labels) and
+// returns the dispatched Nomad job ID. It always carries repo_url + labels meta
+// so CountActiveRunners can bucket the runner it creates. In app-mode
+// (spec.MintToken) it also mints a fresh registration token and passes it as
+// runner_token; in vault-mode it mints nothing -- the parameterized job reads
+// its own credential from the secret store and self-registers. The token is
+// built and consumed here so it never returns to the workflow. Because each call
+// creates a new runner, this activity must not be retried (the workflow runs it
+// under NoRetry).
 func (a *Activities) DispatchRunner(ctx context.Context, spec DispatchSpec) (string, error) {
 	logger := activity.GetLogger(ctx)
 
@@ -210,53 +293,79 @@ func (a *Activities) DispatchRunner(ctx context.Context, spec DispatchSpec) (str
 			fmt.Sprintf("invalid repo %q, want owner/repo", spec.Repo), "InvalidRepo", nil)
 	}
 
-	tokCtx, span := shared.StartPeerSpan(ctx, "github", "github.create_runner_token",
-		attribute.String(attrGitHubRepo, spec.Repo))
-	token, _, err := a.cfg.GitHub.CreateRunnerRegistrationToken(tokCtx, owner, name)
-	span.End()
-	if err != nil {
-		return "", fmt.Errorf("mint registration token for %s: %w", spec.Repo, err)
+	meta := map[string]string{
+		"repo_url": "https://github.com/" + spec.Repo,
+		"labels":   strings.Join(spec.Labels, ","),
 	}
 
-	meta := map[string]string{
-		"repo_url":     "https://github.com/" + spec.Repo,
-		"runner_token": token,
-		"labels":       strings.Join(spec.Labels, ","),
+	if spec.MintToken {
+		tokCtx, span := shared.StartPeerSpan(ctx, "github", "github.create_runner_token",
+			attribute.String(attrGitHubRepo, spec.Repo))
+		token, _, err := a.cfg.GitHub.CreateRunnerRegistrationToken(tokCtx, owner, name)
+		span.End()
+		if err != nil {
+			return "", fmt.Errorf("mint registration token for %s: %w", spec.Repo, err)
+		}
+		meta["runner_token"] = token
+	}
+	// vault-mode: hand the job the secret-store path so it self-registers from
+	// its own PAT -- the token itself never transits the scaler or Nomad meta.
+	if spec.VaultSecret != "" {
+		meta["runner_secret"] = spec.VaultSecret
 	}
 	if spec.Image != "" {
 		meta["runner_image"] = spec.Image
+	}
+
+	jobID := spec.Job
+	if jobID == "" {
+		jobID = a.cfg.RunnerJobID
 	}
 
 	dispCtx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.dispatch_job",
 		attribute.String(attrGitHubRepo, spec.Repo))
 	defer span.End()
 
-	id, err := a.cfg.Nomad.DispatchJob(dispCtx, a.cfg.RunnerJobID, meta)
+	id, err := a.cfg.Nomad.DispatchJob(dispCtx, jobID, meta)
 	if err != nil {
 		return "", fmt.Errorf("dispatch runner for %s: %w", spec.Repo, err)
 	}
 	logger.Info("Dispatched ephemeral runner",
-		"repo", spec.Repo, "dispatched", id, "labels", spec.Labels)
+		"repo", spec.Repo, "job", jobID, "dispatched", id, "labels", spec.Labels, "minted", spec.MintToken)
 	return id, nil
 }
 
 // CountActiveRunners returns the number of active (pending or running) ephemeral
-// runners bucketed by (repo, labels), keyed with RunnerBucketKey. The poller
-// subtracts these from the queued-job count per bucket and dispatches only the
-// shortfall: a runner isn't bound to a specific job_id, so reconciling by depth
-// -- not one runner per job -- is what lets a job stranded by a diverted or
-// failed runner get a fresh one on the next tick.
-func (a *Activities) CountActiveRunners(ctx context.Context) (map[string]int, error) {
+// runners bucketed by (repo, labels), keyed with RunnerBucketKey, across the
+// default runner job and every extra dispatched job named by a repo profile.
+// The poller subtracts these from the queued-job count per bucket and dispatches
+// only the shortfall: a runner isn't bound to a specific job_id, so reconciling
+// by depth -- not one runner per job -- is what lets a job stranded by a diverted
+// or failed runner get a fresh one on the next tick. Counting must span every
+// dispatch job, or a bucket served by a non-default job would always read active
+// = 0 and over-provision each tick.
+func (a *Activities) CountActiveRunners(ctx context.Context, extraJobIDs []string) (map[string]int, error) {
 	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.active_runners")
 	defer span.End()
 
-	slots, err := a.cfg.Nomad.ActiveRunnerSlots(ctx, a.cfg.RunnerJobID)
-	if err != nil {
-		return nil, fmt.Errorf("list active runners: %w", err)
+	jobs := []string{a.cfg.RunnerJobID}
+	seen := map[string]bool{a.cfg.RunnerJobID: true}
+	for _, j := range extraJobIDs {
+		if j != "" && !seen[j] {
+			seen[j] = true
+			jobs = append(jobs, j)
+		}
 	}
-	counts := make(map[string]int, len(slots))
-	for _, s := range slots {
-		counts[RunnerBucketKey(repoFromURL(s.RepoURL), splitLabels(s.Labels))]++
+
+	counts := make(map[string]int)
+	for _, jobID := range jobs {
+		slots, err := a.cfg.Nomad.ActiveRunnerSlots(ctx, jobID)
+		if err != nil {
+			return nil, fmt.Errorf("list active runners for %s: %w", jobID, err)
+		}
+		for _, s := range slots {
+			counts[RunnerBucketKey(repoFromURL(s.RepoURL), splitLabels(s.Labels))]++
+		}
 	}
 	return counts, nil
 }

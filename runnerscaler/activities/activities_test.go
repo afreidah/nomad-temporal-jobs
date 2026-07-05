@@ -4,11 +4,13 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Runs the activities in a TestActivityEnvironment with in-memory fakes for the
-// githubRunners, kvGetter, and jobDispatcher consumer interfaces: repo/profile
-// parsing from Consul KV (including missing/malformed keys), queued-job
-// discovery, the dispatch meta the runner job receives (registration token
-// minted internally, image carried only when the profile sets one), and the
-// reaper tolerating an already-gone job.
+// githubApp, githubLister, kvGetter, secretReader, and jobDispatcher consumer
+// interfaces: per-repo config parsing from Consul KV (including missing/malformed
+// keys), queued-job discovery in both app-mode (App client) and vault-mode (PAT
+// read from the secret store), the dispatch meta the runner job receives (token
+// minted only when the mode asks, image carried only when a profile sets one),
+// active-runner counting across multiple dispatch jobs, and the reaper tolerating
+// an already-gone job.
 // -------------------------------------------------------------------------------
 
 package activities
@@ -48,12 +50,34 @@ func (f *fakeGitHub) CreateRunnerRegistrationToken(_ context.Context, _, _ strin
 	return f.token, time.Now().Add(time.Hour), f.tokenErr
 }
 
+// fakeVault is the secret-store fake for vault-mode: path -> fields.
+type fakeVault map[string]map[string]any
+
+func (f fakeVault) ReadKV(_ context.Context, path string) (map[string]any, error) {
+	v, ok := f[path]
+	if !ok {
+		return nil, errors.New("no secret at " + path)
+	}
+	return v, nil
+}
+
+// fakeLister is the PAT-built job lister returned by a fake NewPATLister.
+type fakeLister struct {
+	jobs  []git.QueuedJob
+	token string // the token it was constructed with, for assertions
+}
+
+func (f *fakeLister) ListQueuedSelfHostedJobs(_ context.Context, _, _ string) ([]git.QueuedJob, error) {
+	return f.jobs, nil
+}
+
 type fakeNomad struct {
 	dispatchedMeta map[string]string
 	dispatchedJob  string
 	stopped        []string
 	stopErr        error
 	slots          []nomad.RunnerSlot
+	slotsByJob     map[string][]nomad.RunnerSlot // per-parent-job slots; falls back to slots
 	slotsErr       error
 	dispatchErr    error
 	runnerTerminal func() (bool, error)
@@ -72,7 +96,7 @@ func (f *fakeNomad) DispatchJob(_ context.Context, jobID string, meta map[string
 	if f.dispatchErr != nil {
 		return "", f.dispatchErr
 	}
-	return "ci-runner/dispatch-1-abc", nil
+	return jobID + "/dispatch-1-abc", nil
 }
 
 func (f *fakeNomad) StopJob(_ context.Context, jobID string) error {
@@ -80,8 +104,14 @@ func (f *fakeNomad) StopJob(_ context.Context, jobID string) error {
 	return f.stopErr
 }
 
-func (f *fakeNomad) ActiveRunnerSlots(_ context.Context, _ string) ([]nomad.RunnerSlot, error) {
-	return f.slots, f.slotsErr
+func (f *fakeNomad) ActiveRunnerSlots(_ context.Context, parentJobID string) ([]nomad.RunnerSlot, error) {
+	if f.slotsErr != nil {
+		return nil, f.slotsErr
+	}
+	if f.slotsByJob != nil {
+		return f.slotsByJob[parentJobID], nil
+	}
+	return f.slots, nil
 }
 
 func actEnv() *testsuite.TestActivityEnvironment {
@@ -92,92 +122,64 @@ func newActs(kv fakeKV, gh *fakeGitHub, nm *fakeNomad) *Activities {
 	return New(Config{GitHub: gh, KV: kv, Nomad: nm})
 }
 
-// --- ListWatchedRepos --------------------------------------------------------
+// --- LoadConfig --------------------------------------------------------------
 
-func TestListWatchedRepos(t *testing.T) {
-	a := newActs(fakeKV{"runners/repos": []byte("octo/a\n# comment\n\nocto/b\n")}, nil, nil)
+func TestLoadConfig(t *testing.T) {
+	raw := []byte(`{
+		"octo/a": {"mode": "app"},
+		"octo/b": {"mode": "vault", "vaultPath": "kv/octo-pat", "profiles": [{"label":"vm","job":"vm-runner"},{"label":"custom","job":"std-runner"}]}
+	}`)
+	a := newActs(fakeKV{"runners/config": raw}, nil, nil)
 	env := actEnv()
-	env.RegisterActivity(a.ListWatchedRepos)
+	env.RegisterActivity(a.LoadConfig)
 
-	val, err := env.ExecuteActivity(a.ListWatchedRepos)
+	val, err := env.ExecuteActivity(a.LoadConfig)
 	if err != nil {
-		t.Fatalf("ListWatchedRepos: %v", err)
+		t.Fatalf("LoadConfig: %v", err)
 	}
-	var repos []string
-	if err := val.Get(&repos); err != nil {
+	var cfg map[string]RepoConfig
+	if err := val.Get(&cfg); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(repos) != 2 || repos[0] != "octo/a" || repos[1] != "octo/b" {
-		t.Errorf("repos = %v, want [octo/a octo/b]", repos)
+	if cfg["octo/a"].Mode != "app" {
+		t.Errorf("octo/a mode = %q, want app", cfg["octo/a"].Mode)
+	}
+	vault := cfg["octo/b"]
+	if vault.Mode != ModeVault || vault.VaultPath != "kv/octo-pat" {
+		t.Errorf("octo/b = %+v, want vault/kv/octo-pat", vault)
+	}
+	if len(vault.Profiles) != 2 || vault.Profiles[0].Label != "vm" || vault.Profiles[0].Job != "vm-runner" {
+		t.Errorf("octo/b profiles = %+v, want ordered vm-first", vault.Profiles)
 	}
 }
 
-func TestListWatchedRepos_MissingKeyIsNonRetryable(t *testing.T) {
+func TestLoadConfig_MissingKeyIsNonRetryable(t *testing.T) {
 	a := newActs(fakeKV{}, nil, nil)
 	env := actEnv()
-	env.RegisterActivity(a.ListWatchedRepos)
-	if _, err := env.ExecuteActivity(a.ListWatchedRepos); err == nil {
-		t.Fatal("expected an error for a missing repo-list key")
+	env.RegisterActivity(a.LoadConfig)
+	if _, err := env.ExecuteActivity(a.LoadConfig); err == nil {
+		t.Fatal("expected an error for a missing config key")
 	}
 }
 
-// --- LoadProfiles ------------------------------------------------------------
-
-func TestLoadProfiles(t *testing.T) {
-	kv := fakeKV{"runners/profiles": []byte(`{"amd64":{"image":"reg/ci-amd64:latest"},"default":{"image":"reg/ci:latest"}}`)}
-	a := newActs(kv, nil, nil)
+func TestLoadConfig_MalformedIsNonRetryable(t *testing.T) {
+	a := newActs(fakeKV{"runners/config": []byte("not json")}, nil, nil)
 	env := actEnv()
-	env.RegisterActivity(a.LoadProfiles)
-
-	val, err := env.ExecuteActivity(a.LoadProfiles)
-	if err != nil {
-		t.Fatalf("LoadProfiles: %v", err)
-	}
-	var profiles map[string]Profile
-	if err := val.Get(&profiles); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if profiles["amd64"].Image != "reg/ci-amd64:latest" || profiles["default"].Image != "reg/ci:latest" {
-		t.Errorf("profiles = %+v", profiles)
-	}
-}
-
-func TestLoadProfiles_MissingKeyIsEmpty(t *testing.T) {
-	a := newActs(fakeKV{}, nil, nil)
-	env := actEnv()
-	env.RegisterActivity(a.LoadProfiles)
-
-	val, err := env.ExecuteActivity(a.LoadProfiles)
-	if err != nil {
-		t.Fatalf("LoadProfiles: %v", err)
-	}
-	var profiles map[string]Profile
-	if err := val.Get(&profiles); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(profiles) != 0 {
-		t.Errorf("profiles = %v, want empty (missing key is not an error)", profiles)
-	}
-}
-
-func TestLoadProfiles_MalformedIsNonRetryable(t *testing.T) {
-	a := newActs(fakeKV{"runners/profiles": []byte("not json")}, nil, nil)
-	env := actEnv()
-	env.RegisterActivity(a.LoadProfiles)
-	if _, err := env.ExecuteActivity(a.LoadProfiles); err == nil {
-		t.Fatal("expected an error for malformed profiles JSON")
+	env.RegisterActivity(a.LoadConfig)
+	if _, err := env.ExecuteActivity(a.LoadConfig); err == nil {
+		t.Fatal("expected an error for malformed config JSON")
 	}
 }
 
 // --- ListQueuedJobs ----------------------------------------------------------
 
-func TestListQueuedJobs(t *testing.T) {
+func TestListQueuedJobs_AppMode(t *testing.T) {
 	gh := &fakeGitHub{jobs: []git.QueuedJob{{ID: 7, RunID: 1, Name: "build", Labels: []string{"self-hosted"}}}}
 	a := newActs(fakeKV{}, gh, nil)
 	env := actEnv()
 	env.RegisterActivity(a.ListQueuedJobs)
 
-	val, err := env.ExecuteActivity(a.ListQueuedJobs, "octo/widget")
+	val, err := env.ExecuteActivity(a.ListQueuedJobs, PollRepo{Repo: "octo/widget"})
 	if err != nil {
 		t.Fatalf("ListQueuedJobs: %v", err)
 	}
@@ -190,18 +192,72 @@ func TestListQueuedJobs(t *testing.T) {
 	}
 }
 
+func TestListQueuedJobs_VaultMode(t *testing.T) {
+	// vault-mode reads the token from the secret store and polls with a PAT
+	// lister, never touching the App client (gh is nil here).
+	var gotToken string
+	a := New(Config{
+		KV:    fakeKV{},
+		Vault: fakeVault{"kv/octo-pat": {"token": "pat-secret", "repo_url": "https://github.com/octo/private"}},
+		Nomad: &fakeNomad{},
+		NewPATLister: func(token string) (githubLister, error) {
+			gotToken = token
+			return &fakeLister{jobs: []git.QueuedJob{{ID: 9, Labels: []string{"self-hosted", "custom"}}}, token: token}, nil
+		},
+	})
+	env := actEnv()
+	env.RegisterActivity(a.ListQueuedJobs)
+
+	val, err := env.ExecuteActivity(a.ListQueuedJobs, PollRepo{Repo: "octo/private", Mode: ModeVault, VaultPath: "kv/octo-pat"})
+	if err != nil {
+		t.Fatalf("ListQueuedJobs vault: %v", err)
+	}
+	var jobs []git.QueuedJob
+	if err := val.Get(&jobs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != 9 {
+		t.Errorf("jobs = %+v, want one job id 9", jobs)
+	}
+	if gotToken != "pat-secret" {
+		t.Errorf("PAT lister built with token %q, want pat-secret", gotToken)
+	}
+}
+
+func TestListQueuedJobs_VaultModeMissingPath(t *testing.T) {
+	a := New(Config{KV: fakeKV{}, Vault: fakeVault{}, Nomad: &fakeNomad{}})
+	env := actEnv()
+	env.RegisterActivity(a.ListQueuedJobs)
+	if _, err := env.ExecuteActivity(a.ListQueuedJobs, PollRepo{Repo: "octo/private", Mode: ModeVault}); err == nil {
+		t.Fatal("expected an error for vault-mode with no vaultPath")
+	}
+}
+
+func TestListQueuedJobs_VaultModeMissingToken(t *testing.T) {
+	a := New(Config{
+		KV:    fakeKV{},
+		Vault: fakeVault{"kv/octo-pat": {"repo_url": "https://github.com/octo/private"}}, // no token field
+		Nomad: &fakeNomad{},
+	})
+	env := actEnv()
+	env.RegisterActivity(a.ListQueuedJobs)
+	if _, err := env.ExecuteActivity(a.ListQueuedJobs, PollRepo{Repo: "octo/private", Mode: ModeVault, VaultPath: "kv/octo-pat"}); err == nil {
+		t.Fatal("expected an error when the secret has no token field")
+	}
+}
+
 func TestListQueuedJobs_InvalidRepo(t *testing.T) {
 	a := newActs(fakeKV{}, &fakeGitHub{}, nil)
 	env := actEnv()
 	env.RegisterActivity(a.ListQueuedJobs)
-	if _, err := env.ExecuteActivity(a.ListQueuedJobs, "no-slash"); err == nil {
+	if _, err := env.ExecuteActivity(a.ListQueuedJobs, PollRepo{Repo: "no-slash"}); err == nil {
 		t.Fatal("expected an error for an unparseable repo")
 	}
 }
 
 // --- DispatchRunner ----------------------------------------------------------
 
-func TestDispatchRunner_BuildsMetaWithImage(t *testing.T) {
+func TestDispatchRunner_AppModeMintsAndBuildsMeta(t *testing.T) {
 	gh := &fakeGitHub{token: "ARRT_reg"}
 	nm := &fakeNomad{}
 	a := newActs(fakeKV{}, gh, nm)
@@ -209,9 +265,10 @@ func TestDispatchRunner_BuildsMetaWithImage(t *testing.T) {
 	env.RegisterActivity(a.DispatchRunner)
 
 	val, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
-		Repo:   "octo/widget",
-		Labels: []string{"self-hosted", "amd64"},
-		Image:  "reg/ci-amd64:latest",
+		Repo:      "octo/widget",
+		Labels:    []string{"self-hosted", "amd64"},
+		Image:     "reg/ci-amd64:latest",
+		MintToken: true,
 	})
 	if err != nil {
 		t.Fatalf("DispatchRunner: %v", err)
@@ -224,7 +281,7 @@ func TestDispatchRunner_BuildsMetaWithImage(t *testing.T) {
 		t.Errorf("dispatched id = %q", id)
 	}
 	if nm.dispatchedJob != "ci-runner" {
-		t.Errorf("dispatched job = %q, want ci-runner", nm.dispatchedJob)
+		t.Errorf("dispatched job = %q, want ci-runner (default)", nm.dispatchedJob)
 	}
 	want := map[string]string{
 		"repo_url":     "https://github.com/octo/widget",
@@ -239,6 +296,38 @@ func TestDispatchRunner_BuildsMetaWithImage(t *testing.T) {
 	}
 }
 
+func TestDispatchRunner_VaultModeSkipsMintAndUsesProfileJob(t *testing.T) {
+	// vault-mode: no token is minted (gh is nil, so any mint attempt would panic),
+	// the profile job is dispatched, and repo_url + labels meta are still carried
+	// so the runner buckets in CountActiveRunners.
+	nm := &fakeNomad{}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:        "octo/private",
+		Labels:      []string{"self-hosted", "go"},
+		Job:         "vault-runner",
+		MintToken:   false,
+		VaultSecret: "kv/octo-pat",
+	}); err != nil {
+		t.Fatalf("DispatchRunner vault: %v", err)
+	}
+	if nm.dispatchedJob != "vault-runner" {
+		t.Errorf("dispatched job = %q, want vault-runner", nm.dispatchedJob)
+	}
+	if _, ok := nm.dispatchedMeta["runner_token"]; ok {
+		t.Error("runner_token meta must be absent in vault-mode (job self-registers)")
+	}
+	if nm.dispatchedMeta["runner_secret"] != "kv/octo-pat" {
+		t.Errorf("runner_secret meta = %q, want kv/octo-pat (job reads its own PAT)", nm.dispatchedMeta["runner_secret"])
+	}
+	if nm.dispatchedMeta["repo_url"] != "https://github.com/octo/private" || nm.dispatchedMeta["labels"] != "self-hosted,go" {
+		t.Errorf("bookkeeping meta = %+v, want repo_url + labels set", nm.dispatchedMeta)
+	}
+}
+
 func TestDispatchRunner_OmitsImageWhenUnset(t *testing.T) {
 	nm := &fakeNomad{}
 	a := newActs(fakeKV{}, &fakeGitHub{token: "t"}, nm)
@@ -246,8 +335,9 @@ func TestDispatchRunner_OmitsImageWhenUnset(t *testing.T) {
 	env.RegisterActivity(a.DispatchRunner)
 
 	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
-		Repo:   "octo/widget",
-		Labels: []string{"self-hosted"},
+		Repo:      "octo/widget",
+		Labels:    []string{"self-hosted"},
+		MintToken: true,
 	}); err != nil {
 		t.Fatalf("DispatchRunner: %v", err)
 	}
@@ -261,8 +351,9 @@ func TestDispatchRunner_TokenError(t *testing.T) {
 	env := actEnv()
 	env.RegisterActivity(a.DispatchRunner)
 	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
-		Repo:   "octo/widget",
-		Labels: []string{"self-hosted"},
+		Repo:      "octo/widget",
+		Labels:    []string{"self-hosted"},
+		MintToken: true,
 	}); err == nil {
 		t.Fatal("expected an error when registration-token minting fails")
 	}
@@ -273,10 +364,23 @@ func TestDispatchRunner_DispatchError(t *testing.T) {
 	env := actEnv()
 	env.RegisterActivity(a.DispatchRunner)
 	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
-		Repo:   "octo/widget",
-		Labels: []string{"self-hosted"},
+		Repo:      "octo/widget",
+		Labels:    []string{"self-hosted"},
+		MintToken: true,
 	}); err == nil {
 		t.Fatal("expected an error when the Nomad dispatch fails")
+	}
+}
+
+func TestDispatchRunner_InvalidRepo(t *testing.T) {
+	a := newActs(fakeKV{}, &fakeGitHub{}, &fakeNomad{})
+	env := actEnv()
+	env.RegisterActivity(a.DispatchRunner)
+	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
+		Repo:   "no-slash",
+		Labels: []string{"self-hosted"},
+	}); err == nil {
+		t.Fatal("expected an error dispatching for an unparseable repo")
 	}
 }
 
@@ -352,7 +456,7 @@ func TestCountActiveRunners(t *testing.T) {
 	env := actEnv()
 	env.RegisterActivity(a.CountActiveRunners)
 
-	val, err := env.ExecuteActivity(a.CountActiveRunners)
+	val, err := env.ExecuteActivity(a.CountActiveRunners, []string{})
 	if err != nil {
 		t.Fatalf("CountActiveRunners: %v", err)
 	}
@@ -374,25 +478,41 @@ func TestCountActiveRunners(t *testing.T) {
 	}
 }
 
+func TestCountActiveRunners_UnionsAcrossJobs(t *testing.T) {
+	// A vault-mode runner comes from its own parent job; counting must span the
+	// default job and every extra job, or the extra-job bucket reads active = 0
+	// and over-provisions. Passing a duplicate extra job must not double-count.
+	nm := &fakeNomad{slotsByJob: map[string][]nomad.RunnerSlot{
+		"ci-runner":    {{RepoURL: "https://github.com/octo/a", Labels: "self-hosted"}},
+		"vault-runner": {{RepoURL: "https://github.com/octo/private", Labels: "self-hosted,custom"}},
+	}}
+	a := newActs(fakeKV{}, nil, nm)
+	env := actEnv()
+	env.RegisterActivity(a.CountActiveRunners)
+
+	val, err := env.ExecuteActivity(a.CountActiveRunners, []string{"vault-runner", "vault-runner"})
+	if err != nil {
+		t.Fatalf("CountActiveRunners: %v", err)
+	}
+	var counts map[string]int
+	if err := val.Get(&counts); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if counts["octo/a|self-hosted"] != 1 {
+		t.Errorf("default-job bucket = %d, want 1", counts["octo/a|self-hosted"])
+	}
+	if counts["octo/private|custom,self-hosted"] != 1 {
+		t.Errorf("extra-job bucket = %d, want 1 (counted once despite duplicate extra job)", counts["octo/private|custom,self-hosted"])
+	}
+}
+
 func TestCountActiveRunners_Error(t *testing.T) {
 	nm := &fakeNomad{slotsErr: errors.New("nomad down")}
 	a := newActs(fakeKV{}, nil, nm)
 	env := actEnv()
 	env.RegisterActivity(a.CountActiveRunners)
-	if _, err := env.ExecuteActivity(a.CountActiveRunners); err == nil {
+	if _, err := env.ExecuteActivity(a.CountActiveRunners, []string{}); err == nil {
 		t.Fatal("expected CountActiveRunners to propagate the Nomad error")
-	}
-}
-
-func TestDispatchRunner_InvalidRepo(t *testing.T) {
-	a := newActs(fakeKV{}, &fakeGitHub{}, &fakeNomad{})
-	env := actEnv()
-	env.RegisterActivity(a.DispatchRunner)
-	if _, err := env.ExecuteActivity(a.DispatchRunner, DispatchSpec{
-		Repo:   "no-slash",
-		Labels: []string{"self-hosted"},
-	}); err == nil {
-		t.Fatal("expected an error dispatching for an unparseable repo")
 	}
 }
 

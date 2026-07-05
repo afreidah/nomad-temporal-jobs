@@ -35,13 +35,18 @@ import (
 const defaultReapAfter = time.Hour
 
 // RunnerSpec is the child input: the repo the runner serves, the labels to
-// register it with, the profile image (empty => the Nomad job default), and an
-// optional reap override (0 => defaultReapAfter).
+// register it with, the parameterized job to dispatch (empty => the default
+// runner job), the profile image (empty => the Nomad job default), whether to
+// mint a registration token (app-mode) or let the job self-register (vault-mode),
+// and an optional reap override (0 => defaultReapAfter).
 type RunnerSpec struct {
-	Repo      string        `json:"repo"`
-	Labels    []string      `json:"labels"`
-	Image     string        `json:"image,omitempty"`
-	ReapAfter time.Duration `json:"reap_after,omitempty"`
+	Repo        string        `json:"repo"`
+	Labels      []string      `json:"labels"`
+	Job         string        `json:"job,omitempty"`
+	Image       string        `json:"image,omitempty"`
+	MintToken   bool          `json:"mint_token"`
+	VaultSecret string        `json:"vault_secret,omitempty"`
+	ReapAfter   time.Duration `json:"reap_after,omitempty"`
 }
 
 // HandleRunner dispatches one ephemeral runner for spec's (repo, labels) and
@@ -59,9 +64,12 @@ func HandleRunner(ctx workflow.Context, spec RunnerSpec) error {
 	})
 	var dispatchedID string
 	err := workflow.ExecuteActivity(dispatchCtx, a.DispatchRunner, activities.DispatchSpec{
-		Repo:   spec.Repo,
-		Labels: spec.Labels,
-		Image:  spec.Image,
+		Repo:        spec.Repo,
+		Labels:      spec.Labels,
+		Job:         spec.Job,
+		Image:       spec.Image,
+		MintToken:   spec.MintToken,
+		VaultSecret: spec.VaultSecret,
 	}).Get(dispatchCtx, &dispatchedID)
 	if err != nil {
 		return fmt.Errorf("dispatch runner for %s: %w", spec.Repo, err)
