@@ -144,12 +144,16 @@ Keeps each managed repository's CI/release token secret continuously valid so it
 
 ### Runner Scaler
 
-Scales self-hosted CI runners on demand (zero idle) instead of running them always-on. On a short schedule, the `PollAndDispatch` workflow reads the watched repos and runner profiles from Consul KV and, for each repo, lists the queued Actions jobs whose `runs-on` includes `self-hosted`. For each queued job it starts a child workflow keyed `runner-<repo>-<job_id>` with a reject-duplicate ID policy, so Temporal itself guarantees one runner per job — a job still queued on the next tick can't spawn a second runner, with no external state store. The child `HandleQueuedJob` mints a runner registration token and dispatches one ephemeral Nomad `ci-runner` carrying it; the token is minted inside the dispatch activity so it never enters workflow history. The runner is ephemeral (one job, then it self-deregisters); a backstop timer reaps a runner that never picked its job up. Profiles map a `runs-on` label to a runner image, so a workflow selects its toolchain via `runs-on: [self-hosted, <profile>]` and a bare `[self-hosted]` job gets the `default` profile. It reuses the token-renewer GitHub App, which additionally grants Administration (registration tokens) and Actions (queued-job discovery).
+Scales self-hosted CI runners on demand (zero idle) instead of running them always-on. On a short schedule, the `PollAndDispatch` workflow reads a per-repo provisioning config from Consul KV (`runners/config`) and, for each repo, lists the queued Actions jobs whose `runs-on` includes `self-hosted`. Rather than one child per job, it **reconciles by depth**: it buckets the queued jobs by `(repo, labels)`, counts the ephemeral runners already pending/running for each bucket, and starts `HandleRunner` children only for the shortfall. Ephemeral repo-scoped runners aren't bound to a specific job — GitHub hands any label-matching runner whichever job is queued — so a bucket left short is simply topped back up on the next tick; there is no per-job dedup or external state store.
+
+Each repo picks a **mode**. `app` repos are polled through the shared GitHub App, and the child mints a runner registration token inside the dispatch activity (so it never enters workflow history). `vault` repos are polled with a PAT read from the secret store and dispatch a self-registering runner job that mints nothing — the poll token (`vaultPath`, needs only Actions:read) is split from the registration token (`registerVaultPath`, needs repo admin), so a write-only collaborator can poll a repo it doesn't own while a higher-privilege PAT registers. Every runner is ephemeral (one job, then it self-deregisters); a backstop timer reaps one that never picked its job up.
+
+Ordered **profiles** map a distinguishing `runs-on` label to the parameterized Nomad job (and optional image) dispatched for it — first matching label wins — so a repo routes e.g. `vm`/`go` jobs to different runner pools, and a bare `[self-hosted]` job falls back to the default `ci-runner`. Each profile, or the repo as a whole, can set `maxConcurrent` to cap that pool's concurrent runners; overflow stays queued on GitHub until a slot frees.
 
 **Task queue:** `ci-runner-scaler-task-queue`
-**Workflows:** `PollAndDispatch`, `HandleQueuedJob`
+**Workflows:** `PollAndDispatch`, `HandleRunner`
 **Image:** `ci-runner-scaler`
-**Dependencies:** Vault (Workload Identity, holds the App key), Consul KV (repos + profiles), GitHub API, Nomad (job dispatch)
+**Dependencies:** Vault (Workload Identity — the App key for `app` repos, per-repo PATs for `vault` repos), Consul KV (`runners/config`), GitHub API, Nomad (job dispatch)
 
 ## Maintenance Sagas
 
@@ -339,15 +343,33 @@ The cert worker carries no static service tokens: it reads its Vault token from 
 
 ### Runner Scaler Worker
 
-Authenticates to Vault with its Workload Identity and pulls the GitHub App key through it (reusing the token-renewer App); Consul uses the local agent token and Nomad uses `NOMAD_TOKEN`.
+Authenticates to Vault with its Workload Identity and pulls credentials through it — the GitHub App key for `app`-mode repos, and the per-repo PATs for `vault`-mode repos; Consul uses the local agent token and Nomad uses `NOMAD_TOKEN`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GITHUB_APP_VAULT_PATH` | `github/token-renewer-app` | Vault KV path holding the App `app_id`, `installation_id`, `private_key` |
-| `RUNNERS_REPOS_KEY` | `runners/repos` | Consul KV key with the newline-separated `owner/repo` watch list |
-| `RUNNERS_PROFILES_KEY` | `runners/profiles` | Consul KV key with the JSON `label -> {image}` profile map |
-| `RUNNER_JOB_ID` | `ci-runner` | Parameterized Nomad job dispatched per runner |
+| `GITHUB_APP_VAULT_PATH` | `github/token-renewer-app` | Vault KV path holding the App `app_id`, `installation_id`, `private_key` (used by `app`-mode repos) |
+| `RUNNERS_CONFIG_KEY` | `runners/config` | Consul KV key with the per-repo provisioning config (JSON; see below) |
+| `RUNNER_JOB_ID` | `ci-runner` | Default parameterized Nomad job dispatched when no profile matches |
 | `NOMAD_TOKEN` | -- | Nomad API token (dispatch/stop the runner job) |
+
+The config at `RUNNERS_CONFIG_KEY` is a JSON object keyed by `owner/repo`:
+
+```json
+{
+  "owner/app-repo": { "mode": "app", "maxConcurrent": 6 },
+  "owner/vault-repo": {
+    "mode": "vault",
+    "vaultPath": "github/vault-repo-poll",
+    "registerVaultPath": "github/vault-repo-admin",
+    "profiles": [
+      { "label": "vm", "job": "vm-runner", "maxConcurrent": 2 },
+      { "label": "go", "job": "go-ci-runner", "maxConcurrent": 6 }
+    ]
+  }
+}
+```
+
+`mode` defaults to `app`. `vaultPath`/`registerVaultPath` apply only to `vault` mode (register falls back to poll when unset). `profiles` is optional and evaluated top-down; `maxConcurrent` (per-profile or repo-wide) is `0`/absent for unlimited.
 
 ## Observability
 
@@ -447,7 +469,7 @@ Each domain is deployed as a separate Nomad service job. Workflows are started o
 | `cleanup-worker` | service | `cleanup-worker` | `cleanup-task-queue` | `Cleanup`, `RegistryGC`, `AptlyCleanup`, `PostgresMaintenance` |
 | `cert-acquirer-worker` | service | `cert-acquirer-worker` | `cert-task-queue` | `CertAcquirer` |
 | `github-token-renewer` | service | `github-token-renewer` | `github-token-renewer-task-queue` | `RenewTokens` |
-| `ci-runner-scaler` | service | `ci-runner-scaler` | `ci-runner-scaler-task-queue` | `PollAndDispatch`, `HandleQueuedJob` |
+| `ci-runner-scaler` | service | `ci-runner-scaler` | `ci-runner-scaler-task-queue` | `PollAndDispatch`, `HandleRunner` |
 
 ### Manual Runs
 
@@ -527,6 +549,7 @@ nomad-temporal-jobs/
     containerd.go                    containerd gRPC API over an SSH socket tunnel (store-aware moby-store reclaim)
     rootfs.go                        SFTP sweep of orphaned /var/lib/docker/rootfs (mount-table guarded)
     buildx.go                        Dangling buildx builder-state volume removal (Docker volume API)
+    client/git/                      GitHub clients: App lister + registration-token minter (runners.go) and a PAT-backed lister for repos the App can't reach (pat.go)
   backup/
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-backup), includes ../_common.mk
     activities/
@@ -568,12 +591,12 @@ nomad-temporal-jobs/
   runnerscaler/                      ci-runner-scaler: on-demand ephemeral CI runners
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-nonroot), includes ../_common.mk
     activities/
-      activities.go                  Activity struct: read repos/profiles, list queued jobs, dispatch + reap runners
+      activities.go                  Activity struct: read per-repo config, list queued jobs, count active + dispatch/reap runners
     workflows/
-      poll_dispatch.go               PollAndDispatch parent: scan repos, start one child per queued job
-      handle_job.go                  HandleQueuedJob child: dispatch one ephemeral runner + backstop reap timer
+      poll_dispatch.go               PollAndDispatch parent: scan repos, reconcile runner count per (repo, labels) bucket
+      handle_job.go                  HandleRunner child: dispatch one ephemeral runner + backstop reap timer
     worker/
-      main.go                        Worker entry point (Vault App client, Consul, Nomad)
+      main.go                        Worker entry point (Vault App client, per-repo PAT listers, Consul, Nomad)
 ```
 
 ## License

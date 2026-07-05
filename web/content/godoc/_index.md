@@ -107,4 +107,18 @@ weight: 30
 </div>
 </a>
 
+<a class="landing-card" href="runnerscaler-activities/">
+<div>
+<strong>runnerscaler/activities</strong>
+<p>Read the per-repo provisioning config from Consul, list queued self-hosted Actions jobs (via the GitHub App or a PAT), count active runners, and dispatch/reap ephemeral Nomad runners &mdash; behind narrow consumer interfaces.</p>
+</div>
+</a>
+
+<a class="landing-card" href="runnerscaler-workflows/">
+<div>
+<strong>runnerscaler/workflows</strong>
+<p>PollAndDispatch reconciles runner supply against queued-job demand per (repo, labels) bucket with optional concurrency caps; HandleRunner dispatches one ephemeral runner and reaps it via a backstop timer.</p>
+</div>
+</a>
+
 </div>

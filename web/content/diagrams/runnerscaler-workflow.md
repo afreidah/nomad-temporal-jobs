@@ -4,7 +4,7 @@ linkTitle: "Runner Scaler"
 weight: 90
 ---
 
-Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `PollAndDispatch` parent reads the watched repos and runner profiles from Consul, then for each repo lists the queued Actions jobs whose `runs-on` includes `self-hosted` and starts one `HandleQueuedJob` child per job. Each child is keyed `runner-<repo>-<job_id>` with a reject-duplicate ID policy, so Temporal guarantees one runner per job &mdash; a job still queued on the next tick can't spawn a second runner, with no external state store. The child mints a registration token and dispatches one ephemeral Nomad `ci-runner`; a backstop timer reaps a runner that never picked its job up. **Hover over any step** for implementation details.
+Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `PollAndDispatch` parent loads the per-repo config from Consul (`runners/config`) and scans each repo for queued `self-hosted` Actions jobs, then **reconciles by depth**: it buckets the queued jobs by `(repo, labels)`, counts the runners already pending/running, and starts one `HandleRunner` child per missing runner &mdash; clamped by an optional `maxConcurrent` cap. A bucket left short is simply topped back up on the next tick, so there is no per-job dedup or external state store. Each child dispatches one ephemeral Nomad runner &mdash; `app`-mode repos mint a registration token, `vault`-mode repos pass a Vault secret path the runner self-registers with &mdash; and a backstop timer reaps a runner that never picked its job up. **Hover over any step** for implementation details.
 
 <style>
   #ac-diagram { margin: 1rem 0; }
@@ -45,28 +45,25 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
   var diagramSrc = [
     'flowchart TD',
     '    START([PollAndDispatch\\nParent]):::workflow --> DEFAULTS[Apply Config\\nDefaults]:::workflow',
-    '    DEFAULTS --> LISTREPOS[List Watched Repos\\nConsul KV]:::activity',
-    '    LISTREPOS --> LOADPROF[Load Profiles\\nConsul KV]:::activity',
-    '    LOADPROF --> ACQUIRE[Acquire Slot\\nsem = Concurrency]:::workflow',
-    '    ACQUIRE --> LISTJOBS[List Queued Jobs\\nGitHub self-hosted]:::activity',
+    '    DEFAULTS --> LOADCFG[Load Config\\nConsul runners/config]:::activity',
+    '    LOADCFG --> ACQUIRE[Acquire Slot\\nsem = Concurrency]:::workflow',
+    '    ACQUIRE --> LISTJOBS[List Queued Jobs\\nApp or PAT, per repo]:::activity',
     '    LISTJOBS --> JOBGATE{List\\nOK?}:::decision',
     '    JOBGATE -->|failed| SKIPREPO[Skip Repo\\nthis tick]:::error',
-    '    JOBGATE -->|ok| PERJOB{Queued\\nJobs?}:::decision',
-    '    PERJOB -->|none| MORE',
-    '    PERJOB -->|each job| STARTCHILD[Start Child\\nrunner-repo-jobid]:::workflow',
-    '    STARTCHILD --> DEDUP{Already\\nStarted?}:::decision',
-    '    DEDUP -->|new| COUNT[Count\\nStarted]:::workflow',
-    '    DEDUP -->|duplicate| SKIPDUP[Skip\\ndedup signal]:::error',
-    '    COUNT --> MORE{More\\nRepos?}:::decision',
-    '    SKIPREPO --> MORE',
-    '    SKIPDUP --> MORE',
-    '    MORE -->|yes, slot frees| ACQUIRE',
-    '    MORE -->|no| DONE([Poll Complete\\nsummary]):::workflow',
+    '    JOBGATE -->|ok| MOREREPOS{More\\nRepos?}:::decision',
+    '    SKIPREPO --> MOREREPOS',
+    '    MOREREPOS -->|yes, slot frees| ACQUIRE',
+    '    MOREREPOS -->|no, all scanned| COUNT[Count Active Runners\\nNomad, per bucket]:::activity',
+    '    COUNT --> BUCKET[Bucket Jobs\\nby repo + labels]:::workflow',
+    '    BUCKET --> RECONCILE{Shortfall?\\nqueued - active, capped}:::decision',
+    '    RECONCILE -->|covered| DONE([Poll Complete\\nsummary]):::workflow',
+    '    RECONCILE -->|each missing runner| STARTCHILD[Start Child\\nrunner-runid-seq]:::workflow',
+    '    STARTCHILD --> DONE',
     '',
     '    STARTCHILD -.spawns.-> CSTART',
-    '    CSTART([HandleQueuedJob\\nChild]):::workflow --> DISPATCH[Dispatch Runner\\nmint token + dispatch]:::activity',
-    '    DISPATCH --> TIMER[Backstop Timer\\nreap deadline]:::workflow',
-    '    TIMER --> REAP[Reap Runner\\nstop Nomad job]:::activity',
+    '    CSTART([HandleRunner\\nChild]):::workflow --> DISPATCH[Dispatch Runner\\nmint token or Vault secret]:::activity',
+    '    DISPATCH --> WAIT[Wait Runner Done\\nbackstop deadline]:::activity',
+    '    WAIT --> REAP[Reap Runner\\nstop Nomad job]:::activity',
     '    REAP --> CDONE([Child\\nComplete]):::workflow',
     '',
     '    classDef workflow fill:#7c3aed,stroke:#a78bfa,color:#fff,font-weight:bold',
@@ -97,15 +94,10 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
       badge: 'workflow', badgeText: 'workflow logic',
       body: '<p>Fills unset fields deterministically across replay. <code>Concurrency</code>: <code>4</code> &mdash; forced positive so the semaphore can\'t size to 0 and deadlock.</p>'
     },
-    LISTREPOS: {
-      title: 'List Watched Repos',
+    LOADCFG: {
+      title: 'Load Config',
       badge: 'activity', badgeText: 'activity',
-      body: '<p><code>ListWatchedRepos</code> reads the newline-separated <code>owner/repo</code> list from Consul KV (<code>runners/repos</code>), skipping blanks and <code>#</code> comments. A missing key is non-retryable.</p>'
-    },
-    LOADPROF: {
-      title: 'Load Profiles',
-      badge: 'activity', badgeText: 'activity',
-      body: '<p><code>LoadProfiles</code> reads the JSON <code>label -> {image}</code> map from Consul KV (<code>runners/profiles</code>). A missing key is not an error &mdash; runners then use the Nomad job\'s default image. Malformed JSON is non-retryable.</p>'
+      body: '<p><code>LoadConfig</code> reads the per-repo JSON from Consul KV (<code>runners/config</code>): a map of <code>owner/repo</code> &rarr; <code>{mode, vaultPath, registerVaultPath, profiles[], maxConcurrent}</code>. Repos are then scanned in sorted order for deterministic replay. A missing or malformed key is non-retryable.</p>'
     },
     ACQUIRE: {
       title: 'Acquire Slot (semaphore)',
@@ -115,7 +107,7 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
     LISTJOBS: {
       title: 'List Queued Jobs (per repo)',
       badge: 'activity', badgeText: 'activity, per-repo',
-      body: '<p><code>ListQueuedJobs</code> enumerates the repo\'s queued/in_progress workflow runs and keeps the jobs that are still <code>queued</code> with a <code>self-hosted</code> label (de-duplicated by job ID). 3 attempts with backoff.</p>'
+      body: '<p><code>ListQueuedJobs</code> enumerates the repo\'s queued/in_progress workflow runs and keeps the jobs still <code>queued</code> with a <code>self-hosted</code> label. <code>app</code>-mode repos use the shared GitHub App installation client; <code>vault</code>-mode repos use a PAT read from the repo\'s <code>vaultPath</code>. 3 attempts with backoff.</p>'
     },
     JOBGATE: {
       title: 'List OK?',
@@ -127,55 +119,50 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
       badge: 'error', badgeText: 'non-fatal',
       body: '<p>The failure is logged and the repo is retried on the next scheduled tick.</p>'
     },
-    PERJOB: {
-      title: 'Queued Jobs?',
-      badge: 'decision', badgeText: 'fan-out',
-      body: '<p>For each queued self-hosted job, the parent attempts to start one runner child.</p>'
+    MOREREPOS: {
+      title: 'More Repos?',
+      badge: 'decision', badgeText: 'scan loop',
+      body: '<p>Each completed scan frees a slot for the next repo. Once every repo has been scanned, the parent moves from scanning to reconciliation.</p>'
+    },
+    COUNT: {
+      title: 'Count Active Runners',
+      badge: 'activity', badgeText: 'activity',
+      body: '<p><code>CountActiveRunners</code> tallies the pending/running ephemeral runners per <code>(repo, labels)</code> bucket, across every dispatch job a profile names (not just the default) so a bucket served by a non-default job isn\'t miscounted as empty. Fatal to the tick if it fails &mdash; dispatching without it would double-provision.</p>'
+    },
+    BUCKET: {
+      title: 'Bucket Queued Jobs',
+      badge: 'workflow', badgeText: 'workflow logic',
+      body: '<p>Queued jobs are grouped by <code>(repo, labels)</code>; each bucket\'s demand is its queued count. Buckets are processed in deterministic order.</p>'
+    },
+    RECONCILE: {
+      title: 'Shortfall?',
+      badge: 'decision', badgeText: 'reconcile by depth',
+      body: '<p><code>needed = queued &minus; active</code>, clamped to the pool\'s <code>maxConcurrent</code> (the matched profile\'s cap, else the repo-wide cap). A covered or over-covered bucket dispatches nothing; overflow stays queued on GitHub until a runner frees.</p>'
     },
     STARTCHILD: {
       title: 'Start Child',
       badge: 'workflow', badgeText: 'child workflow',
-      body: '<p>Starts <code>HandleQueuedJob</code> with <code>WorkflowID = runner-&lt;repo&gt;-&lt;job_id&gt;</code>, <code>REJECT_DUPLICATE</code> reuse, and <code>ABANDON</code> parent-close. The parent waits for the child to <i>start</i> (not finish) so an abandoned child is never dropped. The profile label (first non-<code>self-hosted</code> label, else <code>default</code>) selects the image.</p>'
-    },
-    DEDUP: {
-      title: 'Already Started?',
-      badge: 'decision', badgeText: 'dedup',
-      body: '<p>The reject-duplicate ID policy is the entire state store: if a child for this job ID already exists (running or closed), the start is rejected. That rejection is the expected signal that the job was already handled.</p>'
-    },
-    COUNT: {
-      title: 'Count Started',
-      badge: 'workflow', badgeText: 'workflow logic',
-      body: '<p>A newly started child increments the tick\'s <code>RunnersStarted</code> total.</p>'
-    },
-    SKIPDUP: {
-      title: 'Skip (dedup signal)',
-      badge: 'error', badgeText: 'expected',
-      body: '<p>An already-started child is counted as skipped, not an error &mdash; this is how the scaler avoids a second runner for a job still queued across ticks.</p>'
-    },
-    MORE: {
-      title: 'More Repos?',
-      badge: 'decision', badgeText: 'fan-out loop',
-      body: '<p>Each completed scan frees a slot for the next repo, until all have run.</p>'
+      body: '<p>Starts <code>HandleRunner</code> with <code>WorkflowID = runner-&lt;parent-run-id&gt;-&lt;seq&gt;</code>, <code>ALLOW_DUPLICATE</code> reuse, and <code>ABANDON</code> parent-close. The parent waits for the child to <i>start</i> (not finish) so an abandoned child is never dropped. The first matching profile selects the runner job + image; a bare <code>[self-hosted]</code> job falls back to the default job.</p>'
     },
     DONE: {
       title: 'Poll Complete',
       badge: 'workflow', badgeText: 'result',
-      body: '<p>Returns <code>PollResult</code> (repos scanned, runners started, skipped). Children outlive this tick.</p>'
+      body: '<p>Returns <code>PollResult</code> (repos scanned, queued, active, started). Children outlive this tick.</p>'
     },
     CSTART: {
-      title: 'HandleQueuedJob Child',
+      title: 'HandleRunner Child',
       badge: 'workflow', badgeText: 'child entry',
-      body: '<p>One child backs one queued job. Receives <code>JobSpec</code> (repo, job ID, labels, profile image, reap backstop).</p>'
+      body: '<p>One child backs one runner slot. Receives <code>RunnerSpec</code> (repo, labels, job, image, mint-vs-vault, reap backstop).</p>'
     },
     DISPATCH: {
       title: 'Dispatch Runner',
       badge: 'activity', badgeText: 'activity, NoRetry',
-      body: '<p><code>DispatchRunner</code> mints a runner registration token (Administration on the App) and dispatches one ephemeral Nomad <code>ci-runner</code> with <code>repo_url</code> / <code>runner_token</code> / <code>labels</code> / <code>runner_image</code> meta. The token is minted inside the activity, so it never enters workflow history. NoRetry: each call creates a runner, so a retried dispatch would double up.</p>'
+      body: '<p><code>DispatchRunner</code> dispatches one ephemeral parameterized Nomad job with <code>repo_url</code> / <code>labels</code> (and <code>runner_image</code>) meta. <code>app</code>-mode mints a registration token (<code>runner_token</code>, minted inside the activity so it never enters workflow history); <code>vault</code>-mode passes <code>runner_secret</code> &mdash; a Vault path the job reads to self-register, minting nothing. NoRetry: each call creates a runner, so a retried dispatch would double up.</p>'
     },
-    TIMER: {
-      title: 'Backstop Timer',
-      badge: 'workflow', badgeText: 'durable timer',
-      body: '<p>A <code>workflow.NewTimer</code> sized as an upper bound on a single CI job. The ephemeral runner takes one job and self-deregisters well before it fires, so on the happy path the reap simply finds the job already gone.</p>'
+    WAIT: {
+      title: 'Wait Runner Done',
+      badge: 'activity', badgeText: 'activity, heartbeat',
+      body: '<p><code>WaitRunnerDone</code> blocks (heartbeating) until the ephemeral runner\'s Nomad job completes, bounded by a backstop deadline sized as an upper bound on one CI job. On the happy path the runner takes its one job and exits well before it fires.</p>'
     },
     REAP: {
       title: 'Reap Runner',
@@ -185,7 +172,7 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
     CDONE: {
       title: 'Child Complete',
       badge: 'workflow', badgeText: 'result',
-      body: '<p>The runner was dispatched and the backstop reap ran. GitHub auto-removes the offline ephemeral runner registration.</p>'
+      body: '<p>The runner ran its job and was reaped. GitHub auto-removes the offline ephemeral runner registration.</p>'
     }
   };
 
@@ -294,4 +281,4 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
 | <span style="color:#a78bfa">**Purple**</span> | Workflow logic |
 | <span style="color:#34d399">**Emerald**</span> | Activities (I/O operations) |
 | <span style="color:#14b8a6">**Teal**</span> | Decision points |
-| <span style="color:#f85149">**Red**</span> | Skips (non-fatal / expected dedup) |
+| <span style="color:#f85149">**Red**</span> | Skips (non-fatal) |
