@@ -125,6 +125,8 @@ type ProfileRule struct {
 	Label string `json:"label"`
 	Job   string `json:"job,omitempty"`
 	Image string `json:"image,omitempty"`
+	// Cap on concurrent runners for this pool; 0 = unlimited.
+	MaxConcurrent int `json:"maxConcurrent,omitempty"`
 }
 
 // Config holds the scaler activities' dependencies and Consul locations.

@@ -151,6 +151,10 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 		// range over a negative shortfall iterates zero times -- an over-covered
 		// bucket dispatches nothing.
 		needed := b.queued - active
+		// Clamp to the pool's concurrency ceiling; overflow stays queued on GitHub.
+		if limit := matchProfile(repoCfgs[b.repo].Profiles, b.labels).MaxConcurrent; limit > 0 && needed > limit-active {
+			needed = limit - active
+		}
 		for range needed {
 			if err := startRunnerChild(ctx, b.repo, b.labels, repoCfgs[b.repo], config.ReapAfter, seq); err != nil {
 				logger.Warn("Failed to start runner child", "repo", b.repo, "labels", b.labels, "error", err)

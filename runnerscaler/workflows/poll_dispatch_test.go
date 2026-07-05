@@ -133,6 +133,45 @@ func TestPollAndDispatch_NoShortfallStartsNothing(t *testing.T) {
 	}
 }
 
+func TestPollAndDispatch_MaxConcurrentCapsDispatch(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	env.OnActivity(a.LoadConfig, mock.Anything).Return(map[string]activities.RepoConfig{
+		"octo/a": {
+			Mode: activities.ModeApp,
+			Profiles: []activities.ProfileRule{
+				{Label: "go", Job: "std-runner", MaxConcurrent: 2},
+			},
+		},
+	}, nil)
+	// 5 queued, 1 already in flight -> only 1 more (cap 2 - active 1), not 4.
+	env.OnActivity(a.ListQueuedJobs, mock.Anything, forRepo("octo/a")).Return([]git.QueuedJob{
+		{ID: 1, Labels: []string{"self-hosted", "go"}},
+		{ID: 2, Labels: []string{"self-hosted", "go"}},
+		{ID: 3, Labels: []string{"self-hosted", "go"}},
+		{ID: 4, Labels: []string{"self-hosted", "go"}},
+		{ID: 5, Labels: []string{"self-hosted", "go"}},
+	}, nil)
+	env.OnActivity(a.CountActiveRunners, mock.Anything, mock.Anything).Return(
+		map[string]int{"octo/a|go,self-hosted": 1}, nil)
+
+	env.RegisterWorkflow(HandleRunner)
+	env.OnWorkflow(HandleRunner, mock.Anything, mock.Anything).Return(nil)
+
+	env.ExecuteWorkflow(PollAndDispatch, PollConfig{})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var result PollResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if result.RunnersStarted != 1 {
+		t.Errorf("started = %d, want 1 (capped at MaxConcurrent 2, 1 active)", result.RunnersStarted)
+	}
+}
+
 func TestPollAndDispatch_RepoErrorIsSkipped(t *testing.T) {
 	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
 
