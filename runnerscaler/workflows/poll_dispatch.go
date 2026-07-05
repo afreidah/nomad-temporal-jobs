@@ -151,8 +151,14 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 		// range over a negative shortfall iterates zero times -- an over-covered
 		// bucket dispatches nothing.
 		needed := b.queued - active
-		// Clamp to the pool's concurrency ceiling; overflow stays queued on GitHub.
-		if limit := matchProfile(repoCfgs[b.repo].Profiles, b.labels).MaxConcurrent; limit > 0 && needed > limit-active {
+		// Clamp to the pool's concurrency ceiling (profile cap, else the repo-wide
+		// cap); overflow stays queued on GitHub.
+		rc := repoCfgs[b.repo]
+		limit := matchProfile(rc.Profiles, b.labels).MaxConcurrent
+		if limit == 0 {
+			limit = rc.MaxConcurrent
+		}
+		if limit > 0 && needed > limit-active {
 			needed = limit - active
 		}
 		for range needed {

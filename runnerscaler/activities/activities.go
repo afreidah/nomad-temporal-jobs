@@ -118,6 +118,9 @@ type RepoConfig struct {
 	// evaluated in order; the first whose Label is among a queued job's labels
 	// wins. Empty means the default job (RunnerJobID) with the job's own image.
 	Profiles []ProfileRule `json:"profiles,omitempty"`
+	// Repo-wide runner cap; used for buckets no profile matches and as the default
+	// for profiles that set none. 0 = unlimited.
+	MaxConcurrent int `json:"maxConcurrent,omitempty"`
 }
 
 // ProfileRule maps a runs-on label to the runner job dispatched for it.

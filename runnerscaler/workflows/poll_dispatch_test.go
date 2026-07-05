@@ -172,6 +172,37 @@ func TestPollAndDispatch_MaxConcurrentCapsDispatch(t *testing.T) {
 	}
 }
 
+func TestPollAndDispatch_RepoLevelMaxConcurrentCaps(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	// No profiles: the repo-wide cap applies to the default bucket.
+	env.OnActivity(a.LoadConfig, mock.Anything).Return(map[string]activities.RepoConfig{
+		"octo/a": {Mode: activities.ModeApp, MaxConcurrent: 2},
+	}, nil)
+	env.OnActivity(a.ListQueuedJobs, mock.Anything, forRepo("octo/a")).Return([]git.QueuedJob{
+		{ID: 1, Labels: []string{"self-hosted"}},
+		{ID: 2, Labels: []string{"self-hosted"}},
+		{ID: 3, Labels: []string{"self-hosted"}},
+	}, nil)
+	env.OnActivity(a.CountActiveRunners, mock.Anything, mock.Anything).Return(map[string]int{}, nil)
+
+	env.RegisterWorkflow(HandleRunner)
+	env.OnWorkflow(HandleRunner, mock.Anything, mock.Anything).Return(nil)
+
+	env.ExecuteWorkflow(PollAndDispatch, PollConfig{})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var result PollResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if result.RunnersStarted != 2 {
+		t.Errorf("started = %d, want 2 (repo-wide cap 2)", result.RunnersStarted)
+	}
+}
+
 func TestPollAndDispatch_RepoErrorIsSkipped(t *testing.T) {
 	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
 
