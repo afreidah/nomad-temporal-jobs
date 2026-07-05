@@ -92,7 +92,17 @@ func (g *GitHub) ListQueuedSelfHostedJobs(ctx context.Context, owner, repo strin
 	if err != nil {
 		return nil, err
 	}
+	return listQueuedSelfHostedJobs(ctx, cli, owner, repo)
+}
 
+// listQueuedSelfHostedJobs is the token-agnostic core of queued-job discovery:
+// it works off an already-authenticated client, so both the App path (a
+// per-call installation token) and the PAT path (GitHubPAT) share one
+// implementation. GitHub has no "list queued jobs" endpoint, so it enumerates
+// runs that are queued or in_progress (a multi-job run can be in_progress with
+// one leg still waiting) and keeps the queued, self-hosted jobs under them,
+// de-duplicating by job ID across the two run states.
+func listQueuedSelfHostedJobs(ctx context.Context, cli *github.Client, owner, repo string) ([]QueuedJob, error) {
 	var all []QueuedJob
 	for _, status := range []string{"queued", "in_progress"} {
 		runIDs, err := listWorkflowRunIDs(ctx, cli, owner, repo, status)

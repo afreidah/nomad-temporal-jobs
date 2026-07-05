@@ -3,24 +3,27 @@
 //
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
-// PollAndDispatch is the scheduled entry point. Each tick it loads the watched
-// repos and runner profiles, scans the repos (bounded concurrency) for queued
-// self-hosted Actions jobs, and reconciles supply against demand: it buckets the
-// queued jobs by (repo, labels), counts the active (pending/running) ephemeral
-// runners in each bucket, and starts HandleRunner children only for the
-// shortfall. Ephemeral repo-scoped runners are not bound to a specific job_id --
-// GitHub hands any label-matching runner whichever job is queued -- so keying one
-// child per job (the old model) stranded a job whenever its runner was diverted
-// to another job and never retried it. Reconciling by depth self-heals: a job
-// left unserved is still queued next tick and simply tops the count back up.
-// Children are abandoned (they outlive this tick); the parent waits only for each
-// to *start*. Pure orchestration; all I/O is in activities.
+// PollAndDispatch is the scheduled entry point. Each tick it loads the per-repo
+// config (each repo's provisioning mode + profiles), scans the repos (bounded
+// concurrency) for queued self-hosted Actions jobs, and reconciles supply
+// against demand: it buckets the queued jobs by (repo, labels), counts the
+// active (pending/running) ephemeral runners in each bucket across every
+// dispatched job, and starts HandleRunner children only for the shortfall.
+// Ephemeral repo-scoped runners are not bound to a specific job_id -- GitHub
+// hands any label-matching runner whichever job is queued -- so keying one child
+// per job (the old model) stranded a job whenever its runner was diverted to
+// another job and never retried it. Reconciling by depth self-heals: a job left
+// unserved is still queued next tick and simply tops the count back up. Children
+// are abandoned (they outlive this tick); the parent waits only for each to
+// *start*. Pure orchestration; all I/O is in activities.
 // -------------------------------------------------------------------------------
 
 package workflows
 
 import (
 	"fmt"
+	"slices"
+	"sort"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
@@ -33,10 +36,6 @@ import (
 
 // a is a nil-typed activity stub for compile-time method references.
 var a *activities.Activities
-
-// defaultProfile is the profile label used for a bare `runs-on: [self-hosted]`
-// job that names no profile.
-const defaultProfile = "default"
 
 // PollConfig is the workflow input.
 type PollConfig struct {
@@ -69,23 +68,26 @@ type runnerBucket struct {
 	queued int
 }
 
-// PollAndDispatch scans every watched repo for queued self-hosted jobs and tops
-// up the runner count per (repo, labels) bucket to cover them.
+// PollAndDispatch scans every configured repo for queued self-hosted jobs and
+// tops up the runner count per (repo, labels) bucket to cover them.
 func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, error) {
 	logger := workflow.GetLogger(ctx)
 	config.applyDefaults()
 
 	quickCtx := workflow.WithActivityOptions(ctx, shared.QuickActivityOptions())
 
-	var repos []string
-	if err := workflow.ExecuteActivity(quickCtx, a.ListWatchedRepos).Get(quickCtx, &repos); err != nil {
-		return nil, fmt.Errorf("list watched repos: %w", err)
+	var repoCfgs map[string]activities.RepoConfig
+	if err := workflow.ExecuteActivity(quickCtx, a.LoadConfig).Get(quickCtx, &repoCfgs); err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
 	}
-	var profiles map[string]activities.Profile
-	if err := workflow.ExecuteActivity(quickCtx, a.LoadProfiles).Get(quickCtx, &profiles); err != nil {
-		return nil, fmt.Errorf("load profiles: %w", err)
+	// Iterate repos in sorted order so every derived slice (scan results, the
+	// extra-job list handed to CountActiveRunners) is deterministic across replay.
+	repos := make([]string, 0, len(repoCfgs))
+	for repo := range repoCfgs {
+		repos = append(repos, repo)
 	}
-	logger.Info("Polling for queued runners", "repos", len(repos), "profiles", len(profiles), "concurrency", config.Concurrency)
+	sort.Strings(repos)
+	logger.Info("Polling for queued runners", "repos", len(repos), "concurrency", config.Concurrency)
 
 	// Scan repos with bounded concurrency; results land per-index so the
 	// post-barrier reconciliation stays deterministic (no concurrent appends).
@@ -93,6 +95,7 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 	sem := workflow.NewBufferedChannel(ctx, config.Concurrency)
 	wg := workflow.NewWaitGroup(ctx)
 	for i, repo := range repos {
+		rc := repoCfgs[repo]
 		wg.Add(1)
 		workflow.Go(ctx, func(gctx workflow.Context) {
 			defer wg.Done()
@@ -100,8 +103,9 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 			defer sem.Receive(gctx, nil)
 
 			rctx := workflow.WithActivityOptions(gctx, shared.QuickActivityOptions())
+			pr := activities.PollRepo{Repo: repo, Mode: rc.Mode, VaultPath: rc.VaultPath}
 			var jobs []git.QueuedJob
-			if err := workflow.ExecuteActivity(rctx, a.ListQueuedJobs, repo).Get(rctx, &jobs); err != nil {
+			if err := workflow.ExecuteActivity(rctx, a.ListQueuedJobs, pr).Get(rctx, &jobs); err != nil {
 				logger.Warn("List queued jobs failed; skipping repo this tick", "repo", repo, "error", err)
 				return
 			}
@@ -111,10 +115,11 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 	wg.Wait(ctx)
 
 	// Count the runners already in flight per (repo, labels) bucket so we top up
-	// only the shortfall. A failure here is fatal to the tick: dispatching without
-	// the active count would double-provision every queued job.
+	// only the shortfall, across every dispatched job any profile names (the
+	// default job plus each profile's job). A failure here is fatal to the tick:
+	// dispatching without the active count would double-provision every queued job.
 	var activeCounts map[string]int
-	if err := workflow.ExecuteActivity(quickCtx, a.CountActiveRunners).Get(quickCtx, &activeCounts); err != nil {
+	if err := workflow.ExecuteActivity(quickCtx, a.CountActiveRunners, profileJobs(repos, repoCfgs)).Get(quickCtx, &activeCounts); err != nil {
 		return nil, fmt.Errorf("count active runners: %w", err)
 	}
 
@@ -146,8 +151,18 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 		// range over a negative shortfall iterates zero times -- an over-covered
 		// bucket dispatches nothing.
 		needed := b.queued - active
+		// Clamp to the pool's concurrency ceiling (profile cap, else the repo-wide
+		// cap); overflow stays queued on GitHub.
+		rc := repoCfgs[b.repo]
+		limit := matchProfile(rc.Profiles, b.labels).MaxConcurrent
+		if limit == 0 {
+			limit = rc.MaxConcurrent
+		}
+		if limit > 0 && needed > limit-active {
+			needed = limit - active
+		}
 		for range needed {
-			if err := startRunnerChild(ctx, b.repo, b.labels, profiles, config.ReapAfter, seq); err != nil {
+			if err := startRunnerChild(ctx, b.repo, b.labels, repoCfgs[b.repo], config.ReapAfter, seq); err != nil {
 				logger.Warn("Failed to start runner child", "repo", b.repo, "labels", b.labels, "error", err)
 			} else {
 				result.RunnersStarted++
@@ -162,12 +177,31 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 	return result, nil
 }
 
+// profileJobs collects the distinct non-empty parameterized job IDs named by any
+// repo profile, in deterministic order (sorted repos, then profile order), so
+// CountActiveRunners can tally active runners across every dispatch job -- not
+// just the default one -- without a bucket served by a non-default job reading
+// active = 0 and over-provisioning.
+func profileJobs(repos []string, repoCfgs map[string]activities.RepoConfig) []string {
+	var jobs []string
+	seen := map[string]bool{}
+	for _, repo := range repos {
+		for _, rule := range repoCfgs[repo].Profiles {
+			if rule.Job != "" && !seen[rule.Job] {
+				seen[rule.Job] = true
+				jobs = append(jobs, rule.Job)
+			}
+		}
+	}
+	return jobs
+}
+
 // startRunnerChild starts one HandleRunner child for a (repo, labels) bucket.
 // The child ID is unique per (parent run, seq) so tops-up never collide, and the
 // child is abandoned so it outlives this tick -- but the parent waits for it to
 // start so an abandoned child is never dropped. Unlike the old per-job model
 // there is no dedup: the parent already reconciled how many to start.
-func startRunnerChild(ctx workflow.Context, repo string, labels []string, profiles map[string]activities.Profile, reapAfter time.Duration, seq int) error {
+func startRunnerChild(ctx workflow.Context, repo string, labels []string, rc activities.RepoConfig, reapAfter time.Duration, seq int) error {
 	runID := workflow.GetInfo(ctx).WorkflowExecution.RunID
 	childCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
 		WorkflowID:            fmt.Sprintf("runner-%s-%d", runID, seq),
@@ -175,11 +209,23 @@ func startRunnerChild(ctx workflow.Context, repo string, labels []string, profil
 		ParentClosePolicy:     enumspb.PARENT_CLOSE_POLICY_ABANDON,
 	})
 
+	rule := matchProfile(rc.Profiles, labels)
+	// vault-mode carries the repo's *registration* secret path so the dispatched
+	// job self-registers -- distinct from the poll token when registration needs
+	// higher privilege (RegisterVaultPath), else the same token (VaultPath).
+	// app-mode (both empty) mints a token instead.
+	registerSecret := rc.RegisterVaultPath
+	if registerSecret == "" {
+		registerSecret = rc.VaultPath
+	}
 	spec := RunnerSpec{
-		Repo:      repo,
-		Labels:    labels,
-		Image:     profiles[profileLabel(labels)].Image,
-		ReapAfter: reapAfter,
+		Repo:        repo,
+		Labels:      labels,
+		Job:         rule.Job,
+		Image:       rule.Image,
+		MintToken:   !isVaultMode(rc.Mode),
+		VaultSecret: registerSecret,
+		ReapAfter:   reapAfter,
 	}
 
 	child := workflow.ExecuteChildWorkflow(childCtx, HandleRunner, spec)
@@ -187,13 +233,21 @@ func startRunnerChild(ctx workflow.Context, repo string, labels []string, profil
 	return child.GetChildWorkflowExecution().Get(childCtx, &exec)
 }
 
-// profileLabel picks the runner profile for a job from its runs-on labels: the
-// first label that isn't "self-hosted", or "default" for a bare self-hosted job.
-func profileLabel(labels []string) string {
-	for _, l := range labels {
-		if l != "self-hosted" {
-			return l
+// matchProfile selects the profile rule for a job from its runs-on labels: the
+// first rule (in config order) whose Label the job carries. A repo with no
+// profiles -- or a job matching none -- yields the zero rule, i.e. the default
+// job and no image override, which is the plain self-hosted case.
+func matchProfile(profiles []activities.ProfileRule, labels []string) activities.ProfileRule {
+	for _, rule := range profiles {
+		if slices.Contains(labels, rule.Label) {
+			return rule
 		}
 	}
-	return defaultProfile
+	return activities.ProfileRule{}
+}
+
+// isVaultMode reports whether mode is the vault (self-registering) strategy; any
+// other value -- including the empty default -- is app-mode, which mints a token.
+func isVaultMode(mode string) bool {
+	return mode == activities.ModeVault
 }

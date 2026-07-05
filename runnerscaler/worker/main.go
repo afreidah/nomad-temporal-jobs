@@ -4,14 +4,14 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Starts a Temporal worker on the ci-runner-scaler-task-queue that polls GitHub
-// for queued self-hosted Actions jobs and dispatches one ephemeral Nomad runner
-// per job, leaning on Temporal's workflow-ID dedup so there is no external state
-// store. The worker authenticates to Vault with its Nomad Workload Identity and
-// pulls the GitHub App key through that client (the same App the token renewer
-// uses), so the only secret the Nomad job carries is its identity. Consul (the
-// watched repos + profiles) uses the local agent's default token; Nomad uses its
-// NOMAD_TOKEN. The shared runtime owns tracing, logging, metrics, and the
-// Temporal client.
+// for queued self-hosted Actions jobs and dispatches ephemeral Nomad runners to
+// cover them, reconciling by depth so there is no external state store. The
+// worker authenticates to Vault with its Nomad Workload Identity and pulls the
+// GitHub App key through that client (the same App the token renewer uses); it
+// also reads runner PATs through Vault for vault-mode repos the App can't reach,
+// so the only secret the Nomad job carries is its identity. Consul (the per-repo
+// config) uses the local agent's default token; Nomad uses its NOMAD_TOKEN. The
+// shared runtime owns tracing, logging, metrics, and the Temporal client.
 // -------------------------------------------------------------------------------
 
 package main
@@ -52,8 +52,8 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			// Consul KV (watched repos + runner profiles) uses the local agent's
-			// default ACL token over host networking -- no per-worker Consul token.
+			// Consul KV (per-repo runner config) uses the local agent's default
+			// ACL token over host networking -- no per-worker Consul token.
 			kv, err := consul.NewConsul(ctx, nil)
 			if err != nil {
 				return nil, err
@@ -63,12 +63,15 @@ func main() {
 				return nil, err
 			}
 
+			// Vault doubles as the vault-mode PAT source: repos the App can't reach
+			// carry a runner token in the secret store, read per poll via ReadKV.
+			// The default NewPATLister (git.NewGitHubPAT) is left in place.
 			acts := activities.New(activities.Config{
 				GitHub:      gh,
 				KV:          kv,
 				Nomad:       nm,
-				RepoListKey: os.Getenv("RUNNERS_REPOS_KEY"),
-				ProfilesKey: os.Getenv("RUNNERS_PROFILES_KEY"),
+				Vault:       vc,
+				ConfigKey:   os.Getenv("RUNNERS_CONFIG_KEY"),
 				RunnerJobID: os.Getenv("RUNNER_JOB_ID"),
 			})
 			w.RegisterWorkflow(workflows.PollAndDispatch)
