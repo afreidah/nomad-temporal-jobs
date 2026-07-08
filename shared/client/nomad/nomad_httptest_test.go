@@ -63,10 +63,12 @@ func nomadStub(failPath string) *httptest.Server {
 				{ID: "a1", NodeID: "n1", ClientStatus: api.AllocClientStatusRunning},
 			})
 		case r.Method == http.MethodGet && p == "/v1/job/aptly":
-			// First docker task wins; the exec task ahead of it is skipped.
+			// Mirrors the real aptly job: prestart alpine sidecar precedes the
+			// aptly workload task, so JobImage must skip the sidecar and resolve
+			// the task named after the job.
 			_ = enc.Encode(&api.Job{TaskGroups: []*api.TaskGroup{{Tasks: []*api.Task{
-				{Driver: "exec", Config: map[string]any{"command": "/bin/true"}},
-				{Driver: "docker", Config: map[string]any{"image": "aptly:1.6.3"}},
+				{Name: "setup-gpg", Driver: "docker", Lifecycle: &api.TaskLifecycle{Hook: "prestart"}, Config: map[string]any{"image": "alpine:3.23.4"}},
+				{Name: "aptly", Driver: "docker", Config: map[string]any{"image": "aptly:1.6.3"}},
 			}}}})
 		case r.Method == http.MethodGet && p == "/v1/job/noimage":
 			// A job with no docker-driver image at all.
