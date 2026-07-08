@@ -34,6 +34,7 @@ import (
 // structurally.
 type nomad interface {
 	FindJobNode(ctx context.Context, jobName string) (nomadclient.NomadNode, error)
+	JobImage(ctx context.Context, jobName string) (string, error)
 	ScaleJob(ctx context.Context, jobName, groupName string, count int, reason string) error
 	WaitAllocCount(ctx context.Context, jobName string, target int, interval time.Duration, onPoll func(running int)) error
 }
@@ -83,6 +84,28 @@ func (a *SagaActivities) FindJobNode(ctx context.Context, jobName string) (NodeI
 		HTTPAddr: node.HTTPAddr,
 		IsOracle: strings.HasPrefix(node.Name, "oracle"),
 	}, nil
+}
+
+// -------------------------------------------------------------------------
+// RESOLVE JOB IMAGE
+// -------------------------------------------------------------------------
+
+// ResolveJobImage returns the docker image the named job is configured to run,
+// so a saga's one-shot helper container tracks the deployed image automatically
+// instead of a hard-coded tag that breaks on every upgrade.
+func (a *SagaActivities) ResolveJobImage(ctx context.Context, jobName string) (string, error) {
+	logger := activity.GetLogger(ctx)
+	logger.Info("Resolving job image", "job", jobName)
+
+	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.resolve_job_image")
+	defer span.End()
+
+	image, err := a.nomad.JobImage(ctx, jobName)
+	if err != nil {
+		return "", err
+	}
+	logger.Info("Resolved job image", "job", jobName, "image", image)
+	return image, nil
 }
 
 // -------------------------------------------------------------------------

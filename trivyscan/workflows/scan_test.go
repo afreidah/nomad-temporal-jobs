@@ -40,11 +40,11 @@ func TestScan_Success(t *testing.T) {
 		ScannedAt: time.Now(),
 	}
 
+	// Successful scans persist inline in ScanImage, so SaveScanResult is not
+	// called on the happy path.
 	env.OnActivity(a.GetRunningImages, mock.Anything).Return(images, nil)
 	env.OnActivity(a.ScanImage, mock.Anything, "nginx:latest").Return(scanResult, nil)
 	env.OnActivity(a.ScanImage, mock.Anything, "redis:7").Return(scanResult2, nil)
-	env.OnActivity(a.SaveScanResult, mock.Anything, scanResult).Return(nil)
-	env.OnActivity(a.SaveScanResult, mock.Anything, scanResult2).Return(nil)
 
 	env.ExecuteWorkflow(Scan, activities.ScanConfig{Concurrency: 2})
 
@@ -111,8 +111,8 @@ func TestScan_ScanFailureContinues(t *testing.T) {
 	env.OnActivity(a.ScanImage, mock.Anything, "bad:latest").
 		Return(activities.ScanResult{}, testsuite.ErrMockStartChildWorkflowFailed)
 
-	// Both results should be saved — the failed one with error status
-	env.OnActivity(a.SaveScanResult, mock.Anything, goodResult).Return(nil)
+	// Only the failed image is saved here (an error-status row); the successful
+	// one was persisted inline by ScanImage.
 	env.OnActivity(a.SaveScanResult, mock.Anything, mock.Anything).Return(nil)
 
 	env.ExecuteWorkflow(Scan, activities.ScanConfig{Concurrency: 2})
@@ -137,7 +137,6 @@ func TestScan_Defaults(t *testing.T) {
 
 	env.OnActivity(a.GetRunningImages, mock.Anything).Return(images, nil)
 	env.OnActivity(a.ScanImage, mock.Anything, "nginx:latest").Return(result, nil)
-	env.OnActivity(a.SaveScanResult, mock.Anything, mock.Anything).Return(nil)
 
 	env.ExecuteWorkflow(Scan, activities.ScanConfig{})
 

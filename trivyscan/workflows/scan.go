@@ -95,16 +95,22 @@ func scanImage(ctx workflow.Context, image string) activities.ScanResult {
 
 	scanCtx := workflow.WithActivityOptions(ctx, withActivityID(scanOpts, "ScanImage:"+image))
 	var result activities.ScanResult
-	if err := workflow.ExecuteActivity(scanCtx, a.ScanImage, image).Get(scanCtx, &result); err != nil {
-		logger.Warn("Scan activity error", "image", image, "error", err)
-		result = activities.ScanResult{
-			Image:     image,
-			Status:    "error",
-			Error:     err.Error(),
-			ScannedAt: workflow.Now(ctx),
-		}
+	err := workflow.ExecuteActivity(scanCtx, a.ScanImage, image).Get(scanCtx, &result)
+	if err == nil {
+		// Success: ScanImage persisted the scan and its CVEs inline (keeping the
+		// vulnerability list off the workflow payload path), so nothing to save.
+		return result
 	}
 
+	logger.Warn("Scan activity error", "image", image, "error", err)
+	result = activities.ScanResult{
+		Image:     image,
+		Status:    "error",
+		Error:     err.Error(),
+		ScannedAt: workflow.Now(ctx),
+	}
+
+	// Record the failure row. It carries no vulnerabilities, so the payload is tiny.
 	saveCtx := workflow.WithActivityOptions(ctx, withActivityID(quickOpts, "SaveScan:"+image))
 	if err := workflow.ExecuteActivity(saveCtx, a.SaveScanResult, result).Get(saveCtx, nil); err != nil {
 		logger.Error("Failed to save scan result", "image", image, "error", err)

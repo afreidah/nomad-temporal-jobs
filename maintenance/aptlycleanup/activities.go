@@ -51,20 +51,20 @@ func New(runner ssh.ContainerRunner) *Activities {
 type AptlyCleanupConfig struct {
 	JobName   string `json:"job_name"`   // Nomad job hosting aptly. Default "aptly".
 	GroupName string `json:"group_name"` // Task group to scale. Default = JobName.
-	Image     string `json:"image"`      // aptly image for the one-shot cleanup. Default "urpylka/aptly:1.6.2".
+	Image     string `json:"image"`      // Optional override for the one-shot cleanup image. Empty = resolve the deployed aptly job's image at run time (so it tracks upgrades).
 	DataDir   string `json:"data_dir"`   // Host path of aptly's rootDir pool. Default "/mnt/gdrive/aptly".
 }
 
-// ApplyDefaults fills any unset field with its default.
+// ApplyDefaults fills any unset field with its default. Image is deliberately
+// left alone: an empty Image signals the workflow to resolve the deployed
+// aptly job's image (see ResolveJobImage), so cleanup never drifts behind an
+// aptly upgrade.
 func (c *AptlyCleanupConfig) ApplyDefaults() {
 	if c.JobName == "" {
 		c.JobName = "aptly"
 	}
 	if c.GroupName == "" {
 		c.GroupName = c.JobName
-	}
-	if c.Image == "" {
-		c.Image = "urpylka/aptly:1.6.2"
 	}
 	if c.DataDir == "" {
 		c.DataDir = "/mnt/gdrive/aptly"

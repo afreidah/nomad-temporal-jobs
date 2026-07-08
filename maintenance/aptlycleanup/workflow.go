@@ -78,6 +78,15 @@ func AptlyCleanup(ctx workflow.Context, config AptlyCleanupConfig) (result *Aptl
 	}
 	result.Node = node.Name
 
+	// --- Resolve the cleanup image from the deployed aptly job, so it tracks
+	//     upgrades automatically. config.Image, if set, is an explicit override. ---
+	image := config.Image
+	if image == "" {
+		if err = workflow.ExecuteActivity(fastCtx, saga.ResolveJobImage, config.JobName).Get(ctx, &image); err != nil {
+			return result, fmt.Errorf("resolve aptly image: %w", err)
+		}
+	}
+
 	// --- Measure pool (before) ---
 	var beforeBytes int64
 	if err = workflow.ExecuteActivity(fastCtx, saga.MeasureDataDir, node, config.DataDir).Get(ctx, &beforeBytes); err != nil {
@@ -117,7 +126,7 @@ func AptlyCleanup(ctx workflow.Context, config AptlyCleanupConfig) (result *Aptl
 
 	// --- Run the one-shot db cleanup ---
 	var output string
-	if err = workflow.ExecuteActivity(cleanupCtx, acts.RunAptlyDBCleanup, node, config.Image, config.DataDir).Get(ctx, &output); err != nil {
+	if err = workflow.ExecuteActivity(cleanupCtx, acts.RunAptlyDBCleanup, node, image, config.DataDir).Get(ctx, &output); err != nil {
 		return result, fmt.Errorf("aptly db cleanup: %w", err)
 	}
 	result.Output = output

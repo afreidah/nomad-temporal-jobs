@@ -122,8 +122,8 @@ func TestScanResult_ZeroValue(t *testing.T) {
 func TestScanConfig_ApplyDefaults(t *testing.T) {
 	var c ScanConfig
 	c.ApplyDefaults()
-	if c.Concurrency != 10 {
-		t.Errorf("Concurrency = %d, want 10", c.Concurrency)
+	if c.Concurrency != 3 {
+		t.Errorf("Concurrency = %d, want 3", c.Concurrency)
 	}
 }
 

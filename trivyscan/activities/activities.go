@@ -83,13 +83,38 @@ type imageDiscoverer interface {
 	RunningImages(ctx context.Context) ([]string, error)
 }
 
+// trivyRunner runs `trivy image` for one image and returns its stdout, stderr,
+// and the process error. It's a struct field so tests can substitute canned
+// output for the real binary and exercise the parse/persist and error-handling
+// paths without a trivy install (see execTrivy for the production impl).
+type trivyRunner func(ctx context.Context, image, serverAddr string) (stdout []byte, stderr string, err error)
+
 // Activities holds shared dependencies for trivy scan activities. Register
 // an instance with the Temporal worker to expose all exported methods as
 // activity implementations.
 type Activities struct {
-	config Config
-	db     *sql.DB
-	nomad  imageDiscoverer
+	config   Config
+	db       *sql.DB
+	nomad    imageDiscoverer
+	runTrivy trivyRunner // defaults to execTrivy; overridden in tests
+}
+
+// execTrivy shells out to the trivy binary in client/server mode and returns
+// its captured stdout, stderr, and process error.
+func execTrivy(ctx context.Context, image, serverAddr string) ([]byte, string, error) {
+	cmd := exec.CommandContext(ctx, trivyBin, "image",
+		"--server", serverAddr,
+		"--format", "json",
+		"--timeout", "10m",
+		"--scanners", "vuln",
+		image)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	return stdout.Bytes(), stderr.String(), err
 }
 
 // New creates an Activities instance with a pooled database connection and a
@@ -118,7 +143,7 @@ func New(cfg Config) (*Activities, error) {
 		return nil, err
 	}
 
-	return &Activities{config: cfg, db: db, nomad: nomad}, nil
+	return &Activities{config: cfg, db: db, nomad: nomad, runTrivy: execTrivy}, nil
 }
 
 // Close shuts down the database connection pool.
@@ -157,15 +182,17 @@ type ScanResult struct {
 // ScanConfig holds workflow-level configuration passed as input so values
 // are deterministic across replays.
 type ScanConfig struct {
-	// Concurrency bounds how many images scan in parallel so the burst
-	// doesn't overwhelm the Trivy server. Default 10.
+	// Concurrency bounds how many images scan in parallel. Kept low because
+	// trivy in client/server mode still unpacks each image's layers locally,
+	// and several large (>1GB) images unpacking at once OOM-killed the worker.
+	// Default 3.
 	Concurrency int `json:"concurrency"`
 }
 
 // ApplyDefaults fills any unset field with its fleet-wide default.
 func (c *ScanConfig) ApplyDefaults() {
 	if c.Concurrency <= 0 {
-		c.Concurrency = 10
+		c.Concurrency = 3
 	}
 }
 
@@ -215,19 +242,13 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 	)
 	defer span.End()
 
-	cmd := exec.CommandContext(ctx, trivyBin, "image",
-		"--server", a.config.TrivyServerAddr,
-		"--format", "json",
-		"--timeout", "10m",
-		"--scanners", "vuln",
-		image)
+	run := a.runTrivy
+	if run == nil {
+		run = execTrivy
+	}
+	stdout, errMsg, runErr := run(ctx, image, a.config.TrivyServerAddr)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := stderr.String()
+	if runErr != nil {
 		switch classifyTrivyError(errMsg) {
 		case scanErrPermanent:
 			result.Status = "pull_failed"
@@ -244,43 +265,75 @@ func (a *Activities) ScanImage(ctx context.Context, image string) (ScanResult, e
 			return result, fmt.Errorf("trivy server unavailable for %s: %s", image, errMsg)
 		default:
 			result.Status = "error"
-			result.Error = fmt.Sprintf("%v: %s", err, errMsg)
+			result.Error = fmt.Sprintf("%v: %s", runErr, errMsg)
 			span.SetStatus(codes.Error, "scan_failed")
 			span.SetAttributes(attribute.String(attrTrivyError, result.Error))
 			logger.Error("Scan failed", "image", image, "error", result.Error)
-			return result, fmt.Errorf("scan failed for %s: %w", image, err)
+			return result, fmt.Errorf("scan failed for %s: %w", image, runErr)
 		}
 	}
 
-	vulns, counts, err := parseTrivyOutput(stdout.Bytes())
+	// Parse and persist inside the activity so the CVE list -- thousands of
+	// rows for a large OS image -- is written straight to Postgres and never
+	// returned to the workflow. Returning it previously exceeded Temporal's
+	// activity-result payload limit (TMPRL1103) for registry.munchbox.cc/patroni:pg18.
+	summary, err := a.storeScan(ctx, image, stdout, result.ScannedAt)
 	if err != nil {
 		result.Status = "error"
-		result.Error = fmt.Sprintf("failed to parse trivy output: %v", err)
-		return result, temporal.NewNonRetryableApplicationError(
-			result.Error, "PARSE_FAILED", nil)
+		result.Error = err.Error()
+		span.SetStatus(codes.Error, "store_failed")
+		span.SetAttributes(attribute.String(attrTrivyError, result.Error))
+		logger.Error("Store failed", "image", image, "error", result.Error)
+		return ScanResult{}, err
 	}
-	result.Vulnerabilities = vulns
-	result.CriticalCount = counts.Critical
-	result.HighCount = counts.High
-	result.MediumCount = counts.Medium
-	result.LowCount = counts.Low
 
 	span.SetAttributes(
-		attribute.Int("trivy.critical", result.CriticalCount),
-		attribute.Int("trivy.high", result.HighCount),
-		attribute.Int("trivy.medium", result.MediumCount),
-		attribute.Int("trivy.low", result.LowCount),
-		attribute.Int("trivy.total", len(result.Vulnerabilities)),
+		attribute.Int("trivy.critical", summary.CriticalCount),
+		attribute.Int("trivy.high", summary.HighCount),
+		attribute.Int("trivy.medium", summary.MediumCount),
+		attribute.Int("trivy.low", summary.LowCount),
+		attribute.Int("trivy.total", summary.CriticalCount+summary.HighCount+summary.MediumCount+summary.LowCount),
 	)
 
 	logger.Info("Scan complete",
 		"image", image,
-		"critical", result.CriticalCount,
-		"high", result.HighCount,
-		"medium", result.MediumCount,
-		"low", result.LowCount,
-		"total_vulns", len(result.Vulnerabilities))
+		"critical", summary.CriticalCount,
+		"high", summary.HighCount,
+		"medium", summary.MediumCount,
+		"low", summary.LowCount)
 
+	return summary, nil
+}
+
+// storeScan parses trivy's JSON output, persists the scan row and every CVE in
+// a single transaction, and returns a summary result carrying only the severity
+// counts. The vulnerability slice is deliberately left in Postgres and cleared
+// from the returned value so a large image's CVE list never crosses Temporal's
+// activity-result payload limit.
+func (a *Activities) storeScan(ctx context.Context, image string, stdout []byte, scannedAt time.Time) (ScanResult, error) {
+	vulns, counts, err := parseTrivyOutput(stdout)
+	if err != nil {
+		return ScanResult{}, temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("failed to parse trivy output: %v", err), "PARSE_FAILED", nil)
+	}
+
+	result := ScanResult{
+		Image:           image,
+		Status:          "success",
+		ScannedAt:       scannedAt,
+		Vulnerabilities: vulns,
+		CriticalCount:   counts.Critical,
+		HighCount:       counts.High,
+		MediumCount:     counts.Medium,
+		LowCount:        counts.Low,
+	}
+
+	if err := a.saveScanResult(ctx, result); err != nil {
+		return ScanResult{}, fmt.Errorf("persist scan for %s: %w", image, err)
+	}
+
+	// CVEs are now in Postgres; drop them so the workflow receives counts only.
+	result.Vulnerabilities = nil
 	return result, nil
 }
 
@@ -385,13 +438,20 @@ func parseTrivyOutput(stdout []byte) ([]Vulnerability, SeverityCounts, error) {
 	return vulns, counts, nil
 }
 
-// SaveScanResult stores a single scan result and its vulnerabilities in
-// PostgreSQL. Saves individually rather than in batches to stay under
-// Temporal's 2MB activity input payload limit.
+// SaveScanResult records a scan result in PostgreSQL. The workflow calls it only
+// to persist scan *failures* -- an error-status row with no vulnerabilities, so
+// the payload stays tiny. Successful scans are persisted inline by ScanImage
+// (via storeScan) so their CVE list never crosses the Temporal payload boundary.
 func (a *Activities) SaveScanResult(ctx context.Context, result ScanResult) error {
-	logger := activity.GetLogger(ctx)
-	logger.Info("Saving scan result", "image", result.Image, "vulns", len(result.Vulnerabilities))
+	activity.GetLogger(ctx).Info("Saving scan result",
+		"image", result.Image, "status", result.Status, "vulns", len(result.Vulnerabilities))
+	return a.saveScanResult(ctx, result)
+}
 
+// saveScanResult writes a scan row and its vulnerabilities in one transaction.
+// Shared by SaveScanResult (failure rows from the workflow) and storeScan
+// (successful scans persisted inline by the scan activity).
+func (a *Activities) saveScanResult(ctx context.Context, result ScanResult) error {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -423,8 +483,6 @@ func (a *Activities) SaveScanResult(ctx context.Context, result ScanResult) erro
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit transaction: %w", err)
 	}
-
-	logger.Info("Saved scan result", "image", result.Image)
 	return nil
 }
 
