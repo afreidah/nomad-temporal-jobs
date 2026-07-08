@@ -135,36 +135,72 @@ func TestCollectDockerImages(t *testing.T) {
 	}
 }
 
-func TestFirstDockerImage(t *testing.T) {
-	// Skips a non-docker task and a docker task with no image, returns the
-	// first real docker image -- the tag a maintenance saga should reuse.
-	job := &api.Job{
-		TaskGroups: []*api.TaskGroup{
-			{Tasks: []*api.Task{
-				{Driver: "exec", Config: map[string]any{"image": "ignored"}},
-				{Driver: "docker", Config: nil},
-			}},
-			{Tasks: []*api.Task{
-				{Driver: "docker", Config: map[string]any{"image": "urpylka/aptly:1.6.3"}},
-				{Driver: "docker", Config: map[string]any{"image": "second:ignored"}},
-			}},
-		},
-	}
-	if img, ok := firstDockerImage(job); !ok || img != "urpylka/aptly:1.6.3" {
-		t.Errorf("firstDockerImage = (%q, %v), want (urpylka/aptly:1.6.3, true)", img, ok)
-	}
-}
+func TestMainDockerImage(t *testing.T) {
+	prestart := &api.TaskLifecycle{Hook: "prestart"}
+	poststart := &api.TaskLifecycle{Hook: "poststart"}
 
-func TestFirstDockerImage_None(t *testing.T) {
-	job := &api.Job{
-		TaskGroups: []*api.TaskGroup{
-			{Tasks: []*api.Task{
-				{Driver: "exec", Config: map[string]any{"image": "ignored"}},
-				{Driver: "docker", Config: map[string]any{"image": ""}},
-			}},
+	tests := []struct {
+		name    string
+		jobName string
+		job     *api.Job
+		want    string
+		wantOK  bool
+	}{
+		{
+			// Mirrors the real aptly job: two alpine prestart sidecars and a curl
+			// poststart sidecar precede the aptly workload. The task named after
+			// the job must win over the earlier sidecar images.
+			name:    "picks task named after job over earlier sidecars",
+			jobName: "aptly",
+			job: &api.Job{TaskGroups: []*api.TaskGroup{{Tasks: []*api.Task{
+				{Name: "setup-gpg", Driver: "docker", Lifecycle: prestart, Config: map[string]any{"image": "alpine:3.23.4"}},
+				{Name: "setup-webui", Driver: "docker", Lifecycle: prestart, Config: map[string]any{"image": "alpine:3.23.4"}},
+				{Name: "setup-repo", Driver: "docker", Lifecycle: poststart, Config: map[string]any{"image": "curlimages/curl:8.20.0"}},
+				{Name: "aptly", Driver: "docker", Config: map[string]any{"image": "urpylka/aptly:1.6.3"}},
+			}}}},
+			want:   "urpylka/aptly:1.6.3",
+			wantOK: true,
+		},
+		{
+			// No name match: fall through to the first task with no lifecycle hook,
+			// skipping the prestart sidecar ahead of it.
+			name:    "falls back to first non-lifecycle task",
+			jobName: "other",
+			job: &api.Job{TaskGroups: []*api.TaskGroup{{Tasks: []*api.Task{
+				{Name: "init", Driver: "docker", Lifecycle: prestart, Config: map[string]any{"image": "busybox:1"}},
+				{Name: "app", Driver: "docker", Config: map[string]any{"image": "app:2"}},
+			}}}},
+			want:   "app:2",
+			wantOK: true,
+		},
+		{
+			// Only lifecycle sidecars exist -> last-resort fallback to any docker task.
+			name:    "falls back to any docker task when all are sidecars",
+			jobName: "x",
+			job: &api.Job{TaskGroups: []*api.TaskGroup{{Tasks: []*api.Task{
+				{Name: "only", Driver: "docker", Lifecycle: prestart, Config: map[string]any{"image": "sidecar:1"}},
+			}}}},
+			want:   "sidecar:1",
+			wantOK: true,
+		},
+		{
+			// Non-docker tasks and imageless docker tasks are skipped entirely.
+			name:    "no docker image",
+			jobName: "x",
+			job: &api.Job{TaskGroups: []*api.TaskGroup{{Tasks: []*api.Task{
+				{Name: "e", Driver: "exec", Config: map[string]any{"image": "ignored"}},
+				{Name: "d", Driver: "docker", Config: map[string]any{"image": ""}},
+			}}}},
+			want:   "",
+			wantOK: false,
 		},
 	}
-	if img, ok := firstDockerImage(job); ok || img != "" {
-		t.Errorf("firstDockerImage = (%q, %v), want (\"\", false)", img, ok)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			img, ok := mainDockerImage(tt.job, tt.jobName)
+			if img != tt.want || ok != tt.wantOK {
+				t.Errorf("mainDockerImage = (%q, %v), want (%q, %v)", img, ok, tt.want, tt.wantOK)
+			}
+		})
 	}
 }

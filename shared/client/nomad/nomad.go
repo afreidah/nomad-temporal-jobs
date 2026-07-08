@@ -184,36 +184,78 @@ func collectDockerImages(job *api.Job, set map[string]struct{}) {
 	}
 }
 
-// JobImage returns the docker image of the first docker-driver task in the
-// named job's spec. Maintenance sagas use it so one-shot helper containers
-// always run the *deployed* image instead of a hard-coded tag that silently
-// drifts on every upgrade. Reads the job definition (not a running alloc), so
-// it still works when the job has been scaled to 0.
+// JobImage returns the docker image of the named job's main workload task, so
+// maintenance sagas run one-shot helper containers on the *deployed* image
+// instead of a hard-coded tag that silently drifts on every upgrade. Reads the
+// job definition (not a running alloc), so it still works when the job has been
+// scaled to 0.
 func (n *Nomad) JobImage(ctx context.Context, jobName string) (string, error) {
 	job, _, err := n.client.Jobs().Info(jobName, (&api.QueryOptions{}).WithContext(ctx))
 	if err != nil {
 		return "", fmt.Errorf("get job %s: %w", jobName, err)
 	}
-	if img, ok := firstDockerImage(job); ok {
+	if img, ok := mainDockerImage(job, jobName); ok {
 		return img, nil
 	}
 	return "", fmt.Errorf("no docker-driver image found in job %s", jobName)
 }
 
-// firstDockerImage returns the image of the first docker-driver task in job,
-// and false if the job has none.
-func firstDockerImage(job *api.Job) (string, bool) {
+// dockerTask pairs a docker task's image with the traits mainDockerImage picks by.
+type dockerTask struct {
+	name    string
+	image   string
+	sidecar bool // has a prestart/poststart lifecycle hook
+}
+
+// mainDockerImage returns the image of the job's main workload docker task,
+// deliberately skipping prestart/poststart sidecars -- e.g. the aptly job runs
+// alpine (GPG/web-UI setup) and curl (repo setup) lifecycle sidecars *before*
+// the aptly task itself, and a naive "first docker task" would resolve alpine.
+// Selection order: the task named after the job (the conventional main task),
+// then the first docker task with no lifecycle hook, then any docker task.
+func mainDockerImage(job *api.Job, jobName string) (string, bool) {
+	tasks := dockerTasks(job)
+	for _, t := range tasks {
+		if t.name == jobName {
+			return t.image, true
+		}
+	}
+	for _, t := range tasks {
+		if !t.sidecar {
+			return t.image, true
+		}
+	}
+	if len(tasks) > 0 {
+		return tasks[0].image, true
+	}
+	return "", false
+}
+
+// dockerTasks flattens the job's docker-driver tasks (those declaring an image)
+// across all task groups, in declaration order.
+func dockerTasks(job *api.Job) []dockerTask {
+	var tasks []dockerTask
 	for _, tg := range job.TaskGroups {
 		for _, task := range tg.Tasks {
-			if task.Driver != "docker" || task.Config == nil {
-				continue
-			}
-			if img, ok := task.Config["image"].(string); ok && img != "" {
-				return img, true
+			if img, ok := dockerImage(task); ok {
+				tasks = append(tasks, dockerTask{name: task.Name, image: img, sidecar: task.Lifecycle != nil})
 			}
 		}
 	}
-	return "", false
+	return tasks
+}
+
+// dockerImage returns a docker-driver task's image, and false if the task isn't
+// a docker task or declares no image.
+func dockerImage(task *api.Task) (string, bool) {
+	if task.Driver != "docker" || task.Config == nil {
+		return "", false
+	}
+	img, ok := task.Config["image"].(string)
+	if !ok || img == "" {
+		return "", false
+	}
+	return img, true
 }
 
 // ClientNodes returns the ready Nomad client nodes with SSH-dialable addresses.
