@@ -25,6 +25,8 @@ import (
 
 type fakeSagaNomad struct {
 	node     nomadclient.NomadNode
+	image    string
+	imageErr error
 	findErr  error
 	scaleErr error
 	waitErr  error
@@ -33,6 +35,10 @@ type fakeSagaNomad struct {
 
 func (f *fakeSagaNomad) FindJobNode(_ context.Context, _ string) (nomadclient.NomadNode, error) {
 	return f.node, f.findErr
+}
+
+func (f *fakeSagaNomad) JobImage(_ context.Context, _ string) (string, error) {
+	return f.image, f.imageErr
 }
 
 func (f *fakeSagaNomad) ScaleJob(_ context.Context, _, _ string, _ int, _ string) error {
@@ -115,6 +121,33 @@ func TestSagaFindJobNode_NoRunningAlloc(t *testing.T) {
 	env.RegisterActivity(a.FindJobNode)
 	if _, err := env.ExecuteActivity(a.FindJobNode, "myjob"); err == nil {
 		t.Fatal("expected a (non-retryable) error when no alloc is running")
+	}
+}
+
+func TestSagaResolveJobImage(t *testing.T) {
+	a := NewSagaActivities(&fakeSagaNomad{image: "urpylka/aptly:1.6.3"}, nil)
+	env := sagaEnv()
+	env.RegisterActivity(a.ResolveJobImage)
+
+	val, err := env.ExecuteActivity(a.ResolveJobImage, "aptly")
+	if err != nil {
+		t.Fatalf("ResolveJobImage: %v", err)
+	}
+	var img string
+	if err := val.Get(&img); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if img != "urpylka/aptly:1.6.3" {
+		t.Errorf("image = %q, want urpylka/aptly:1.6.3", img)
+	}
+}
+
+func TestSagaResolveJobImage_Error(t *testing.T) {
+	a := NewSagaActivities(&fakeSagaNomad{imageErr: errors.New("job not found")}, nil)
+	env := sagaEnv()
+	env.RegisterActivity(a.ResolveJobImage)
+	if _, err := env.ExecuteActivity(a.ResolveJobImage, "aptly"); err == nil {
+		t.Fatal("expected an error when JobImage fails")
 	}
 }
 

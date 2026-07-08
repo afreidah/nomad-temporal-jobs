@@ -184,6 +184,38 @@ func collectDockerImages(job *api.Job, set map[string]struct{}) {
 	}
 }
 
+// JobImage returns the docker image of the first docker-driver task in the
+// named job's spec. Maintenance sagas use it so one-shot helper containers
+// always run the *deployed* image instead of a hard-coded tag that silently
+// drifts on every upgrade. Reads the job definition (not a running alloc), so
+// it still works when the job has been scaled to 0.
+func (n *Nomad) JobImage(ctx context.Context, jobName string) (string, error) {
+	job, _, err := n.client.Jobs().Info(jobName, (&api.QueryOptions{}).WithContext(ctx))
+	if err != nil {
+		return "", fmt.Errorf("get job %s: %w", jobName, err)
+	}
+	if img, ok := firstDockerImage(job); ok {
+		return img, nil
+	}
+	return "", fmt.Errorf("no docker-driver image found in job %s", jobName)
+}
+
+// firstDockerImage returns the image of the first docker-driver task in job,
+// and false if the job has none.
+func firstDockerImage(job *api.Job) (string, bool) {
+	for _, tg := range job.TaskGroups {
+		for _, task := range tg.Tasks {
+			if task.Driver != "docker" || task.Config == nil {
+				continue
+			}
+			if img, ok := task.Config["image"].(string); ok && img != "" {
+				return img, true
+			}
+		}
+	}
+	return "", false
+}
+
 // ClientNodes returns the ready Nomad client nodes with SSH-dialable addresses.
 // Nodes that aren't ready, or whose info can't be fetched, are skipped.
 func (n *Nomad) ClientNodes(ctx context.Context) ([]NomadNode, error) {

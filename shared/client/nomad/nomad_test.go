@@ -134,3 +134,37 @@ func TestCollectDockerImages(t *testing.T) {
 		}
 	}
 }
+
+func TestFirstDockerImage(t *testing.T) {
+	// Skips a non-docker task and a docker task with no image, returns the
+	// first real docker image -- the tag a maintenance saga should reuse.
+	job := &api.Job{
+		TaskGroups: []*api.TaskGroup{
+			{Tasks: []*api.Task{
+				{Driver: "exec", Config: map[string]any{"image": "ignored"}},
+				{Driver: "docker", Config: nil},
+			}},
+			{Tasks: []*api.Task{
+				{Driver: "docker", Config: map[string]any{"image": "urpylka/aptly:1.6.3"}},
+				{Driver: "docker", Config: map[string]any{"image": "second:ignored"}},
+			}},
+		},
+	}
+	if img, ok := firstDockerImage(job); !ok || img != "urpylka/aptly:1.6.3" {
+		t.Errorf("firstDockerImage = (%q, %v), want (urpylka/aptly:1.6.3, true)", img, ok)
+	}
+}
+
+func TestFirstDockerImage_None(t *testing.T) {
+	job := &api.Job{
+		TaskGroups: []*api.TaskGroup{
+			{Tasks: []*api.Task{
+				{Driver: "exec", Config: map[string]any{"image": "ignored"}},
+				{Driver: "docker", Config: map[string]any{"image": ""}},
+			}},
+		},
+	}
+	if img, ok := firstDockerImage(job); ok || img != "" {
+		t.Errorf("firstDockerImage = (%q, %v), want (\"\", false)", img, ok)
+	}
+}

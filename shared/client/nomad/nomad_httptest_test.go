@@ -62,6 +62,17 @@ func nomadStub(failPath string) *httptest.Server {
 			_ = enc.Encode([]*api.AllocationListStub{
 				{ID: "a1", NodeID: "n1", ClientStatus: api.AllocClientStatusRunning},
 			})
+		case r.Method == http.MethodGet && p == "/v1/job/aptly":
+			// First docker task wins; the exec task ahead of it is skipped.
+			_ = enc.Encode(&api.Job{TaskGroups: []*api.TaskGroup{{Tasks: []*api.Task{
+				{Driver: "exec", Config: map[string]any{"command": "/bin/true"}},
+				{Driver: "docker", Config: map[string]any{"image": "aptly:1.6.3"}},
+			}}}})
+		case r.Method == http.MethodGet && p == "/v1/job/noimage":
+			// A job with no docker-driver image at all.
+			_ = enc.Encode(&api.Job{TaskGroups: []*api.TaskGroup{{Tasks: []*api.Task{
+				{Driver: "exec", Config: map[string]any{"command": "/bin/true"}},
+			}}}})
 		case strings.HasSuffix(p, "/scale"):
 			_ = enc.Encode(&api.JobRegisterResponse{EvalID: "e1"})
 		case strings.HasSuffix(p, "/dispatch"):
@@ -132,6 +143,34 @@ func TestNomad_RunningImages(t *testing.T) {
 	}
 	if len(imgs) != 1 || imgs[0] != "nginx:1.27" {
 		t.Errorf("images = %v, want [nginx:1.27]", imgs)
+	}
+}
+
+func TestNomad_JobImage(t *testing.T) {
+	ts := nomadStub("")
+	defer ts.Close()
+	img, err := testNomad(t, ts).JobImage(context.Background(), "aptly")
+	if err != nil {
+		t.Fatalf("JobImage: %v", err)
+	}
+	if img != "aptly:1.6.3" {
+		t.Errorf("image = %q, want aptly:1.6.3", img)
+	}
+}
+
+func TestNomad_JobImage_NoDockerImage(t *testing.T) {
+	ts := nomadStub("")
+	defer ts.Close()
+	if _, err := testNomad(t, ts).JobImage(context.Background(), "noimage"); err == nil {
+		t.Fatal("expected an error when the job has no docker-driver image")
+	}
+}
+
+func TestNomad_JobImage_APIError(t *testing.T) {
+	ts := nomadStub("/v1/job/aptly")
+	defer ts.Close()
+	if _, err := testNomad(t, ts).JobImage(context.Background(), "aptly"); err == nil {
+		t.Fatal("expected an error when the job info call fails")
 	}
 }
 
