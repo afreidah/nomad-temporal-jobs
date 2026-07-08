@@ -200,6 +200,13 @@ func (n *Nomad) JobImage(ctx context.Context, jobName string) (string, error) {
 	return "", fmt.Errorf("no docker-driver image found in job %s", jobName)
 }
 
+// dockerTask pairs a docker task's image with the traits mainDockerImage picks by.
+type dockerTask struct {
+	name    string
+	image   string
+	sidecar bool // has a prestart/poststart lifecycle hook
+}
+
 // mainDockerImage returns the image of the job's main workload docker task,
 // deliberately skipping prestart/poststart sidecars -- e.g. the aptly job runs
 // alpine (GPG/web-UI setup) and curl (repo setup) lifecycle sidecars *before*
@@ -207,29 +214,35 @@ func (n *Nomad) JobImage(ctx context.Context, jobName string) (string, error) {
 // Selection order: the task named after the job (the conventional main task),
 // then the first docker task with no lifecycle hook, then any docker task.
 func mainDockerImage(job *api.Job, jobName string) (string, bool) {
-	var nonLifecycle, fallback string
-	var haveNonLifecycle, haveFallback bool
+	tasks := dockerTasks(job)
+	for _, t := range tasks {
+		if t.name == jobName {
+			return t.image, true
+		}
+	}
+	for _, t := range tasks {
+		if !t.sidecar {
+			return t.image, true
+		}
+	}
+	if len(tasks) > 0 {
+		return tasks[0].image, true
+	}
+	return "", false
+}
+
+// dockerTasks flattens the job's docker-driver tasks (those declaring an image)
+// across all task groups, in declaration order.
+func dockerTasks(job *api.Job) []dockerTask {
+	var tasks []dockerTask
 	for _, tg := range job.TaskGroups {
 		for _, task := range tg.Tasks {
-			img, ok := dockerImage(task)
-			if !ok {
-				continue
-			}
-			if task.Name == jobName {
-				return img, true
-			}
-			if !haveFallback {
-				fallback, haveFallback = img, true
-			}
-			if !haveNonLifecycle && task.Lifecycle == nil {
-				nonLifecycle, haveNonLifecycle = img, true
+			if img, ok := dockerImage(task); ok {
+				tasks = append(tasks, dockerTask{name: task.Name, image: img, sidecar: task.Lifecycle != nil})
 			}
 		}
 	}
-	if haveNonLifecycle {
-		return nonLifecycle, true
-	}
-	return fallback, haveFallback
+	return tasks
 }
 
 // dockerImage returns a docker-driver task's image, and false if the task isn't
