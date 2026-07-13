@@ -102,9 +102,11 @@ type RegistryGCResult struct {
 
 // RegistryGCRunResult is the small struct returned by
 // RunRegistryGarbageCollect. The workflow folds it into RegistryGCResult.
+// The full garbage-collect output is deliberately NOT carried here: on a large
+// registry (especially with --delete-untagged) it exceeds Temporal's result
+// payload limit (TMPRL1103). It's logged as a bounded tail instead.
 type RegistryGCRunResult struct {
-	BlobsDeleted int    `json:"blobs_deleted"`
-	Output       string `json:"output"`
+	BlobsDeleted int `json:"blobs_deleted"`
 }
 
 // -------------------------------------------------------------------------
@@ -146,13 +148,26 @@ func (a *Activities) RunRegistryGarbageCollect(ctx context.Context, node nodes.N
 		Cmd:   cmd,
 	}, []string{config.RegistryDataDir + ":/var/lib/registry"}, 30*time.Second)
 	if err != nil {
-		return RegistryGCRunResult{Output: out}, fmt.Errorf("registry garbage-collect on %s: %w", node.Name, err)
+		logger.Error("Registry garbage-collect failed",
+			"node", node.Name, "output_tail", lastLines(out, 40))
+		return RegistryGCRunResult{}, fmt.Errorf("registry garbage-collect on %s: %w", node.Name, err)
 	}
 
-	return RegistryGCRunResult{
-		BlobsDeleted: parseBlobsDeleted(out),
-		Output:       out,
-	}, nil
+	blobs := parseBlobsDeleted(out)
+	logger.Info("Registry garbage-collect finished",
+		"node", node.Name, "blobs_deleted", blobs, "output_tail", lastLines(out, 20))
+	return RegistryGCRunResult{BlobsDeleted: blobs}, nil
+}
+
+// lastLines returns the final n lines of s, so a large garbage-collect output
+// can be logged for debugging without riding the workflow result payload (which
+// Temporal caps -- see RunRegistryGarbageCollect).
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // parseBlobsDeleted counts "blob eligible for deletion:" lines emitted by the

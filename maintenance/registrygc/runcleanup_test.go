@@ -66,3 +66,25 @@ func TestRunRegistryGarbageCollect_Error(t *testing.T) {
 		t.Fatal("expected an error when garbage-collect fails")
 	}
 }
+
+func TestLastLines(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{"fewer than n", "a\nb", 5, "a\nb"},
+		{"exactly n", "a\nb\nc", 3, "a\nb\nc"},
+		{"more than n keeps tail", "a\nb\nc\nd", 2, "c\nd"},
+		{"trailing newline trimmed", "a\nb\nc\n", 2, "b\nc"},
+		{"empty", "", 3, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := lastLines(tt.in, tt.n); got != tt.want {
+				t.Errorf("lastLines(%q, %d) = %q, want %q", tt.in, tt.n, got, tt.want)
+			}
+		})
+	}
+}
