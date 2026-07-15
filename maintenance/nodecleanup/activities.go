@@ -156,37 +156,8 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 		return result, err
 	}
 
-	now := time.Now()
 	var out strings.Builder
-	for _, e := range entries {
-		result.Scanned++
-		activity.RecordHeartbeat(ctx, e.name) // progress signal so a long scan trips HeartbeatTimeout, not StartToClose
-
-		action, ageDays := classifyEntry(e, running, config, now)
-		switch action {
-		case entrySkipExcluded:
-			result.Skipped++
-		case entryActive:
-			fmt.Fprintf(&out, "OK (active): %s\n", e.name)
-		case entryWithinGrace:
-			fmt.Fprintf(&out, "SKIP (%dd old, grace=%dd): %s\n", ageDays, config.GraceDays, e.name)
-			result.Skipped++
-		case entryOrphan:
-			result.Orphaned++
-			if config.DryRun {
-				fmt.Fprintf(&out, "WOULD DELETE (%dd old): %s\n", ageDays, e.name)
-				continue
-			}
-			path := strings.TrimRight(config.DataDir, "/") + "/" + e.name
-			if derr := conn.RemoveAll(path); derr != nil {
-				logger.Warn("Failed to delete orphan dir", "dir", e.name, "error", derr)
-				result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.name, derr))
-				continue
-			}
-			fmt.Fprintf(&out, "DELETED (%dd old): %s\n", ageDays, e.name)
-			result.Deleted++
-		}
-	}
+	out.WriteString(a.sweepDataDirs(ctx, conn, entries, running, config, &result))
 
 	if config.DockerPrune {
 		freed, dockerOut := a.dockerPrune(ctx, conn, config.DryRun)
@@ -226,6 +197,46 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 		"deleted", result.Deleted,
 		"skipped", result.Skipped)
 	return result, nil
+}
+
+// sweepDataDirs classifies each data-dir entry and deletes the orphans (or, in
+// dry-run, reports them), updating the scan counters on result and returning the
+// per-entry log. Split out of CleanupNodeViaSSH so that method stays a flat
+// sequence of steps rather than nesting the scan loop's switch inside it.
+func (a *Activities) sweepDataDirs(ctx context.Context, conn ssh.RemoteHost, entries []dirEntry, running map[string]struct{}, config CleanupConfig, result *CleanupResult) string {
+	logger := activity.GetLogger(ctx)
+	now := time.Now()
+	var out strings.Builder
+	for _, e := range entries {
+		result.Scanned++
+		activity.RecordHeartbeat(ctx, e.name) // progress signal so a long scan trips HeartbeatTimeout, not StartToClose
+
+		action, ageDays := classifyEntry(e, running, config, now)
+		switch action {
+		case entrySkipExcluded:
+			result.Skipped++
+		case entryActive:
+			fmt.Fprintf(&out, "OK (active): %s\n", e.name)
+		case entryWithinGrace:
+			fmt.Fprintf(&out, "SKIP (%dd old, grace=%dd): %s\n", ageDays, config.GraceDays, e.name)
+			result.Skipped++
+		case entryOrphan:
+			result.Orphaned++
+			if config.DryRun {
+				fmt.Fprintf(&out, "WOULD DELETE (%dd old): %s\n", ageDays, e.name)
+				continue
+			}
+			path := strings.TrimRight(config.DataDir, "/") + "/" + e.name
+			if derr := conn.RemoveAll(path); derr != nil {
+				logger.Warn("Failed to delete orphan dir", "dir", e.name, "error", derr)
+				result.Errors = append(result.Errors, fmt.Sprintf("delete %s: %v", e.name, derr))
+				continue
+			}
+			fmt.Fprintf(&out, "DELETED (%dd old): %s\n", ageDays, e.name)
+			result.Deleted++
+		}
+	}
+	return out.String()
 }
 
 // orphanExcludes are the Nomad data subdirectories that are never cleanup

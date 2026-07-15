@@ -89,10 +89,36 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 	sort.Strings(repos)
 	logger.Info("Polling for queued runners", "repos", len(repos), "concurrency", config.Concurrency)
 
-	// Scan repos with bounded concurrency; results land per-index so the
-	// post-barrier reconciliation stays deterministic (no concurrent appends).
+	queued := scanRepos(ctx, repos, repoCfgs, config.Concurrency)
+
+	// Count the runners already in flight per (repo, labels) bucket so we top up
+	// only the shortfall, across every dispatched job any profile names (the
+	// default job plus each profile's job). A failure here is fatal to the tick:
+	// dispatching without the active count would double-provision every queued job.
+	var activeCounts map[string]int
+	if err := workflow.ExecuteActivity(quickCtx, a.CountActiveRunners, profileJobs(repos, repoCfgs)).Get(quickCtx, &activeCounts); err != nil {
+		return nil, fmt.Errorf("count active runners: %w", err)
+	}
+
+	buckets, order := bucketQueuedJobs(repos, queued)
+
+	result := &PollResult{ReposScanned: len(repos)}
+	dispatchShortfall(ctx, order, buckets, activeCounts, repoCfgs, config.ReapAfter, result)
+
+	logger.Info("Poll complete",
+		"repos", result.ReposScanned, "queued", result.QueuedJobs,
+		"active", result.ActiveRunners, "started", result.RunnersStarted)
+	return result, nil
+}
+
+// scanRepos scans every repo for queued self-hosted jobs with bounded
+// concurrency. Results land per-index (aligned to repos) so the caller's
+// post-barrier reconciliation stays deterministic across replay -- no concurrent
+// appends. A repo whose scan fails is logged and left empty for this tick.
+func scanRepos(ctx workflow.Context, repos []string, repoCfgs map[string]activities.RepoConfig, concurrency int) [][]git.QueuedJob {
+	logger := workflow.GetLogger(ctx)
 	queued := make([][]git.QueuedJob, len(repos))
-	sem := workflow.NewBufferedChannel(ctx, config.Concurrency)
+	sem := workflow.NewBufferedChannel(ctx, concurrency)
 	wg := workflow.NewWaitGroup(ctx)
 	for i, repo := range repos {
 		rc := repoCfgs[repo]
@@ -113,17 +139,12 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 		})
 	}
 	wg.Wait(ctx)
+	return queued
+}
 
-	// Count the runners already in flight per (repo, labels) bucket so we top up
-	// only the shortfall, across every dispatched job any profile names (the
-	// default job plus each profile's job). A failure here is fatal to the tick:
-	// dispatching without the active count would double-provision every queued job.
-	var activeCounts map[string]int
-	if err := workflow.ExecuteActivity(quickCtx, a.CountActiveRunners, profileJobs(repos, repoCfgs)).Get(quickCtx, &activeCounts); err != nil {
-		return nil, fmt.Errorf("count active runners: %w", err)
-	}
-
-	// Bucket queued jobs by (repo, labels) in deterministic scan order.
+// bucketQueuedJobs groups queued jobs by (repo, labels) in deterministic scan
+// order, returning the buckets and the key order they were first seen in.
+func bucketQueuedJobs(repos []string, queued [][]git.QueuedJob) (map[string]*runnerBucket, []string) {
 	buckets := make(map[string]*runnerBucket)
 	var order []string
 	for i, repo := range repos {
@@ -138,9 +159,14 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 			b.queued++
 		}
 	}
+	return buckets, order
+}
 
-	// Top up each bucket to cover its queued jobs.
-	result := &PollResult{ReposScanned: len(repos)}
+// dispatchShortfall tops up each bucket to cover its queued jobs, clamped to the
+// pool's concurrency ceiling, starting one HandleRunner child per shortfall
+// runner and accumulating the tick's counters into result.
+func dispatchShortfall(ctx workflow.Context, order []string, buckets map[string]*runnerBucket, activeCounts map[string]int, repoCfgs map[string]activities.RepoConfig, reapAfter time.Duration, result *PollResult) {
+	logger := workflow.GetLogger(ctx)
 	seq := 0
 	for _, key := range order {
 		b := buckets[key]
@@ -162,7 +188,7 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 			needed = limit - active
 		}
 		for range needed {
-			if err := startRunnerChild(ctx, b.repo, b.labels, repoCfgs[b.repo], config.ReapAfter, seq); err != nil {
+			if err := startRunnerChild(ctx, b.repo, b.labels, repoCfgs[b.repo], reapAfter, seq); err != nil {
 				logger.Warn("Failed to start runner child", "repo", b.repo, "labels", b.labels, "error", err)
 			} else {
 				result.RunnersStarted++
@@ -170,11 +196,6 @@ func PollAndDispatch(ctx workflow.Context, config PollConfig) (*PollResult, erro
 			seq++
 		}
 	}
-
-	logger.Info("Poll complete",
-		"repos", result.ReposScanned, "queued", result.QueuedJobs,
-		"active", result.ActiveRunners, "started", result.RunnersStarted)
-	return result, nil
 }
 
 // profileJobs collects the distinct non-empty parameterized job IDs named by any

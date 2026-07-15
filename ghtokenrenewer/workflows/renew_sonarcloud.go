@@ -14,7 +14,6 @@
 package workflows
 
 import (
-	"errors"
 	"fmt"
 
 	"go.temporal.io/sdk/workflow"
@@ -57,39 +56,10 @@ func RenewSonarCloudTokens(ctx workflow.Context, config SonarRenewConfig) (*Sona
 	}
 	logger.Info("Renewing SonarCloud tokens", "count", len(repos), "concurrency", config.Concurrency)
 
-	renewed := make([]activities.SonarRenewResult, len(repos))
-	errs := make([]error, len(repos))
-
-	sem := workflow.NewBufferedChannel(ctx, config.Concurrency)
-	wg := workflow.NewWaitGroup(ctx)
-	for i, repo := range repos {
-		wg.Add(1)
-		workflow.Go(ctx, func(gctx workflow.Context) {
-			defer wg.Done()
-			sem.Send(gctx, nil) // acquire a slot
-			defer sem.Receive(gctx, nil)
-
-			rctx := workflow.WithActivityOptions(gctx, shared.QuickActivityOptions())
-			if err := workflow.ExecuteActivity(rctx, a.RenewSonarCloudToken, repo).Get(rctx, &renewed[i]); err != nil {
-				logger.Warn("Repo SonarCloud token renewal failed", "repo", repo, "error", err)
-				errs[i] = fmt.Errorf("%s: %w", repo, err)
-			}
-		})
-	}
-	wg.Wait(ctx)
-
-	// Partition results after the barrier -- deterministic, no concurrent appends.
-	result := &SonarRenewResult{}
-	for i, repo := range repos {
-		if errs[i] != nil {
-			result.Failed = append(result.Failed, repo)
-		} else {
-			result.Renewed = append(result.Renewed, renewed[i])
-		}
-	}
-
-	if err := errors.Join(errs...); err != nil {
-		result.Success = false
+	renewed, failed, err := renewAll[activities.SonarRenewResult](
+		ctx, config.Concurrency, a.RenewSonarCloudToken, "Repo SonarCloud token renewal failed", repos)
+	result := &SonarRenewResult{Renewed: renewed, Failed: failed}
+	if err != nil {
 		return result, fmt.Errorf("one or more repos failed: %w", err)
 	}
 	result.Success = true
