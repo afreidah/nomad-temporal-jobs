@@ -216,9 +216,15 @@ pre.mermaid {
   border: none !important;
 }
 
-/* Hide the top bar and search */
-#R-topbar {
-  display: none;
+/* Hide the top bar and search.
+   Only hide the topbar on wide screens where the sidebar is permanently
+   visible. Below relearn's 60rem breakpoint the sidebar slides off-canvas and
+   the topbar holds the only hamburger toggle -- hiding it there leaves mobile
+   with no way to open the nav. */
+@media screen and (min-width: 60rem) {
+  #R-topbar {
+    display: none;
+  }
 }
 
 #R-searchresults,
@@ -425,4 +431,28 @@ a.landing-card:hover p {
 .btn.cstyle.button.primary a:hover {
   background-color: #064e3b !important;
   color: #6ee7b7 !important;
+}
+
+/* ---- Mobile / responsive ---- */
+
+/* Plain markdown tables use table-layout:auto with no scroll wrapper, so a
+   wide table pushes the page past the viewport. Make the table its own
+   horizontal scroll container instead (code-fence tables already do this). */
+#R-body article table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+@media screen and (max-width: 59.999rem) {
+  /* Card grids are two columns by default -- too tight on a phone. */
+  .feature-grid,
+  .landing-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* The 2.5rem hero heading overflows narrow screens. */
+  #R-body h1 {
+    font-size: 1.8rem !important;
+  }
 }
