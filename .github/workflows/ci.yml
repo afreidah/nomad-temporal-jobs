@@ -120,7 +120,9 @@ jobs:
   # ---------------------------------------------------------------------------
   sonarqube:
     needs: [changes, test]
-    if: needs.changes.outputs.go == 'true'
+    # Skip on Dependabot PRs: they can't access the SONAR_TOKEN secret, so the
+    # scan always fails auth and blocks nothing useful.
+    if: needs.changes.outputs.go == 'true' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
