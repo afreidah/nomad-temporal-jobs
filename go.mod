@@ -31,11 +31,11 @@ require (
 	go.opentelemetry.io/otel/trace v1.44.0
 	go.temporal.io/api v1.63.3
 	go.temporal.io/sdk v1.46.0
-	go.temporal.io/sdk/contrib/opentelemetry v0.7.0
+	go.temporal.io/sdk/contrib/opentelemetry v0.8.1
 	go.temporal.io/sdk/contrib/sysinfo v0.1.1
 	go.temporal.io/sdk/contrib/tally v0.2.0
 	golang.org/x/crypto v0.54.0
-	google.golang.org/grpc v1.82.0
+	google.golang.org/grpc v1.82.1
 )
 
 require (
