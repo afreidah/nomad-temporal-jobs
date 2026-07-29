@@ -55,6 +55,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    TEMPORAL --> CETQ[cert<br/>task-queue]:::middleware',
     '    TEMPORAL --> GTQ[github-token<br/>task-queue]:::middleware',
     '    TEMPORAL --> RSTQ[runner-scaler<br/>task-queue]:::middleware',
+    '    TEMPORAL --> MITQ[media-import<br/>task-queue]:::middleware',
     '',
     '    BTQ --> BWORKER[Backup<br/>Worker]:::handler',
     '    TTQ --> TWORKER[Trivy Scan<br/>Worker]:::handler',
@@ -62,6 +63,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    CETQ --> CEWORKER[Cert Acquirer<br/>Worker]:::handler',
     '    GTQ --> GWORKER[GitHub Token<br/>Renewer Worker]:::handler',
     '    RSTQ --> RSWORKER[Runner Scaler<br/>Worker]:::handler',
+    '    MITQ --> MIWORKER[Media Import<br/>Worker]:::handler',
     '',
     '    BWORKER --> NOMAD_API[Nomad API]:::data',
     '    BWORKER --> CONSUL_API[Consul API]:::data',
@@ -89,6 +91,12 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    RSWORKER --> GITHUB',
     '    RSWORKER --> NOMAD_API',
     '',
+    '    MIWORKER --> VAULT',
+    '    MIWORKER --> DELUGE[Deluge]:::data',
+    '    MIWORKER --> SONARR[Sonarr]:::data',
+    '    MIWORKER --> RADARR[Radarr]:::data',
+    '    MIWORKER --> JELLYFIN[Jellyfin]:::data',
+    '',
     '    BWORKER --> TEMPO[Tempo<br/>Tracing]:::observability',
     '    BWORKER --> PROM[Prometheus<br/>Metrics]:::observability',
     '    TWORKER --> TEMPO',
@@ -101,6 +109,8 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    GWORKER --> PROM',
     '    RSWORKER --> TEMPO',
     '    RSWORKER --> PROM',
+    '    MIWORKER --> TEMPO',
+    '    MIWORKER --> PROM',
     '',
     '    BWORKER --> LOKI[Loki<br/>Logging]:::observability',
     '    TWORKER --> LOKI',
@@ -108,6 +118,7 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
     '    CEWORKER --> LOKI',
     '    GWORKER --> LOKI',
     '    RSWORKER --> LOKI',
+    '    MIWORKER --> LOKI',
     '',
     '    classDef entry fill:#059669,stroke:#34d399,color:#fff,font-weight:bold',
     '    classDef middleware fill:#0d9488,stroke:#14b8a6,color:#fff',
@@ -197,6 +208,36 @@ High-level architecture of the Temporal workers showing the schedule flow, worke
       title: 'GitHub Token Renewer Worker',
       badge: 'handler', badgeText: 'worker',
       body: '<p>Keeps each managed repo\'s CI/release token secret continuously valid by minting a fresh GitHub App installation token every run &mdash; replacing hand-rotated Personal Access Tokens (which can\'t be API-minted).</p><p>Reads the repo list from Consul KV, then per repo mints a repo-scoped token (<code>contents</code> + <code>pull-requests: write</code>), seals it with a NaCl box against the repo\'s Actions public key, and writes it to the <code>RELEASE_PAT</code> secret via a separate <code>secrets: write</code> token &mdash; native <code>go-github</code>, no <code>gh</code> CLI.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the App private key through Vault &mdash; no static secrets in the job.</p><p><a href="../ghtokenrenewer-workflow/">GitHub token renewer workflow diagram &rarr;</a></p>'
+    },
+    MITQ: {
+      title: 'media-import-task-queue',
+      badge: 'middleware', badgeText: 'task queue',
+      body: '<p>Temporal task queue for the <code>Reconcile</code> workflow and its activities. Only the media-import worker polls this queue.</p><p>Fired on a coarse cron (<code>0 */2 * * *</code>). Each run reconciles the currently-completed Deluge torrents; nothing is stored between runs.</p>'
+    },
+    MIWORKER: {
+      title: 'Media Import Worker',
+      badge: 'handler', badgeText: 'worker',
+      body: '<p>Reconciles torrents grabbed in Deluge <b>outside</b> of Sonarr/Radarr into the library so Jellyfin can see them. Lists the torrents Deluge reports 100% complete (in-progress ones are skipped so partial files are never linked), then offers each folder to Sonarr (TV) and, on no series match, Radarr (movies) through their manual-import API with <code>importMode=Copy</code> &mdash; hardlinking the genuinely-missing episodes/movie while the torrent keeps seeding.</p><p>Imports only what\'s actually missing: duplicates and quality-downgrades are skipped, and the multi-season-pack guard is overridden with explicit episode mappings. A single Jellyfin scan fires when anything imported; unknown-series/unmappable folders are logged for a human.</p><p>Self-authenticates with its Nomad Workload Identity and pulls the Sonarr/Radarr/Deluge/Jellyfin credentials through Vault &mdash; no static secrets in the job. <a href="../media-import-workflow/">Media import workflow diagram &rarr;</a></p>'
+    },
+    DELUGE: {
+      title: 'Deluge',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>Deluge WebUI JSON-RPC (<code>/json</code>). The worker authenticates with the WebUI password and calls <code>core.get_torrents_status</code> to read each torrent\'s name, progress, and state, keeping only the 100%-complete ones.</p>'
+    },
+    SONARR: {
+      title: 'Sonarr',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>Sonarr v3 manual-import API. A GET to <code>/manualimport</code> returns per-file decisions (matched series/episodes + rejections); a <code>ManualImport</code> command POST force-imports the genuinely-missing episodes with explicit episode IDs, hardlinking them into the TV library.</p>'
+    },
+    RADARR: {
+      title: 'Radarr',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>Radarr v3 manual-import API, tried when Sonarr matches no series. Same GET-decisions / <code>ManualImport</code>-command shape, keyed on the matched movie.</p>'
+    },
+    JELLYFIN: {
+      title: 'Jellyfin',
+      badge: 'data', badgeText: 'external service',
+      body: '<p>Jellyfin media server. A single <code>POST /Library/Refresh</code> (authenticated with the API key) triggers a library scan once a run has imported new media, so it surfaces in Jellyfin without waiting for the scheduled scan.</p>'
     },
     NOMAD_API: {
       title: 'Nomad API',
