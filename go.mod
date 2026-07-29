@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.30
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.35
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.0
-	github.com/aws/smithy-go v1.27.4
+	github.com/aws/smithy-go v1.27.5
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/containerd/containerd/v2 v2.3.3
 	github.com/go-acme/lego/v4 v4.35.2
