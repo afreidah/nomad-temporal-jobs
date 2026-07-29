@@ -57,14 +57,14 @@ push-runnerscaler: ## Build and push ci-runner-scaler image
 push-mediaimport: ## Build and push media-import-worker image
 	cd mediaimport && $(MAKE) push
 
-push-all: push-backup push-trivy push-cleanup push-cert push-ghtokens push-runnerscaler push-mediaimport ## Build and push all images
+push-all: push-backup push-trivy push-cleanup push-cert push-ghtokens push-runnerscaler push-mediaimport web-push ## Build and push all images (workers + website)
 
 # Recurses with -j so the image builds run concurrently. They share one
 # buildx builder + BuildKit cache mounts, so the Go-compile phases partly
 # serialize (cache-mount locks); the registry pushes, runtime stages, and the
 # emulated arm64 legs overlap. Net speedup, not a clean linear scale.
 push-all-parallel: ## Build and push all images concurrently (make -j)
-	$(MAKE) -j7 push-backup push-trivy push-cleanup push-cert push-ghtokens push-runnerscaler push-mediaimport
+	$(MAKE) -j8 push-backup push-trivy push-cleanup push-cert push-ghtokens push-runnerscaler push-mediaimport web-push
 
 changelog: ## Generate CHANGELOG.md from git history
 	git cliff -o CHANGELOG.md
