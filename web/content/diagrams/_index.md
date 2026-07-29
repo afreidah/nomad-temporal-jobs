@@ -79,4 +79,11 @@ weight: 20
 </div>
 </a>
 
+<a class="landing-card" href="media-import-workflow/">
+<div>
+<strong>Media Import Workflow</strong>
+<p>Reconciles completed Deluge downloads grabbed outside Sonarr/Radarr into the library &mdash; importing only genuinely-missing media, then triggering a Jellyfin scan.</p>
+</div>
+</a>
+
 </div>

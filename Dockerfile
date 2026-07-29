@@ -20,7 +20,7 @@
 # -------------------------------------------------------------------------------
 
 # ---- shared builder: native host toolchain, cross-compiles to TARGET arch ----
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS builder
 ARG PKG
 ARG TARGETOS
 ARG TARGETARCH

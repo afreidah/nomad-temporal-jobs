@@ -13,7 +13,7 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-Temporal workflow workers for automated infrastructure operations. **Six worker binaries host nine scheduled jobs.** Five workers map to one job each — backup, vulnerability scanning, certificate acquisition, GitHub token renewal, and on-demand CI runner scaling — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
+Temporal workflow workers for automated infrastructure operations. **Seven worker binaries host ten scheduled jobs.** Six workers map to one job each — backup, vulnerability scanning, certificate acquisition, GitHub token renewal, on-demand CI runner scaling, and media-library import — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
 
 ```
   Temporal Schedules            Temporal Server
@@ -44,13 +44,17 @@ Temporal workflow workers for automated infrastructure operations. **Six worker 
                             | ci-runner-scaler-      |
                             |  task-queue            |
                             +------------------------+
+                            | media-import-worker    |
+                            | media-import-task-queue|
+                            +------------------------+
                                         |
                                         v
                               Nomad, Consul, S3,
                               PostgreSQL, Trivy,
                               SSH (client nodes),
                               Vault, ACME, Cloudflare,
-                              GitHub
+                              GitHub, Deluge, Sonarr,
+                              Radarr, Jellyfin
 ```
 
 Each worker is a long-running Temporal worker process that polls its dedicated task queue. Workflows are pure orchestration; all I/O happens in activities. Activities are registered as struct methods, sharing pooled connections (DB, S3) across invocations.
@@ -155,6 +159,15 @@ Ordered **profiles** map a distinguishing `runs-on` label to the parameterized N
 **Image:** `ci-runner-scaler`
 **Dependencies:** Vault (Workload Identity — the App key for `app` repos, per-repo PATs for `vault` repos), Consul KV (`runners/config`), GitHub API, Nomad (job dispatch)
 
+### Media Import
+
+Reconciles torrents grabbed in Deluge *outside* of Sonarr/Radarr into the media library so Jellyfin can see them. Downloads that Sonarr/Radarr never initiated have no queue entry, so Completed Download Handling ignores them — they sit in the download folder forever, invisible to Jellyfin. The `Reconcile` workflow lists the torrents Deluge reports as 100% complete (in-progress ones are skipped so partial files are never linked), then offers each folder to Sonarr (TV) and, on no series match, Radarr (movies) through their manual-import API with `importMode=Copy` — hardlinking the genuinely-missing episodes/movie into the library while the torrent keeps seeding. It imports only what's actually missing: duplicates and quality-downgrades ("not an upgrade") are skipped, and the multi-season-pack guard ("episode unexpected") is overridden with explicit episode mappings. A single Jellyfin scan fires when anything imported; folders with no series/movie match or unmappable release names are logged for a human. The worker authenticates to Vault with its Nomad Workload Identity and pulls the Sonarr/Radarr/Deluge/Jellyfin credentials through it; no static secrets are templated into the job.
+
+**Task queue:** `media-import-task-queue`
+**Workflow:** `Reconcile`
+**Image:** `media-import-worker`
+**Dependencies:** Vault (Workload Identity), Deluge (WebUI JSON-RPC), Sonarr + Radarr (manual-import API), Jellyfin (library scan)
+
 ## Maintenance Sagas
 
 The registry GC and aptly cleanup workflows share one saga skeleton so the job being maintained is never left stranded offline: scale it to 0, do the work while it's down, then always scale it back. The generic steps — locate the job's node, scale, wait for drain/running, measure the data dir — are the **shared saga activities** (`maintenance/internal/nodes`); only the middle "do the work" step is job-specific. Each step has its own retry policy:
@@ -222,6 +235,7 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 | `postgres-maintenance-weekly` | `PostgresMaintenance` | `cleanup-task-queue` | `0 6 * * 0` | `PostgresMaintenanceConfig` (concurrency) |
 | `cert-acquirer-weekly` | `CertAcquirer` | `cert-task-queue` | `0 4 * * 1` | `IssueRequest` (domains, email) |
 | `ci-runner-scaler` | `PollAndDispatch` | `ci-runner-scaler-task-queue` | every ~30s (calendar, `second=0,30`) | `PollConfig` (scan concurrency, reap backstop) |
+| `media-reconcile` | `Reconcile` | `media-import-task-queue` | `0 */2 * * *` | `ReconcileConfig` (concurrency, dry-run) |
 
 ## Retry and Error Handling
 
@@ -371,6 +385,17 @@ The config at `RUNNERS_CONFIG_KEY` is a JSON object keyed by `owner/repo`:
 
 `mode` defaults to `app`. `vaultPath`/`registerVaultPath` apply only to `vault` mode (register falls back to poll when unset). `profiles` is optional and evaluated top-down; `maxConcurrent` (per-profile or repo-wide) is `0`/absent for unlimited.
 
+### Media Import Worker
+
+Authenticates to Vault with its Workload Identity and pulls the downstream credentials through it (Sonarr/Radarr API keys from `secret/media-import`, Deluge `web_password`, Jellyfin `api_key`). Only the service endpoints come from env; per-run knobs (`concurrency`, `dry_run`) arrive in the schedule input as `ReconcileConfig`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SONARR_ADDR` | `http://sonarr.service.consul:8989` | Sonarr base URL |
+| `RADARR_ADDR` | `http://radarr.service.consul:7878` | Radarr base URL |
+| `DELUGE_ADDR` | `http://deluge.service.consul:8112` | Deluge WebUI (JSON-RPC) base URL |
+| `JELLYFIN_ADDR` | `http://jellyfin.service.consul:8096` | Jellyfin base URL |
+
 ## Observability
 
 ### Tracing
@@ -382,6 +407,7 @@ All workers initialize OpenTelemetry with OTLP gRPC export. The Temporal SDK tra
 - `cleanup-worker` -> nomad, postgres-primary
 - `cert-acquirer-worker` -> vault, acme, cloudflare
 - `ci-runner-scaler` -> vault, consul, github, nomad
+- `media-import-worker` -> deluge, sonarr, radarr, jellyfin, vault
 
 ### Metrics
 
@@ -470,6 +496,7 @@ Each domain is deployed as a separate Nomad service job. Workflows are started o
 | `cert-acquirer-worker` | service | `cert-acquirer-worker` | `cert-task-queue` | `CertAcquirer` |
 | `github-token-renewer` | service | `github-token-renewer` | `github-token-renewer-task-queue` | `RenewTokens` |
 | `ci-runner-scaler` | service | `ci-runner-scaler` | `ci-runner-scaler-task-queue` | `PollAndDispatch`, `HandleRunner` |
+| `media-import-worker` | service | `media-import-worker` | `media-import-task-queue` | `Reconcile` |
 
 ### Manual Runs
 
@@ -515,6 +542,11 @@ temporal workflow start --task-queue cert-task-queue --type CertAcquirer \
 temporal workflow start --task-queue ci-runner-scaler-task-queue --type PollAndDispatch \
   --address temporal-server.service.consul:7233 \
   --input '{"concurrency":4}'
+
+# Media import (reconcile completed downloads; dry-run preview)
+temporal workflow start --task-queue media-import-task-queue --type Reconcile \
+  --address temporal-server.service.consul:7233 \
+  --input '{"concurrency":4,"dry_run":true}'
 ```
 
 ## Project Structure
@@ -597,6 +629,14 @@ nomad-temporal-jobs/
       handle_job.go                  HandleRunner child: dispatch one ephemeral runner + backstop reap timer
     worker/
       main.go                        Worker entry point (Vault App client, per-repo PAT listers, Consul, Nomad)
+  mediaimport/                       media-import-worker: reconcile manual downloads into the library
+    Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-nonroot), includes ../_common.mk
+    activities/
+      activities.go                  Activity struct: Deluge completed list, Sonarr/Radarr manual import, Jellyfin refresh
+    workflows/
+      reconcile.go                   Reconcile: list completed torrents, import missing media, trigger a Jellyfin scan
+    worker/
+      main.go                        Worker entry point (builds the shared Vault client)
 ```
 
 ## License
