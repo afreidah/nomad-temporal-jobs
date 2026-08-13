@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -186,8 +187,8 @@ func TestSonarrImportDryRun(t *testing.T) {
 
 func TestJellyfinRefresh(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Emby-Token") != "jk" {
-			t.Errorf("missing token")
+		if auth := r.Header.Get("Authorization"); !strings.Contains(auth, `Token="jk"`) {
+			t.Errorf("expected MediaBrowser Token in Authorization, got %q", auth)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))

@@ -465,7 +465,11 @@ func (a *Activities) JellyfinRefresh(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("build jellyfin refresh: %w", err)
 	}
-	req.Header.Set("X-Emby-Token", a.jellyfinKey)
+	// Jellyfin 12.x rejects the bare X-Emby-Token / api_key forms; it wants the
+	// full MediaBrowser Authorization header with the client fields + Token.
+	req.Header.Set("Authorization", fmt.Sprintf(
+		`MediaBrowser Client="media-import-worker", Device="nomad", DeviceId="media-import-worker", Version="1.0", Token=%q`,
+		a.jellyfinKey))
 	resp, err := a.http.Do(req)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
