@@ -5,11 +5,11 @@ go 1.26.5
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/XSAM/otelsql v0.43.0
-	github.com/aws/aws-sdk-go-v2 v1.43.4
+	github.com/aws/aws-sdk-go-v2 v1.43.6
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.34
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.41
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.0
-	github.com/aws/smithy-go v1.27.6
+	github.com/aws/smithy-go v1.27.8
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/containerd/containerd/v2 v2.3.3
 	github.com/go-acme/lego/v4 v4.35.2
