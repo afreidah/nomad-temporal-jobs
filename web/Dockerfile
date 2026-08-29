@@ -23,4 +23,5 @@ RUN hugo --minify
 FROM nginx:alpine
 RUN apk upgrade --no-cache
 COPY --from=build /src/web/public /usr/share/nginx/html
+COPY web/nginx-cache.conf /etc/nginx/conf.d/nginx-cache.conf
 EXPOSE 80
