@@ -12,6 +12,7 @@ package s3store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,6 +130,79 @@ func TestS3Store_DeleteOldest_ListError(t *testing.T) {
 	if _, err := store.DeleteOldest(context.Background(), "backups/p", ""); err == nil {
 		t.Fatal("expected error to propagate from list")
 	}
+}
+
+func TestEncodeTags(t *testing.T) {
+	tests := []struct {
+		name string
+		tags map[string]string
+		want string
+	}{
+		{"nil is empty", nil, ""},
+		{"empty is empty", map[string]string{}, ""},
+		{"single pair", map[string]string{"backup": "nomad"}, "backup=nomad"},
+		// url.Values sorts by key, so a multi-tag set encodes the same way every
+		// time regardless of map iteration order.
+		{"sorted by key", map[string]string{"database": "app", "backup": "postgres"},
+			"backup=postgres&database=app"},
+		{"escapes values", map[string]string{"backup": "a b&c"}, "backup=a+b%26c"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := encodeTags(tc.tags); got != tc.want {
+				t.Errorf("encodeTags(%v) = %q, want %q", tc.tags, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestS3Store_Put(t *testing.T) {
+	t.Run("sets Tagging when tags are given", func(t *testing.T) {
+		var got *s3.PutObjectInput
+		store := &S3Store{bucket: "b", upload: func(_ context.Context, in *s3.PutObjectInput) error {
+			got = in
+			return nil
+		}}
+
+		err := store.Put(context.Background(), "backups/nomad/x.snap", strings.NewReader("data"),
+			map[string]string{"backup": "nomad"})
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		if aws.ToString(got.Bucket) != "b" || aws.ToString(got.Key) != "backups/nomad/x.snap" {
+			t.Errorf("bucket/key = %q/%q, want b/backups/nomad/x.snap",
+				aws.ToString(got.Bucket), aws.ToString(got.Key))
+		}
+		if aws.ToString(got.Tagging) != "backup=nomad" {
+			t.Errorf("Tagging = %q, want backup=nomad", aws.ToString(got.Tagging))
+		}
+	})
+
+	t.Run("leaves Tagging unset without tags", func(t *testing.T) {
+		var got *s3.PutObjectInput
+		store := &S3Store{bucket: "b", upload: func(_ context.Context, in *s3.PutObjectInput) error {
+			got = in
+			return nil
+		}}
+
+		if err := store.Put(context.Background(), "k", strings.NewReader("data"), nil); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		// A nil Tagging is what an untagged PUT looks like; an empty string
+		// would still send the header.
+		if got.Tagging != nil {
+			t.Errorf("Tagging = %q, want unset", aws.ToString(got.Tagging))
+		}
+	})
+
+	t.Run("propagates upload errors", func(t *testing.T) {
+		store := &S3Store{bucket: "b", upload: func(_ context.Context, _ *s3.PutObjectInput) error {
+			return errors.New("boom")
+		}}
+		if err := store.Put(context.Background(), "k", strings.NewReader("d"), nil); err == nil {
+			t.Fatal("expected the upload error to propagate")
+		}
+	})
 }
 
 func TestS3Store_ListObjects_PaginatesAndSkipsMarkers(t *testing.T) {
