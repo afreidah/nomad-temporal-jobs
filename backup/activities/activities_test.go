@@ -182,12 +182,17 @@ func TestBackupConfig_ApplyDefaults(t *testing.T) {
 	if c.DumpConcurrency != 4 {
 		t.Errorf("DumpConcurrency = %d, want 4", c.DumpConcurrency)
 	}
+	// Retention lives in s3-orchestrator lifecycle rules by default, so the
+	// workflow's own sweep stays off unless a deployment asks for it.
+	if c.S3Cleanup {
+		t.Error("S3Cleanup = true, want false by default")
+	}
 }
 
 func TestBackupConfig_ApplyDefaults_PreservesValues(t *testing.T) {
-	c := BackupConfig{LocalDays: 3, S3Days: 14, DumpConcurrency: 8}
+	c := BackupConfig{LocalDays: 3, S3Days: 14, DumpConcurrency: 8, S3Cleanup: true}
 	c.ApplyDefaults()
-	if c.LocalDays != 3 || c.S3Days != 14 || c.DumpConcurrency != 8 {
+	if c.LocalDays != 3 || c.S3Days != 14 || c.DumpConcurrency != 8 || !c.S3Cleanup {
 		t.Errorf("ApplyDefaults overwrote set values: %+v", c)
 	}
 }

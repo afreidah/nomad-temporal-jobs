@@ -72,6 +72,75 @@ func TestBackup_Success(t *testing.T) {
 	}
 }
 
+// TestBackup_S3CleanupDisabledByDefault verifies the workflow's own S3
+// retention sweep does not run unless it is explicitly enabled -- retention is
+// s3-orchestrator's job now, matched on the tags the uploads carry.
+func TestBackup_S3CleanupDisabledByDefault(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	swept := false
+	env.OnActivity(a.CleanupOldS3Backups, mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { swept = true }).
+		Return(nil)
+	mockAllSuccess(env, []string{"app"})
+
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{DumpConcurrency: 2})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("Workflow failed: %v", err)
+	}
+	if swept {
+		t.Error("CleanupOldS3Backups ran with S3Cleanup unset")
+	}
+	// Local cleanup is unaffected by the flag.
+	env.AssertCalled(t, "CleanupOldBackups", mock.Anything, mock.Anything)
+}
+
+// TestBackup_S3CleanupEnabled verifies the opt-in sweep still runs, with the
+// configured retention window, when S3Cleanup is set.
+func TestBackup_S3CleanupEnabled(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	gotDays := 0
+	env.OnActivity(a.CleanupOldS3Backups, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { gotDays = args.Get(1).(int) }).
+		Return(nil)
+	mockAllSuccess(env, []string{"app"})
+
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{S3Days: 14, S3Cleanup: true, DumpConcurrency: 2})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("Workflow failed: %v", err)
+	}
+	if gotDays != 14 {
+		t.Errorf("CleanupOldS3Backups retention = %d, want 14", gotDays)
+	}
+}
+
+// TestBackup_S3CleanupFailureContinues verifies a failing opt-in sweep is
+// non-fatal, like the local cleanup.
+func TestBackup_S3CleanupFailureContinues(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	env.OnActivity(a.CleanupOldS3Backups, mock.Anything, mock.Anything).
+		Return(testsuite.ErrMockStartChildWorkflowFailed)
+	mockAllSuccess(env, []string{"app"})
+
+	env.ExecuteWorkflow(Backup, activities.BackupConfig{S3Cleanup: true, DumpConcurrency: 2})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("Workflow should succeed despite S3 cleanup failure: %v", err)
+	}
+	var result activities.BackupResult
+	_ = env.GetWorkflowResult(&result)
+	if !result.Success {
+		t.Error("Expected Success=true despite S3 cleanup failure")
+	}
+}
+
 // TestBackup_UploadTags verifies every leg tags its upload with its backup
 // type, and that per-database dumps additionally carry a database tag -- the
 // tags s3-orchestrator's lifecycle rules expire objects by.

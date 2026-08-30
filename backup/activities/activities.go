@@ -232,8 +232,15 @@ type BackupResult struct {
 type BackupConfig struct {
 	// LocalDays is the local-backup retention window. Default 7.
 	LocalDays int `json:"local_days"`
-	// S3Days is the S3-backup retention window. Default 30.
+	// S3Days is the S3-backup retention window used by the sweep. Only read
+	// when S3Cleanup is true. Default 30.
 	S3Days int `json:"s3_days"`
+	// S3Cleanup enables the workflow's own S3 retention sweep. Default false:
+	// uploads are tagged by backup type, so retention belongs in
+	// s3-orchestrator's tag-matched lifecycle rules, which expire per backup
+	// type instead of applying one S3Days window to all of them. Set it true
+	// only for a deployment that has no lifecycle rules configured yet.
+	S3Cleanup bool `json:"s3_cleanup"`
 	// DumpConcurrency bounds how many per-database pg_dump activities run
 	// at once so the parallel dumps don't overwhelm the primary. Default 4.
 	DumpConcurrency int `json:"dump_concurrency"`
@@ -241,7 +248,8 @@ type BackupConfig struct {
 
 // ApplyDefaults fills in unset fields with their defaults. Called by the
 // workflow before any activities run so the values are deterministic across
-// replay.
+// replay. S3Cleanup has no clause here: its default is false, which is also
+// its zero value, and a bool cannot distinguish unset from explicitly off.
 func (c *BackupConfig) ApplyDefaults() {
 	if c.LocalDays <= 0 {
 		c.LocalDays = 7

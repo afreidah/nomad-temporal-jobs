@@ -78,6 +78,7 @@ func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.B
 	logger.Info("Starting backup workflow",
 		"local_days", config.LocalDays,
 		"s3_days", config.S3Days,
+		"s3_cleanup", config.S3Cleanup,
 		"dump_concurrency", config.DumpConcurrency)
 
 	result := &activities.BackupResult{
@@ -116,9 +117,17 @@ func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.B
 		logger.Warn("Local cleanup failed", "error", err)
 	}
 
-	logger.Info("Cleaning up old S3 backups", "retention_days", config.S3Days)
-	if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldS3Backups, config.S3Days).Get(ctx, nil); err != nil {
-		logger.Warn("S3 cleanup failed", "error", err)
+	// Retention normally lives in s3-orchestrator, which expires objects by the
+	// tags the uploads carry. The sweep here is the opt-in fallback, and leaving
+	// it off without lifecycle rules keeps backups forever -- hence the warning.
+	if config.S3Cleanup {
+		logger.Info("Cleaning up old S3 backups", "retention_days", config.S3Days)
+		if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldS3Backups, config.S3Days).Get(ctx, nil); err != nil {
+			logger.Warn("S3 cleanup failed", "error", err)
+		}
+	} else {
+		logger.Warn("S3 retention sweep disabled; S3 backups expire only via s3-orchestrator lifecycle rules matching the backup tag",
+			"tag", tagBackup)
 	}
 
 	result.Success = true
