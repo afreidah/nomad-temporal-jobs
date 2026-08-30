@@ -46,11 +46,29 @@ var uploadOpts = workflow.ActivityOptions{
 	RetryPolicy:            shared.StandardRetry(),
 }
 
+// Backup types name both the S3 prefix a leg uploads under and the value of
+// the "backup" object tag, so retention rules in s3-orchestrator line up with
+// the layout on disk.
 const (
-	s3PrefixNomad    = "backups/nomad"
-	s3PrefixConsul   = "backups/consul"
-	s3PrefixPostgres = "backups/postgres"
+	backupTypeNomad    = "nomad"
+	backupTypeConsul   = "consul"
+	backupTypePostgres = "postgres"
+
+	s3PrefixRoot     = "backups/"
+	s3PrefixPostgres = s3PrefixRoot + backupTypePostgres
 )
+
+// Object tag keys. s3-orchestrator expires objects by tag, so these are what
+// its lifecycle rules match on.
+const (
+	tagBackup   = "backup"
+	tagDatabase = "database"
+)
+
+// backupTags returns the tags every upload of a given backup type carries.
+func backupTags(backupType string) map[string]string {
+	return map[string]string{tagBackup: backupType}
+}
 
 // Backup runs the three snapshot legs concurrently, then retention cleanup
 // once they all finish.
@@ -60,6 +78,7 @@ func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.B
 	logger.Info("Starting backup workflow",
 		"local_days", config.LocalDays,
 		"s3_days", config.S3Days,
+		"s3_cleanup", config.S3Cleanup,
 		"dump_concurrency", config.DumpConcurrency)
 
 	result := &activities.BackupResult{
@@ -72,11 +91,11 @@ func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.B
 
 	workflow.Go(ctx, func(gctx workflow.Context) {
 		defer wg.Done()
-		nomadErr = snapshotLeg(gctx, a.TakeNomadSnapshot, s3PrefixNomad, &result.NomadSnapshot, &result.NomadS3Key)
+		nomadErr = snapshotLeg(gctx, a.TakeNomadSnapshot, backupTypeNomad, &result.NomadSnapshot, &result.NomadS3Key)
 	})
 	workflow.Go(ctx, func(gctx workflow.Context) {
 		defer wg.Done()
-		consulErr = snapshotLeg(gctx, a.TakeConsulSnapshot, s3PrefixConsul, &result.ConsulSnapshot, &result.ConsulS3Key)
+		consulErr = snapshotLeg(gctx, a.TakeConsulSnapshot, backupTypeConsul, &result.ConsulSnapshot, &result.ConsulS3Key)
 	})
 	workflow.Go(ctx, func(gctx workflow.Context) {
 		defer wg.Done()
@@ -98,9 +117,17 @@ func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.B
 		logger.Warn("Local cleanup failed", "error", err)
 	}
 
-	logger.Info("Cleaning up old S3 backups", "retention_days", config.S3Days)
-	if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldS3Backups, config.S3Days).Get(ctx, nil); err != nil {
-		logger.Warn("S3 cleanup failed", "error", err)
+	// Retention normally lives in s3-orchestrator, which expires objects by the
+	// tags the uploads carry. The sweep here is the opt-in fallback, and leaving
+	// it off without lifecycle rules keeps backups forever -- hence the warning.
+	if config.S3Cleanup {
+		logger.Info("Cleaning up old S3 backups", "retention_days", config.S3Days)
+		if err := workflow.ExecuteActivity(quickCtx, a.CleanupOldS3Backups, config.S3Days).Get(ctx, nil); err != nil {
+			logger.Warn("S3 cleanup failed", "error", err)
+		}
+	} else {
+		logger.Warn("S3 retention sweep disabled; S3 backups expire only via s3-orchestrator lifecycle rules matching the backup tag",
+			"tag", tagBackup)
 	}
 
 	result.Success = true
@@ -113,21 +140,29 @@ func Backup(ctx workflow.Context, config activities.BackupConfig) (*activities.B
 	return result, nil
 }
 
-// snapshotLeg takes one snapshot and uploads it. The snapshot is fatal; the
-// upload is non-fatal. pathOut/keyOut are written in place.
-func snapshotLeg(ctx workflow.Context, snapshotFn any, s3Prefix string, pathOut, keyOut *string) error {
+// snapshotLeg takes one snapshot and uploads it under the backup type's prefix,
+// tagged with that type. The snapshot is fatal; the upload is non-fatal.
+// pathOut/keyOut are written in place.
+func snapshotLeg(ctx workflow.Context, snapshotFn any, backupType string, pathOut, keyOut *string) error {
 	logger := workflow.GetLogger(ctx)
 	cctx := workflow.WithActivityOptions(ctx, quickOpts)
 	uctx := workflow.WithActivityOptions(ctx, uploadOpts)
 
 	var path string
 	if err := workflow.ExecuteActivity(cctx, snapshotFn).Get(cctx, &path); err != nil {
-		return fmt.Errorf("%s snapshot: %w", s3Prefix, err)
+		return fmt.Errorf("%s snapshot: %w", backupType, err)
 	}
 	*pathOut = path
 
+	s3Prefix := s3PrefixRoot + backupType
+	upload := activities.UploadRequest{
+		LocalPath: path,
+		KeyPrefix: s3Prefix,
+		Tags:      backupTags(backupType),
+	}
+
 	var key string
-	if err := workflow.ExecuteActivity(uctx, a.UploadToS3, path, s3Prefix).Get(uctx, &key); err != nil {
+	if err := workflow.ExecuteActivity(uctx, a.UploadToS3, upload).Get(uctx, &key); err != nil {
 		logger.Warn("S3 upload failed", "prefix", s3Prefix, "error", err)
 	} else {
 		*keyOut = key
@@ -150,8 +185,14 @@ func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *a
 	}
 	result.PostgresGlobals = globalsPath
 
+	globalsUpload := activities.UploadRequest{
+		LocalPath: globalsPath,
+		KeyPrefix: s3PrefixPostgres,
+		Tags:      backupTags(backupTypePostgres),
+	}
+
 	var globalsKey string
-	if err := workflow.ExecuteActivity(uploadCtx, a.UploadToS3, globalsPath, s3PrefixPostgres).Get(uploadCtx, &globalsKey); err != nil {
+	if err := workflow.ExecuteActivity(uploadCtx, a.UploadToS3, globalsUpload).Get(uploadCtx, &globalsKey); err != nil {
 		logger.Warn("Postgres globals S3 upload failed", "error", err)
 	} else {
 		result.PostgresGlobalsS3Key = globalsKey
@@ -187,10 +228,19 @@ func postgresLeg(ctx workflow.Context, config activities.BackupConfig, result *a
 			}
 			entry.LocalPath = path
 
-			// Each database uploads under its own subdir: backups/postgres/<db>/.
-			dbPrefix := s3PrefixPostgres + "/" + activities.SanitizeDBName(db)
+			// Each database uploads under its own subdir: backups/postgres/<db>/,
+			// and carries a database tag so it can have its own retention window.
+			// The tag value is sanitized like the prefix, which also keeps it
+			// inside the character set S3 allows in a tag value.
+			safe := activities.SanitizeDBName(db)
+			dbUpload := activities.UploadRequest{
+				LocalPath: path,
+				KeyPrefix: s3PrefixPostgres + "/" + safe,
+				Tags:      map[string]string{tagBackup: backupTypePostgres, tagDatabase: safe},
+			}
+
 			var key string
-			if err := workflow.ExecuteActivity(uCtx, a.UploadToS3, path, dbPrefix).Get(uCtx, &key); err != nil {
+			if err := workflow.ExecuteActivity(uCtx, a.UploadToS3, dbUpload).Get(uCtx, &key); err != nil {
 				logger.Warn("Postgres database S3 upload failed", "database", db, "error", err)
 			} else {
 				entry.S3Key = key

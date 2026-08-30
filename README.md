@@ -227,7 +227,7 @@ Workflows fire on cron from Temporal Schedules, defined as code in `infrastructu
 
 | Schedule | Workflow | Task Queue | Cron | Input |
 |----------|----------|------------|------|-------|
-| `backup-daily` | `Backup` | `backup-task-queue` | `0 1 * * *` | `BackupConfig` (local/S3 days, dump concurrency) |
+| `backup-daily` | `Backup` | `backup-task-queue` | `0 1 * * *` | `BackupConfig` (local/S3 days, S3 cleanup toggle, dump concurrency) |
 | `trivy-daily` | `Scan` | `trivy-task-queue` | `0 3 * * *` | `ScanConfig` (scan concurrency) |
 | `cleanup-daily` | `Cleanup` | `cleanup-task-queue` | `0 5 * * *` | `CleanupConfig` (data dir, grace days, concurrency, dry-run, docker prune, containerd prune, rootfs prune, buildx volume prune) |
 | `registry-gc-weekly` | `RegistryGC` | `cleanup-task-queue` | `0 2 * * 0` | `RegistryGCConfig` (job/dir/image, dry-run, delete-untagged) |
@@ -506,7 +506,10 @@ Schedules can be triggered on demand (`temporal schedule trigger --schedule-id b
 # Backup
 temporal workflow start --task-queue backup-task-queue --type Backup \
   --address temporal-server.service.consul:7233 \
-  --input '{"local_days":7,"s3_days":30,"dump_concurrency":4}'
+  # s3_cleanup defaults to false: uploads are tagged backup=nomad|consul|postgres
+  # (plus database=<name> on per-database dumps) and s3-orchestrator lifecycle
+  # rules expire them. Set it true, with s3_days, to sweep from the workflow instead.
+  --input '{"local_days":7,"s3_days":30,"s3_cleanup":false,"dump_concurrency":4}'
 
 # Trivy scan
 temporal workflow start --task-queue trivy-task-queue --type Scan \

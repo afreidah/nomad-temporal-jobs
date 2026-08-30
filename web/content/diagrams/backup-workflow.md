@@ -57,8 +57,8 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     '    PG_DUMP --> PG_DB_S3{Upload Each<br/>to S3?}:::decision',
     '    PG_DB_S3 -->|non-fatal| JOIN',
     '    JOIN[Join Legs]:::workflow --> LOCAL_CLEAN[Cleanup Old<br/>Local Backups]:::activity',
-    '    LOCAL_CLEAN --> S3_CLEAN[Cleanup Old<br/>S3 Backups]:::activity',
-    '    S3_CLEAN --> DONE([Workflow<br/>Complete]):::workflow',
+    '    LOCAL_CLEAN --> S3_CLEAN{Cleanup Old<br/>S3 Backups?}:::decision',
+    '    S3_CLEAN -->|opt-in| DONE([Workflow<br/>Complete]):::workflow',
     '',
     '    classDef workflow fill:#7c3aed,stroke:#a78bfa,color:#fff,font-weight:bold',
     '    classDef activity fill:#059669,stroke:#34d399,color:#fff',
@@ -80,12 +80,12 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     START: {
       title: 'Backup Workflow',
       badge: 'workflow', badgeText: 'workflow entry',
-      body: '<p>Pure orchestration workflow &mdash; all I/O happens in activities. Receives <code>BackupConfig</code> with <code>LocalDays</code>, <code>S3Days</code>, and <code>DumpConcurrency</code> from the schedule input.</p><p>Returns <code>BackupResult</code> with snapshot paths, the per-database list, S3 keys, timestamp, and success status.</p>'
+      body: '<p>Pure orchestration workflow &mdash; all I/O happens in activities. Receives <code>BackupConfig</code> with <code>LocalDays</code>, <code>S3Days</code>, <code>S3Cleanup</code>, and <code>DumpConcurrency</code> from the schedule input.</p><p>Returns <code>BackupResult</code> with snapshot paths, the per-database list, S3 keys, timestamp, and success status.</p>'
     },
     DEFAULTS: {
       title: 'Apply Config Defaults',
       badge: 'workflow', badgeText: 'workflow logic',
-      body: '<p>Applies defaults for any unset config value:</p><p><code>LocalDays</code>: 7 (local NFS backups)<br><code>S3Days</code>: 30 (offsite S3 backups)<br><code>DumpConcurrency</code>: 4 (parallel per-database dumps)</p><p>Configurable via <code>LOCAL_RETENTION_DAYS</code>, <code>S3_RETENTION_DAYS</code>, and <code>PG_DUMP_CONCURRENCY</code> on the trigger job. The three legs below then fan out and run concurrently.</p>'
+      body: '<p>Applies defaults for any unset config value:</p><p><code>LocalDays</code>: 7 (local NFS backups)<br><code>S3Days</code>: 30 (offsite S3 backups, only read when the sweep is on)<br><code>S3Cleanup</code>: false (retention lives in s3-orchestrator lifecycle rules)<br><code>DumpConcurrency</code>: 4 (parallel per-database dumps)</p><p>Configurable via <code>LOCAL_RETENTION_DAYS</code>, <code>S3_RETENTION_DAYS</code>, and <code>PG_DUMP_CONCURRENCY</code> on the trigger job. The three legs below then fan out and run concurrently.</p>'
     },
     NOMAD_SNAP: {
       title: 'Take Nomad Snapshot',
@@ -95,7 +95,7 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     NOMAD_S3: {
       title: 'Upload Nomad Snapshot to S3',
       badge: 'decision', badgeText: 'non-fatal',
-      body: '<p>Uploads the Nomad snapshot to S3 under <code>backups/nomad/</code> prefix.</p><p><b>Non-fatal:</b> if the upload fails, a warning is logged and the workflow continues. Local backup is preserved regardless.</p><p>Smart quota handling: on <code>QuotaExceeded</code>, evicts the oldest object and retries up to 3 times.</p>'
+      body: '<p>Uploads the Nomad snapshot to S3 under <code>backups/nomad/</code> prefix, tagged <code>backup=nomad</code> so s3-orchestrator lifecycle rules can expire it.</p><p><b>Non-fatal:</b> if the upload fails, a warning is logged and the workflow continues. Local backup is preserved regardless.</p><p>Smart quota handling: on <code>QuotaExceeded</code>, evicts the oldest object and retries up to 3 times.</p>'
     },
     CONSUL_SNAP: {
       title: 'Take Consul Snapshot',
@@ -105,7 +105,7 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     CONSUL_S3: {
       title: 'Upload Consul Snapshot to S3',
       badge: 'decision', badgeText: 'non-fatal',
-      body: '<p>Uploads the Consul snapshot to S3 under <code>backups/consul/</code> prefix.</p><p><b>Non-fatal:</b> same behavior as Nomad S3 upload. Warning on failure, workflow continues.</p>'
+      body: '<p>Uploads the Consul snapshot to S3 under <code>backups/consul/</code> prefix, tagged <code>backup=consul</code>.</p><p><b>Non-fatal:</b> same behavior as Nomad S3 upload. Warning on failure, workflow continues.</p>'
     },
     PG_GLOBALS: {
       title: 'Dump Postgres Globals',
@@ -115,7 +115,7 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     PG_GLOBALS_S3: {
       title: 'Upload Globals to S3',
       badge: 'decision', badgeText: 'non-fatal',
-      body: '<p>Uploads the globals dump to S3 under <code>backups/postgres/</code> prefix.</p><p><b>Non-fatal:</b> warning on failure, the leg continues to database enumeration.</p>'
+      body: '<p>Uploads the globals dump to S3 under <code>backups/postgres/</code> prefix, tagged <code>backup=postgres</code>.</p><p><b>Non-fatal:</b> warning on failure, the leg continues to database enumeration.</p>'
     },
     PG_LIST: {
       title: 'List Databases',
@@ -130,7 +130,7 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     PG_DB_S3: {
       title: 'Upload Each Database to S3',
       badge: 'decision', badgeText: 'non-fatal',
-      body: '<p>Uploads each database dump to S3 under <code>backups/postgres/</code> prefix as part of the same bounded-concurrency fan-out.</p><p><b>Non-fatal:</b> a failed upload is logged; the local dump is preserved and the leg continues.</p>'
+      body: '<p>Uploads each database dump to S3 under <code>backups/postgres/&lt;db&gt;/</code> as part of the same bounded-concurrency fan-out, tagged <code>backup=postgres</code> and <code>database=&lt;db&gt;</code> so one database can have its own retention window.</p><p><b>Non-fatal:</b> a failed upload is logged; the local dump is preserved and the leg continues.</p>'
     },
     JOIN: {
       title: 'Join Legs',
@@ -144,8 +144,8 @@ Concurrent backup orchestration: three independent legs (Nomad, Consul, PostgreS
     },
     S3_CLEAN: {
       title: 'Cleanup Old S3 Backups',
-      badge: 'activity', badgeText: 'activity',
-      body: '<p>Lists and deletes S3 objects older than <code>S3Days</code> (default: 30) from all backup prefixes.</p><p>Uses the S3 ListObjects API with the backup prefix, checks each object\'s LastModified timestamp. Non-fatal: warning on failure.</p>'
+      badge: 'decision', badgeText: 'opt-in',
+      body: '<p><b>Skipped by default.</b> Uploads are tagged, so retention normally lives in s3-orchestrator lifecycle rules that expire objects by tag &mdash; per backup type, rather than one window for all of them.</p><p>When <code>S3Cleanup</code> is true, the workflow instead lists and deletes S3 objects older than <code>S3Days</code> (default: 30) from all backup prefixes, checking each object\'s <code>LastModified</code>. Non-fatal: warning on failure.</p><p>With the sweep off and no lifecycle rules configured, backups are kept forever &mdash; the workflow logs a warning saying so.</p>'
     },
     DONE: {
       title: 'Workflow Complete',

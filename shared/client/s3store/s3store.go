@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -95,9 +96,30 @@ func NewS3Store(cfg S3Config) *S3Store {
 	}
 }
 
-// Put uploads body to key in the store's bucket via multipart upload.
-func (s *S3Store) Put(ctx context.Context, key string, body io.Reader) error {
-	return s.upload(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: body})
+// Put uploads body to key in the store's bucket via multipart upload, applying
+// tags to the object when any are given. Tags survive the multipart path: the
+// uploader copies Tagging into CreateMultipartUploadInput and s3-orchestrator
+// applies the tags when the upload completes.
+func (s *S3Store) Put(ctx context.Context, key string, body io.Reader, tags map[string]string) error {
+	in := &s3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: body}
+	if tagging := encodeTags(tags); tagging != "" {
+		in.Tagging = &tagging
+	}
+	return s.upload(ctx, in)
+}
+
+// encodeTags renders tags in the query-string form S3 expects for Tagging
+// ("k=v&k2=v2"). url.Values sorts by key, so the same tag set always encodes
+// to the same string regardless of Go's map iteration order.
+func encodeTags(tags map[string]string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	vals := make(url.Values, len(tags))
+	for k, v := range tags {
+		vals.Set(k, v)
+	}
+	return vals.Encode()
 }
 
 // ListObjects returns all non-marker objects under prefix, paginated.

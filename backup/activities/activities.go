@@ -114,7 +114,7 @@ func (c *Config) Validate() error {
 // the backup activities call. *s3store.S3Store satisfies it structurally, so the
 // shared client can grow without widening this interface.
 type s3Store interface {
-	Put(ctx context.Context, key string, body io.Reader) error
+	Put(ctx context.Context, key string, body io.Reader, tags map[string]string) error
 	ListObjects(ctx context.Context, prefix string) ([]s3types.Object, error)
 	DeleteObject(ctx context.Context, key string) error
 	DeleteOldest(ctx context.Context, prefix, skipKey string) (string, error)
@@ -232,8 +232,15 @@ type BackupResult struct {
 type BackupConfig struct {
 	// LocalDays is the local-backup retention window. Default 7.
 	LocalDays int `json:"local_days"`
-	// S3Days is the S3-backup retention window. Default 30.
+	// S3Days is the S3-backup retention window used by the sweep. Only read
+	// when S3Cleanup is true. Default 30.
 	S3Days int `json:"s3_days"`
+	// S3Cleanup enables the workflow's own S3 retention sweep. Default false:
+	// uploads are tagged by backup type, so retention belongs in
+	// s3-orchestrator's tag-matched lifecycle rules, which expire per backup
+	// type instead of applying one S3Days window to all of them. Set it true
+	// only for a deployment that has no lifecycle rules configured yet.
+	S3Cleanup bool `json:"s3_cleanup"`
 	// DumpConcurrency bounds how many per-database pg_dump activities run
 	// at once so the parallel dumps don't overwhelm the primary. Default 4.
 	DumpConcurrency int `json:"dump_concurrency"`
@@ -241,7 +248,8 @@ type BackupConfig struct {
 
 // ApplyDefaults fills in unset fields with their defaults. Called by the
 // workflow before any activities run so the values are deterministic across
-// replay.
+// replay. S3Cleanup has no clause here: its default is false, which is also
+// its zero value, and a bool cannot distinguish unset from explicitly off.
 func (c *BackupConfig) ApplyDefaults() {
 	if c.LocalDays <= 0 {
 		c.LocalDays = 7
@@ -422,23 +430,39 @@ func (a *Activities) BackupPostgresDatabase(ctx context.Context, database string
 // S3 UPLOAD ACTIVITIES
 // -------------------------------------------------------------------------
 
+// UploadRequest is the input to the UploadToS3 activity. Temporal serializes
+// activity arguments, so the upload takes a struct rather than a growing
+// positional list -- new fields can be added without breaking in-flight
+// workflow histories.
+type UploadRequest struct {
+	// LocalPath is the file to upload; its base name becomes the key suffix.
+	LocalPath string `json:"local_path"`
+	// KeyPrefix is the S3 prefix the object lands under.
+	KeyPrefix string `json:"key_prefix"`
+	// Tags are applied to the uploaded object. s3-orchestrator expires objects
+	// by tag, so these drive per-backup-type retention.
+	Tags map[string]string `json:"tags,omitempty"`
+}
+
 // UploadToS3 uploads a local backup file to S3 storage using multipart upload.
-// The S3 key is constructed from the prefix and the original filename. If the
-// upload fails with a 507 quota error, the oldest backup under the same prefix
-// is evicted and the upload is retried up to 3 times.
-func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix string) (string, error) {
+// The S3 key is constructed from the prefix and the original filename, and the
+// request's tags are applied to the object. If the upload fails with a 507
+// quota error, the oldest backup under the same prefix is evicted and the
+// upload is retried up to 3 times.
+func (a *Activities) UploadToS3(ctx context.Context, req UploadRequest) (string, error) {
 	logger := activity.GetLogger(ctx)
 
 	// Client span for s3-orchestrator edge in service graph
 	ctx, span := shared.StartPeerSpan(ctx, "s3-orchestrator", "s3.upload")
 	defer span.End()
 
+	localPath := req.LocalPath
 	info, err := os.Stat(localPath)
 	if err != nil {
 		return "", fmt.Errorf("stat file %s: %w", localPath, err)
 	}
 
-	key := keyPrefix + "/" + filepath.Base(localPath)
+	key := req.KeyPrefix + "/" + filepath.Base(localPath)
 	bucket := a.config.S3Bucket
 
 	const maxEvictions = 3
@@ -448,8 +472,8 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 			return "", fmt.Errorf("open file %s: %w", localPath, err)
 		}
 
-		logger.Info("Uploading to S3", "key", key, "size_bytes", info.Size(), "bucket", bucket)
-		err = a.store.Put(ctx, key, file)
+		logger.Info("Uploading to S3", "key", key, "size_bytes", info.Size(), "bucket", bucket, "tags", req.Tags)
+		err = a.store.Put(ctx, key, file, req.Tags)
 		_ = file.Close()
 
 		if err == nil {
@@ -461,8 +485,8 @@ func (a *Activities) UploadToS3(ctx context.Context, localPath string, keyPrefix
 			return "", fmt.Errorf("upload %s to s3://%s/%s: %w", localPath, bucket, key, err)
 		}
 
-		logger.Warn("S3 quota exceeded, evicting oldest backup", "prefix", keyPrefix, "attempt", attempt+1)
-		evicted, evictErr := a.store.DeleteOldest(ctx, keyPrefix, key)
+		logger.Warn("S3 quota exceeded, evicting oldest backup", "prefix", req.KeyPrefix, "attempt", attempt+1)
+		evicted, evictErr := a.store.DeleteOldest(ctx, req.KeyPrefix, key)
 		if evictErr != nil {
 			return "", fmt.Errorf("upload failed (quota) and eviction failed: upload: %w, evict: %v", err, evictErr)
 		}

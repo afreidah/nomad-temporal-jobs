@@ -33,6 +33,7 @@ type fakeStore struct {
 	putErrs   []error // returned per Put call, in order
 	putN      int
 	putKeys   []string
+	putTags   []map[string]string // tags seen per Put call, in order
 	objs      []s3types.Object
 	listErr   error
 	deleted   []string
@@ -42,8 +43,9 @@ type fakeStore struct {
 	evictions int
 }
 
-func (f *fakeStore) Put(_ context.Context, key string, _ io.Reader) error {
+func (f *fakeStore) Put(_ context.Context, key string, _ io.Reader, tags map[string]string) error {
 	f.putKeys = append(f.putKeys, key)
+	f.putTags = append(f.putTags, tags)
 	var err error
 	if f.putN < len(f.putErrs) {
 		err = f.putErrs[f.putN]
@@ -166,7 +168,11 @@ func TestUploadToS3_Success(t *testing.T) {
 	env := actEnv()
 	env.RegisterActivity(a.UploadToS3)
 
-	val, err := env.ExecuteActivity(a.UploadToS3, local, "backups/nomad")
+	val, err := env.ExecuteActivity(a.UploadToS3, UploadRequest{
+		LocalPath: local,
+		KeyPrefix: "backups/nomad",
+		Tags:      map[string]string{"backup": "nomad"},
+	})
 	if err != nil {
 		t.Fatalf("UploadToS3: %v", err)
 	}
@@ -179,6 +185,50 @@ func TestUploadToS3_Success(t *testing.T) {
 	}
 	if store.evictions != 0 {
 		t.Errorf("evictions = %d, want 0 on a clean upload", store.evictions)
+	}
+	if len(store.putTags) != 1 || store.putTags[0]["backup"] != "nomad" {
+		t.Errorf("put tags = %v, want [map[backup:nomad]]", store.putTags)
+	}
+}
+
+// An upload with no tags must still reach the store, with a nil/empty tag set
+// rather than a fabricated one.
+func TestUploadToS3_NoTags(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "backup.snap")
+	if err := os.WriteFile(local, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeStore{}
+	a := &Activities{config: Config{S3Bucket: "b"}, store: store}
+	env := actEnv()
+	env.RegisterActivity(a.UploadToS3)
+
+	if _, err := env.ExecuteActivity(a.UploadToS3, UploadRequest{
+		LocalPath: local,
+		KeyPrefix: "backups/nomad",
+	}); err != nil {
+		t.Fatalf("UploadToS3: %v", err)
+	}
+	if len(store.putTags) != 1 || len(store.putTags[0]) != 0 {
+		t.Errorf("put tags = %v, want one empty tag set", store.putTags)
+	}
+}
+
+// A missing local file fails before any upload is attempted.
+func TestUploadToS3_MissingFile(t *testing.T) {
+	store := &fakeStore{}
+	a := &Activities{config: Config{S3Bucket: "b"}, store: store}
+	env := actEnv()
+	env.RegisterActivity(a.UploadToS3)
+
+	if _, err := env.ExecuteActivity(a.UploadToS3, UploadRequest{
+		LocalPath: filepath.Join(t.TempDir(), "absent.snap"),
+		KeyPrefix: "backups/nomad",
+	}); err == nil {
+		t.Fatal("expected an error when the local file is missing")
+	}
+	if store.putN != 0 {
+		t.Errorf("Put calls = %d, want 0", store.putN)
 	}
 }
 
@@ -196,7 +246,11 @@ func TestUploadToS3_QuotaEvictsAndRetries(t *testing.T) {
 	env := actEnv()
 	env.RegisterActivity(a.UploadToS3)
 
-	if _, err := env.ExecuteActivity(a.UploadToS3, local, "backups/nomad"); err != nil {
+	if _, err := env.ExecuteActivity(a.UploadToS3, UploadRequest{
+		LocalPath: local,
+		KeyPrefix: "backups/nomad",
+		Tags:      map[string]string{"backup": "nomad"},
+	}); err != nil {
 		t.Fatalf("UploadToS3 should recover after eviction: %v", err)
 	}
 	if store.evictions != 1 {
@@ -204,6 +258,13 @@ func TestUploadToS3_QuotaEvictsAndRetries(t *testing.T) {
 	}
 	if store.putN != 2 {
 		t.Errorf("Put calls = %d, want 2 (initial + retry)", store.putN)
+	}
+	// The retry must carry the tags too, or an evicted-and-retried backup would
+	// land untagged and never expire.
+	for i, tags := range store.putTags {
+		if tags["backup"] != "nomad" {
+			t.Errorf("put %d tags = %v, want backup=nomad", i, tags)
+		}
 	}
 }
 
