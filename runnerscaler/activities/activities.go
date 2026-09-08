@@ -8,8 +8,10 @@
 // mode: "app" (the default) polls the GitHub App installation and mints a fresh
 // registration token per dispatch; "vault" polls with a personal access token
 // read from the secret store and mints nothing -- the dispatched job carries its
-// own credential and self-registers, for repos the App can't be installed on.
-// Either way the poller lists queued jobs, reconciles them against the active
+// own credential and self-registers, for repos the App can't be installed on;
+// "forgejo" polls a Forgejo instance with a stored API token and mints per
+// dispatch the way app-mode does, against a forge the App does not reach.
+// Whichever mode, the poller lists queued jobs, reconciles them against the active
 // runners across every dispatched job, and dispatches the shortfall. A minted
 // token is built inside DispatchRunner so it never returns to the workflow (and
 // never lands in Temporal history); only the dispatched job ID comes back. All
@@ -32,6 +34,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"munchbox/temporal-workers/shared"
+	"munchbox/temporal-workers/shared/client/forgejo"
 	"munchbox/temporal-workers/shared/client/git"
 	"munchbox/temporal-workers/shared/client/nomad"
 )
@@ -47,6 +50,12 @@ const (
 	// ModeVault polls with a PAT from the secret store and mints nothing -- the
 	// dispatched job self-registers from its own stored credential.
 	ModeVault = "vault"
+	// ModeForgejo polls a Forgejo instance with an API token from the secret
+	// store and mints a registration token per dispatch. Forgejo mints on demand
+	// per repository, so the credential a runner receives is spent once and
+	// nothing long-lived reaches it: the same shape as ModeApp against a
+	// different forge.
+	ModeForgejo = "forgejo"
 )
 
 // -------------------------------------------------------------------------
@@ -67,6 +76,14 @@ type githubApp interface {
 // builds a PAT lister per call.
 type githubLister interface {
 	ListQueuedSelfHostedJobs(ctx context.Context, owner, repo string) ([]git.QueuedJob, error)
+}
+
+// forgeMinter is the mint surface a forge exposes for a dispatch: hand back a
+// registration token the dispatched runner registers with and then discards.
+// The GitHub App client and the Forgejo client both satisfy it, which is what
+// lets DispatchRunner mint without knowing which forge it is talking to.
+type forgeMinter interface {
+	CreateRunnerRegistrationToken(ctx context.Context, owner, repo string) (token string, expiry time.Time, err error)
 }
 
 // kvGetter is the Consul KV surface the scaler uses: read the per-repo config.
@@ -106,8 +123,13 @@ type RepoConfig struct {
 	Mode string `json:"mode,omitempty"`
 	// VaultPath is the secret-store KV path (field "token") the scaler *polls*
 	// with in vault-mode -- only Actions:read is needed, so a write-collaborator
-	// PAT suffices.
+	// PAT suffices. forgejo-mode reads its instance API token from the same
+	// field, and mints with it too: Forgejo issues registration tokens against
+	// the same credential, so there is no second one to separate out.
 	VaultPath string `json:"vaultPath,omitempty"`
+	// ForgejoURL is the instance root for a forgejo-mode repo, e.g.
+	// "http://forgejo.service.consul:30028". Ignored in the other modes.
+	ForgejoURL string `json:"forgejoUrl,omitempty"`
 	// RegisterVaultPath is the KV path (field "token") the dispatched job
 	// *registers* with. Registration needs admin on the repo, which the poll
 	// token may lack, so it can be a separate, higher-privilege PAT. Empty means
@@ -143,6 +165,11 @@ type Config struct {
 	// Injected so the git package stays out of the activity's test surface.
 	NewPATLister func(token string) (githubLister, error)
 
+	// NewForgejo builds a client for a Forgejo instance. Injected for the same
+	// reason as NewPATLister, and because forgejo-mode repos name their own
+	// instance: one scaler can poll more than one forge.
+	NewForgejo func(baseURL, token string) (githubApp, error)
+
 	// ConfigKey holds the JSON repo->RepoConfig map; RunnerJobID is the
 	// parameterized Nomad job dispatched when a repo/profile names none.
 	ConfigKey   string
@@ -167,15 +194,24 @@ func New(cfg Config) *Activities {
 			return git.NewGitHubPAT(token, "")
 		}
 	}
+	if cfg.NewForgejo == nil {
+		cfg.NewForgejo = func(baseURL, token string) (githubApp, error) {
+			return forgejo.New(baseURL, token)
+		}
+	}
 	return &Activities{cfg: cfg}
 }
 
 // PollRepo is the ListQueuedJobs input: the repo to poll and the strategy fields
-// that decide which GitHub client discovers its queued jobs.
+// that decide which forge client discovers its queued jobs.
 type PollRepo struct {
 	Repo      string `json:"repo"` // "owner/repo"
 	Mode      string `json:"mode,omitempty"`
 	VaultPath string `json:"vault_path,omitempty"`
+	// ForgejoURL is the instance root a forgejo-mode repo is polled against.
+	// Carried per repo rather than per scaler so one poller can serve more than
+	// one instance.
+	ForgejoURL string `json:"forgejo_url,omitempty"`
 }
 
 // DispatchSpec is the input to DispatchRunner: which repo to register the runner
@@ -189,12 +225,19 @@ type DispatchSpec struct {
 	Labels []string `json:"labels"`
 	Job    string   `json:"job,omitempty"`
 	Image  string   `json:"image,omitempty"`
-	// MintToken (app-mode) mints a registration token and passes it as
-	// runner_token. VaultSecret (vault-mode) is the secret-store path the
-	// dispatched job reads its own PAT from, passed as runner_secret so a
-	// self-registering job needs no minted token. They are mutually exclusive.
+	// MintToken (app-mode and forgejo-mode) mints a registration token and
+	// passes it as runner_token. VaultSecret (vault-mode) is the secret-store
+	// path the dispatched job reads its own PAT from, passed as runner_secret so
+	// a self-registering job needs no minted token. They are mutually exclusive.
 	MintToken   bool   `json:"mint_token"`
 	VaultSecret string `json:"vault_secret,omitempty"`
+	// Mode, ForgejoURL and VaultPath let the dispatch rebuild the same forge
+	// client the poll used. They are carried rather than resolved from config
+	// again so a config edit between the poll and the dispatch cannot mint
+	// against a different instance than the one whose queue was read.
+	Mode       string `json:"mode,omitempty"`
+	ForgejoURL string `json:"forgejo_url,omitempty"`
+	VaultPath  string `json:"vault_path,omitempty"`
 }
 
 // -------------------------------------------------------------------------
@@ -255,29 +298,74 @@ func (a *Activities) ListQueuedJobs(ctx context.Context, r PollRepo) ([]git.Queu
 }
 
 // listerFor picks the job-discovery client for r's mode: the shared App client
-// for app-mode, or a PAT lister built from the repo's secret-store token for
-// vault-mode. The PAT is read fresh each call so a rotated token is picked up.
+// for app-mode, a PAT lister built from the repo's secret-store token for
+// vault-mode, or a Forgejo client for forgejo-mode. The stored token is read
+// fresh each call in both token-backed modes so a rotated one is picked up.
 func (a *Activities) listerFor(ctx context.Context, r PollRepo) (githubLister, error) {
-	if !strings.EqualFold(r.Mode, ModeVault) {
+	switch {
+	case strings.EqualFold(r.Mode, ModeForgejo):
+		return a.forgejoFor(ctx, r)
+	case strings.EqualFold(r.Mode, ModeVault):
+		token, err := a.storedToken(ctx, r, ModeVault)
+		if err != nil {
+			return nil, err
+		}
+		return a.cfg.NewPATLister(token)
+	default:
 		return a.cfg.GitHub, nil // app-mode (default): the App client is a githubLister
 	}
+}
 
-	if r.VaultPath == "" {
+// forgejoFor builds the Forgejo client for a forgejo-mode repo. It is returned
+// as a githubApp rather than a githubLister because a Forgejo instance both
+// lists and mints, so the same client serves the poll and the dispatch.
+func (a *Activities) forgejoFor(ctx context.Context, r PollRepo) (githubApp, error) {
+	if r.ForgejoURL == "" {
 		return nil, temporal.NewNonRetryableApplicationError(
-			fmt.Sprintf("repo %q is vault-mode but sets no vaultPath", r.Repo), "MissingVaultPath", nil)
+			fmt.Sprintf("repo %q is forgejo-mode but sets no forgejoUrl", r.Repo), "MissingForgejoURL", nil)
+	}
+	token, err := a.storedToken(ctx, r, ModeForgejo)
+	if err != nil {
+		return nil, err
+	}
+	return a.cfg.NewForgejo(r.ForgejoURL, token)
+}
+
+// minterFor picks the client that mints a dispatch's registration token: the
+// shared App client for app-mode, or a Forgejo client rebuilt from the spec for
+// forgejo-mode. vault-mode never reaches here, since it mints nothing.
+func (a *Activities) minterFor(ctx context.Context, spec DispatchSpec) (forgeMinter, error) {
+	if !strings.EqualFold(spec.Mode, ModeForgejo) {
+		return a.cfg.GitHub, nil
+	}
+	return a.forgejoFor(ctx, PollRepo{
+		Repo:       spec.Repo,
+		Mode:       spec.Mode,
+		VaultPath:  spec.VaultPath,
+		ForgejoURL: spec.ForgejoURL,
+	})
+}
+
+// storedToken reads the "token" field at r.VaultPath. Both token-backed modes
+// take their credential from the same place, so the missing-path and
+// missing-field errors are raised once here and named for the calling mode.
+func (a *Activities) storedToken(ctx context.Context, r PollRepo, mode string) (string, error) {
+	if r.VaultPath == "" {
+		return "", temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("repo %q is %s-mode but sets no vaultPath", r.Repo, mode), "MissingVaultPath", nil)
 	}
 	rctx, span := shared.StartPeerSpan(ctx, "vault", "vault.read_kv")
 	data, err := a.cfg.Vault.ReadKV(rctx, r.VaultPath)
 	span.End()
 	if err != nil {
-		return nil, fmt.Errorf("read runner token for %s at %s: %w", r.Repo, r.VaultPath, err)
+		return "", fmt.Errorf("read runner token for %s at %s: %w", r.Repo, r.VaultPath, err)
 	}
 	token, _ := data["token"].(string)
 	if token == "" {
-		return nil, temporal.NewNonRetryableApplicationError(
+		return "", temporal.NewNonRetryableApplicationError(
 			fmt.Sprintf("no token field at %s for %s", r.VaultPath, r.Repo), "MissingRunnerToken", nil)
 	}
-	return a.cfg.NewPATLister(token)
+	return token, nil
 }
 
 // DispatchRunner dispatches one ephemeral runner for spec's (repo, labels) and
@@ -298,15 +386,28 @@ func (a *Activities) DispatchRunner(ctx context.Context, spec DispatchSpec) (str
 			fmt.Sprintf("invalid repo %q, want owner/repo", spec.Repo), "InvalidRepo", nil)
 	}
 
+	// A runner registers against the forge that queued the job, so forgejo-mode
+	// gets its instance root here rather than github.com.
+	repoURL := "https://github.com/" + spec.Repo
+	forge := "github"
+	if strings.EqualFold(spec.Mode, ModeForgejo) {
+		repoURL = strings.TrimRight(spec.ForgejoURL, "/") + "/" + spec.Repo
+		forge = "forgejo"
+	}
+
 	meta := map[string]string{
-		"repo_url": "https://github.com/" + spec.Repo,
+		"repo_url": repoURL,
 		"labels":   strings.Join(spec.Labels, ","),
 	}
 
 	if spec.MintToken {
-		tokCtx, span := shared.StartPeerSpan(ctx, "github", "github.create_runner_token",
+		minter, err := a.minterFor(ctx, spec)
+		if err != nil {
+			return "", err
+		}
+		tokCtx, span := shared.StartPeerSpan(ctx, forge, forge+".create_runner_token",
 			attribute.String(attrGitHubRepo, spec.Repo))
-		token, _, err := a.cfg.GitHub.CreateRunnerRegistrationToken(tokCtx, owner, name)
+		token, _, err := minter.CreateRunnerRegistrationToken(tokCtx, owner, name)
 		span.End()
 		if err != nil {
 			return "", fmt.Errorf("mint registration token for %s: %w", spec.Repo, err)
