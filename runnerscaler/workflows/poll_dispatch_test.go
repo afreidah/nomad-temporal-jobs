@@ -275,6 +275,51 @@ func TestPollAndDispatch_VaultModeDispatchesProfileJobWithoutMint(t *testing.T) 
 	}
 }
 
+// forgejo-mode mints, so it must carry no registration secret even though it is
+// the one minting mode that sets vaultPath (for the instance API token).
+// Carrying both makes DispatchRunner pass runner_secret alongside runner_token,
+// and a parameterized job declaring only the latter rejects the whole dispatch.
+func TestPollAndDispatch_ForgejoModeMintsWithoutRegistrationSecret(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	env.OnActivity(a.LoadConfig, mock.Anything).Return(map[string]activities.RepoConfig{
+		"alex/munchbox": {
+			Mode:       activities.ModeForgejo,
+			ForgejoURL: "http://forgejo.example:3000",
+			VaultPath:  "forgejo/scaler", // instance API token: polls AND mints
+			Profiles: []activities.ProfileRule{
+				{Label: "ubuntu-latest", Job: "forgejo-ci-runner"},
+			},
+		},
+	}, nil)
+	env.OnActivity(a.ListQueuedJobs, mock.Anything, forRepo("alex/munchbox")).Return(
+		[]git.QueuedJob{{ID: 1, Labels: []string{"ubuntu-latest"}}}, nil)
+	env.OnActivity(a.CountActiveRunners, mock.Anything, mock.Anything).Return(map[string]int{}, nil)
+
+	var gotSpec RunnerSpec
+	env.RegisterWorkflow(HandleRunner)
+	env.OnWorkflow(HandleRunner, mock.Anything, mock.Anything).Return(
+		func(_ workflow.Context, spec RunnerSpec) error { gotSpec = spec; return nil })
+
+	env.ExecuteWorkflow(PollAndDispatch, PollConfig{})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gotSpec.MintToken {
+		t.Error("forgejo-mode child must mint a registration token")
+	}
+	if gotSpec.VaultSecret != "" {
+		t.Errorf("child VaultSecret = %q, want empty (minting modes carry no registration secret)", gotSpec.VaultSecret)
+	}
+	// The instance and its API token still reach the dispatch, so it can rebuild
+	// the same forge client the poll used.
+	if gotSpec.VaultPath != "forgejo/scaler" || gotSpec.ForgejoURL != "http://forgejo.example:3000" {
+		t.Errorf("child forge = %q @ %q, want forgejo/scaler @ http://forgejo.example:3000",
+			gotSpec.VaultPath, gotSpec.ForgejoURL)
+	}
+}
+
 func TestHandleRunner_DispatchThenReap(t *testing.T) {
 	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
 

@@ -236,13 +236,20 @@ func startRunnerChild(ctx workflow.Context, repo string, labels []string, rc act
 	})
 
 	rule := matchProfile(rc.Profiles, labels)
-	// vault-mode carries the repo's *registration* secret path so the dispatched
-	// job self-registers -- distinct from the poll token when registration needs
-	// higher privilege (RegisterVaultPath), else the same token (VaultPath).
-	// app-mode (both empty) mints a token instead.
-	registerSecret := rc.RegisterVaultPath
-	if registerSecret == "" {
-		registerSecret = rc.VaultPath
+	// Only vault-mode carries a registration secret path, so the dispatched job
+	// self-registers from its own credential: distinct from the poll token when
+	// registration needs higher privilege (RegisterVaultPath), else the same
+	// token (VaultPath). The minting modes must leave it empty -- a spec that
+	// sets both mints a token and passes runner_secret, and a parameterized job
+	// that declares only the one it uses rejects the dispatch outright. That is
+	// reachable only in forgejo-mode, where vaultPath is required for the
+	// instance API token, since app-mode has no paths to carry.
+	var registerSecret string
+	if isVaultMode(rc.Mode) {
+		registerSecret = rc.RegisterVaultPath
+		if registerSecret == "" {
+			registerSecret = rc.VaultPath
+		}
 	}
 	spec := RunnerSpec{
 		Repo:        repo,
