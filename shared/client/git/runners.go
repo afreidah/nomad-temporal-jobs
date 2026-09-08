@@ -123,7 +123,7 @@ func listQueuedSelfHostedJobs(ctx context.Context, cli *github.Client, owner, re
 // listWorkflowRunIDs returns the IDs of owner/repo's workflow runs in the given
 // status, following pagination.
 func listWorkflowRunIDs(ctx context.Context, cli *github.Client, owner, repo, status string) ([]int64, error) {
-	opts := &github.ListWorkflowRunsOptions{Status: status, ListOptions: github.ListOptions{PerPage: 100}}
+	opts := &github.ListWorkflowRunsOptions{Status: status, PerPage: 100}
 	var ids []int64
 	for run, err := range cli.Actions.ListRepositoryWorkflowRunsIter(ctx, owner, repo, opts) {
 		if err != nil {
@@ -137,7 +137,7 @@ func listWorkflowRunIDs(ctx context.Context, cli *github.Client, owner, repo, st
 // queuedSelfHostedJobsForRun returns runID's jobs that are still queued and ask
 // for a self-hosted runner.
 func queuedSelfHostedJobsForRun(ctx context.Context, cli *github.Client, owner, repo string, runID int64) ([]QueuedJob, error) {
-	opts := &github.ListWorkflowJobsOptions{Filter: "latest", ListOptions: github.ListOptions{PerPage: 100}}
+	opts := &github.ListWorkflowJobsOptions{Filter: "latest", PerPage: 100}
 	var jobs []QueuedJob
 	for job, err := range cli.Actions.ListWorkflowJobsIter(ctx, owner, repo, runID, opts) {
 		if err != nil {
