@@ -7,7 +7,6 @@ weight: 40
 Saga-style Docker registry garbage collection. The registry is scaled offline, garbage-collected via a one-shot container run through the Docker API (tunneled over SSH), and **always** scaled back online via a deferred compensation &mdash; even if GC fails, an activity times out, or the workflow is cancelled. The find / scale / wait / measure steps are the generic saga activities shared with [Aptly Cleanup](../aptly-cleanup-workflow/). **Hover over any step** for implementation details.
 
 <style>
-  #ac-diagram { margin: 1rem 0; }
 
   #ac-tooltip {
     position: fixed; z-index: 9999;
@@ -74,8 +73,27 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
 
   mermaid.initialize({
     startOnLoad: false,
-    theme: 'dark',
-    flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '14px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 26, rankSpacing: 38, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: false, htmlLabels: true }
   });
 
   mermaid.render('registry-gc-mermaid-svg', diagramSrc).then(function(result) {
@@ -180,12 +198,26 @@ Saga-style Docker registry garbage collection. The registry is scaled offline, g
   });
 
   function positionTooltip() {
-    var pad = 12;
-    var x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
-    tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
-  }
+      var pad = 12;
+      var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+      var vw = window.innerWidth, vh = window.innerHeight;
+
+      var x = mouseX + pad;
+      if (x + w > vw - pad) x = mouseX - w - pad;
+      x = Math.max(pad, Math.min(x, vw - w - pad));
+
+      // Prefer below the cursor, and flip above only when above genuinely has
+      // more room. Clamping afterwards is what keeps a tall panel on screen: an
+      // unclamped flip puts its top edge above the viewport, and a panel taller
+      // than the viewport pins to the top and scrolls instead.
+      var below = vh - mouseY - pad * 2;
+      var above = mouseY - pad * 2;
+      var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+      y = Math.max(pad, Math.min(y, vh - h - pad));
+
+      tooltip.style.left = x + 'px';
+      tooltip.style.top = y + 'px';
+    }
 
   function showInfo(id) {
     var info = nodeInfo[id];

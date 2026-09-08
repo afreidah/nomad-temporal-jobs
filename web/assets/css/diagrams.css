@@ -1,0 +1,133 @@
+/* -----------------------------------------------------------------------------
+   Diagram presentation for the pages under diagrams/.
+
+   Every diagram page renders into #ac-diagram and hovers details out of
+   #ac-tooltip, so styling both here reaches all of them without touching page
+   markup.
+
+   The width rules are the load-bearing part. Mermaid is initialised with
+   useMaxWidth, which scales a diagram down to the content column; a tall flow
+   like the write path then renders its labels too small to read. Letting the
+   svg keep its natural width and scrolling the container instead trades a
+   horizontal scrollbar on narrow screens for legible text everywhere.
+   -------------------------------------------------------------------------- */
+
+#ac-diagram {
+  margin: 2rem 0;
+  padding: 1.5rem 1rem;
+  overflow-x: auto;
+  border: 1px solid #303a35;
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 50% 0, #22302b 0, transparent 55%),
+    #191c23;
+}
+
+/*
+  A diagram is not prose and does not want the prose measure. Once the viewport
+  can spare it, the panel reaches into the gutters either side of the content
+  column, which is enough for the widest of these to land inside the box instead
+  of a scrollbar. Below that width the gutters are not there to borrow, so the
+  panel stays in the column and scrolls as before.
+*/
+@media (min-width: 1000px) {
+  #ac-diagram {
+    margin-left: -3.5rem;
+    margin-right: -3.5rem;
+  }
+}
+
+#ac-diagram svg {
+  display: block;
+  height: auto;
+  margin: 0 auto;
+}
+
+/*
+  Mermaid runs with useMaxWidth off here, so it emits the width each diagram
+  actually needs and these only stop the theme clamping it back. There is
+  deliberately no min-width: several of these are wide rather than tall, and a
+  minimum stretches a narrow one instead of leaving it at its own size.
+*/
+#ac-diagram svg {
+  width: auto !important;
+  max-width: none !important;
+}
+
+/* Softer corners than mermaid's default square nodes. */
+#ac-diagram .node rect {
+  rx: 8px;
+  ry: 8px;
+}
+
+/* Mermaid draws edge labels on an opaque plate. Matching it to the container
+   removes the grey blocks that otherwise sit on top of every connector. */
+#ac-diagram .edgeLabel {
+  color: #cbd5d1;
+  font-size: 12px;
+}
+
+#ac-diagram .edgeLabel rect,
+#ac-diagram .edgeLabel .label-container {
+  fill: #191c23 !important;
+  background-color: #191c23 !important;
+  opacity: 0.95 !important;
+}
+
+#ac-diagram .flowchart-link {
+  stroke-width: 1.75px;
+}
+
+#ac-diagram marker path {
+  fill: #7f8b86 !important;
+  stroke: #7f8b86 !important;
+}
+
+/* Subgraph frames sit behind their nodes rather than competing with them. */
+#ac-diagram .cluster rect {
+  rx: 12px;
+  ry: 12px;
+  stroke-dasharray: 4 3;
+}
+
+#ac-diagram .cluster-label,
+#ac-diagram .cluster text {
+  fill: #8fa39b !important;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/*
+  The detail panel is positioned against the viewport, and the largest entries
+  are taller than it. Capping the height and scrolling inside keeps the whole
+  entry reachable; the panel already listens for its own mouseleave, so the
+  pointer can move into it to scroll without dismissing it.
+*/
+#ac-tooltip {
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+#ac-tooltip::-webkit-scrollbar {
+  width: 8px;
+}
+
+#ac-tooltip::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 4px;
+}
+
+/* Hovering a node is the affordance for the tooltip, so say so. */
+#ac-diagram .node {
+  cursor: pointer;
+}
+
+#ac-diagram .node:hover rect,
+#ac-diagram .node:hover polygon,
+#ac-diagram .node:hover circle,
+#ac-diagram .node:hover ellipse {
+  filter: brightness(1.18);
+}
+

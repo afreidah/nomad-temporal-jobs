@@ -1,0 +1,35 @@
+{{- /*
+  Overrides the theme's prev/next topbar buttons for one reason: the theme
+  spells the keyboard hint with U+1F850 and U+1F852, from Supplemental
+  Arrows-C, which most fonts do not cover and which therefore render as
+  replacement boxes. U+2190 and U+2192 say the same thing and are covered
+  everywhere. Nothing else differs from the theme's copy.
+*/ -}}
+{{- $onwidths := cond (isset . "onwidths") .onwidths "show" }}
+{{- $onwidthm := cond (isset . "onwidthm") .onwidthm "show" }}
+{{- $onwidthl := cond (isset . "onwidthl") .onwidthl "show" }}
+{{- with .page }}
+	{{- $show := not (.Param "disableNextPrev") }}
+	{{- if $show }}
+		{{- $startarrow := "←" }}
+		{{- if eq (.Language.LanguageDirection | default (T "Reading-direction") | default "ltr") "rtl" }}
+			{{- $startarrow = "→" }}
+		{{- end }}
+        {{- $prev := partialCached "_relearn/pagePrev.gotmpl" . .Path }}
+		{{- $prevTitle := partial "title.gotmpl" (dict "page" $prev "outputFormat" "html") }}
+		{{- $href := "" }}
+		{{- with (and $prev $prev.Path) }}
+			{{- $href = . }}
+		{{- end }}
+		{{- partial "topbar/func/button.html" (dict
+			"page" .
+			"class" "topbar-button-prev"
+			"href" $href
+			"icon" "chevron-left"
+			"onwidths" $onwidths
+			"onwidthm" $onwidthm
+			"onwidthl" $onwidthl
+			"hint" (printf "%s (%s)" $prevTitle ($startarrow | safeHTML))
+		)}}
+	{{- end }}
+{{- end }}
