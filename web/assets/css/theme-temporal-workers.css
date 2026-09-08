@@ -440,6 +440,12 @@ a.landing-card:hover p {
    horizontal scroll container instead (code-fence tables already do this). */
 #R-body article table {
   display: block;
+  /* A display:block table stops doing table layout, so its box fills the
+     container while the cells still size to their content, and a narrow table
+     reads as stopping halfway across its own border. fit-content shrinks the
+     box back onto the cells; max-width leaves the scroll behaviour above intact
+     for a table too wide for the column. */
+  width: fit-content;
   max-width: 100%;
   overflow-x: auto;
 }

@@ -7,7 +7,6 @@ weight: 90
 Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `PollAndDispatch` parent loads the per-repo config from Consul (`runners/config`) and scans each repo for queued `self-hosted` Actions jobs, then **reconciles by depth**: it buckets the queued jobs by `(repo, labels)`, counts the runners already pending/running, and starts one `HandleRunner` child per missing runner &mdash; clamped by an optional `maxConcurrent` cap. A bucket left short is simply topped back up on the next tick, so there is no per-job dedup or external state store. Each child dispatches one ephemeral Nomad runner &mdash; `app`-mode repos mint a registration token, `vault`-mode repos pass a Vault secret path the runner self-registers with &mdash; and a backstop timer reaps a runner that never picked its job up. **Hover over any step** for implementation details.
 
 <style>
-  #ac-diagram { margin: 1rem 0; }
 
   #ac-tooltip {
     position: fixed; z-index: 9999;
@@ -74,8 +73,27 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
 
   mermaid.initialize({
     startOnLoad: false,
-    theme: 'dark',
-    flowchart: { nodeSpacing: 14, rankSpacing: 22, curve: 'basis', padding: 5, diagramPadding: 8, useMaxWidth: true }
+    theme: 'base',
+    themeVariables: {
+      darkMode: true,
+      background: '#191c23',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+      fontSize: '14px',
+      primaryColor: '#26332f',
+      primaryTextColor: '#f8fafc',
+      primaryBorderColor: '#2a9d73',
+      secondaryColor: '#3a2e20',
+      secondaryTextColor: '#e8dfd0',
+      secondaryBorderColor: '#c4a35a',
+      tertiaryColor: '#20262d',
+      tertiaryTextColor: '#e8dfd0',
+      tertiaryBorderColor: '#4aaa8a',
+      lineColor: '#7f8b86',
+      edgeLabelBackground: '#191c23',
+      clusterBkg: '#1d2229',
+      clusterBorder: '#39443f'
+    },
+    flowchart: { nodeSpacing: 26, rankSpacing: 38, curve: 'linear', padding: 12, diagramPadding: 16, useMaxWidth: false, htmlLabels: true }
   });
 
   mermaid.render('runnerscaler-mermaid-svg', diagramSrc).then(function(result) {
@@ -185,12 +203,26 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
   });
 
   function positionTooltip() {
-    var pad = 12;
-    var x = mouseX + pad, y = mouseY + pad;
-    if (x + tooltip.offsetWidth > window.innerWidth - pad) x = mouseX - tooltip.offsetWidth - pad;
-    if (y + tooltip.offsetHeight > window.innerHeight - pad) y = mouseY - tooltip.offsetHeight - pad;
-    tooltip.style.left = x + 'px'; tooltip.style.top = y + 'px';
-  }
+      var pad = 12;
+      var w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+      var vw = window.innerWidth, vh = window.innerHeight;
+
+      var x = mouseX + pad;
+      if (x + w > vw - pad) x = mouseX - w - pad;
+      x = Math.max(pad, Math.min(x, vw - w - pad));
+
+      // Prefer below the cursor, and flip above only when above genuinely has
+      // more room. Clamping afterwards is what keeps a tall panel on screen: an
+      // unclamped flip puts its top edge above the viewport, and a panel taller
+      // than the viewport pins to the top and scrolls instead.
+      var below = vh - mouseY - pad * 2;
+      var above = mouseY - pad * 2;
+      var y = (h <= below || below >= above) ? mouseY + pad : mouseY - h - pad;
+      y = Math.max(pad, Math.min(y, vh - h - pad));
+
+      tooltip.style.left = x + 'px';
+      tooltip.style.top = y + 'px';
+    }
 
   function showInfo(id) {
     var info = nodeInfo[id];
