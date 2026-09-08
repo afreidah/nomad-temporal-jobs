@@ -129,7 +129,12 @@ func scanRepos(ctx workflow.Context, repos []string, repoCfgs map[string]activit
 			defer sem.Receive(gctx, nil)
 
 			rctx := workflow.WithActivityOptions(gctx, shared.QuickActivityOptions())
-			pr := activities.PollRepo{Repo: repo, Mode: rc.Mode, VaultPath: rc.VaultPath}
+			pr := activities.PollRepo{
+				Repo:       repo,
+				Mode:       rc.Mode,
+				VaultPath:  rc.VaultPath,
+				ForgejoURL: rc.ForgejoURL,
+			}
 			var jobs []git.QueuedJob
 			if err := workflow.ExecuteActivity(rctx, a.ListQueuedJobs, pr).Get(rctx, &jobs); err != nil {
 				logger.Warn("List queued jobs failed; skipping repo this tick", "repo", repo, "error", err)
@@ -247,6 +252,9 @@ func startRunnerChild(ctx workflow.Context, repo string, labels []string, rc act
 		MintToken:   !isVaultMode(rc.Mode),
 		VaultSecret: registerSecret,
 		ReapAfter:   reapAfter,
+		Mode:        rc.Mode,
+		ForgejoURL:  rc.ForgejoURL,
+		VaultPath:   rc.VaultPath,
 	}
 
 	child := workflow.ExecuteChildWorkflow(childCtx, HandleRunner, spec)

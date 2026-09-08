@@ -150,7 +150,7 @@ Keeps each managed repository's CI/release token secret continuously valid so it
 
 Scales self-hosted CI runners on demand (zero idle) instead of running them always-on. On a short schedule, the `PollAndDispatch` workflow reads a per-repo provisioning config from Consul KV (`runners/config`) and, for each repo, lists the queued Actions jobs whose `runs-on` includes `self-hosted`. Rather than one child per job, it **reconciles by depth**: it buckets the queued jobs by `(repo, labels)`, counts the ephemeral runners already pending/running for each bucket, and starts `HandleRunner` children only for the shortfall. Ephemeral repo-scoped runners aren't bound to a specific job — GitHub hands any label-matching runner whichever job is queued — so a bucket left short is simply topped back up on the next tick; there is no per-job dedup or external state store.
 
-Each repo picks a **mode**. `app` repos are polled through the shared GitHub App, and the child mints a runner registration token inside the dispatch activity (so it never enters workflow history). `vault` repos are polled with a PAT read from the secret store and dispatch a self-registering runner job that mints nothing — the poll token (`vaultPath`, needs only Actions:read) is split from the registration token (`registerVaultPath`, needs repo admin), so a write-only collaborator can poll a repo it doesn't own while a higher-privilege PAT registers. Every runner is ephemeral (one job, then it self-deregisters); a backstop timer reaps one that never picked its job up.
+Each repo picks a **mode**. `app` repos are polled through the shared GitHub App, and the child mints a runner registration token inside the dispatch activity (so it never enters workflow history). `vault` repos are polled with a PAT read from the secret store and dispatch a self-registering runner job that mints nothing — the poll token (`vaultPath`, needs only Actions:read) is split from the registration token (`registerVaultPath`, needs repo admin), so a write-only collaborator can poll a repo it doesn't own while a higher-privilege PAT registers. `forgejo` repos are polled against a Forgejo instance with an API token from the secret store (`vaultPath`) and behave like `app` repos from there on: Forgejo mints a registration token per repository on demand, so the dispatch mints one too and the runner receives a credential spent once. Every runner is ephemeral (one job, then it self-deregisters); a backstop timer reaps one that never picked its job up.
 
 Ordered **profiles** map a distinguishing `runs-on` label to the parameterized Nomad job (and optional image) dispatched for it — first matching label wins — so a repo routes e.g. `vm`/`go` jobs to different runner pools, and a bare `[self-hosted]` job falls back to the default `ci-runner`. Each profile, or the repo as a whole, can set `maxConcurrent` to cap that pool's concurrent runners; overflow stays queued on GitHub until a slot frees.
 
@@ -371,6 +371,12 @@ The config at `RUNNERS_CONFIG_KEY` is a JSON object keyed by `owner/repo`:
 ```json
 {
   "owner/app-repo": { "mode": "app", "maxConcurrent": 6 },
+  "alex/forgejo-repo": {
+    "mode": "forgejo",
+    "forgejoUrl": "http://forgejo.service.consul:30028",
+    "vaultPath": "forgejo/api-token",
+    "maxConcurrent": 4
+  },
   "owner/vault-repo": {
     "mode": "vault",
     "vaultPath": "github/vault-repo-poll",
@@ -383,7 +389,7 @@ The config at `RUNNERS_CONFIG_KEY` is a JSON object keyed by `owner/repo`:
 }
 ```
 
-`mode` defaults to `app`. `vaultPath`/`registerVaultPath` apply only to `vault` mode (register falls back to poll when unset). `profiles` is optional and evaluated top-down; `maxConcurrent` (per-profile or repo-wide) is `0`/absent for unlimited.
+`mode` defaults to `app`. `registerVaultPath` applies only to `vault` mode (it falls back to `vaultPath` when unset); `vaultPath` is also the API token `forgejo` mode polls and mints with, and `forgejoUrl` names the instance a `forgejo` repo is polled against. `profiles` is optional and evaluated top-down; `maxConcurrent` (per-profile or repo-wide) is `0`/absent for unlimited.
 
 ### Media Import Worker
 

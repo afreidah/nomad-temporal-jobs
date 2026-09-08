@@ -47,6 +47,12 @@ type RunnerSpec struct {
 	MintToken   bool          `json:"mint_token"`
 	VaultSecret string        `json:"vault_secret,omitempty"`
 	ReapAfter   time.Duration `json:"reap_after,omitempty"`
+	// Mode, ForgejoURL and VaultPath travel with the spec so the dispatch mints
+	// against the same forge the poll read, rather than resolving config a
+	// second time and risking a different answer.
+	Mode       string `json:"mode,omitempty"`
+	ForgejoURL string `json:"forgejo_url,omitempty"`
+	VaultPath  string `json:"vault_path,omitempty"`
 }
 
 // HandleRunner dispatches one ephemeral runner for spec's (repo, labels) and
@@ -70,6 +76,9 @@ func HandleRunner(ctx workflow.Context, spec RunnerSpec) error {
 		Image:       spec.Image,
 		MintToken:   spec.MintToken,
 		VaultSecret: spec.VaultSecret,
+		Mode:        spec.Mode,
+		ForgejoURL:  spec.ForgejoURL,
+		VaultPath:   spec.VaultPath,
 	}).Get(dispatchCtx, &dispatchedID)
 	if err != nil {
 		return fmt.Errorf("dispatch runner for %s: %w", spec.Repo, err)
