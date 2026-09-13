@@ -62,6 +62,7 @@ func RunWorker(ctx context.Context, spec WorkerSpec) error {
 
 	// --- Temporal client ---
 	temporalAddr := cmp.Or(os.Getenv("TEMPORAL_ADDRESS"), "localhost:7233")
+	temporalNamespace := resolveNamespace()
 
 	tracingInterceptor, err := opentelemetry.NewTracingInterceptor(opentelemetry.TracerOptions{})
 	if err != nil {
@@ -70,6 +71,7 @@ func RunWorker(ctx context.Context, spec WorkerSpec) error {
 
 	clientOpts := client.Options{
 		HostPort:       temporalAddr,
+		Namespace:      temporalNamespace,
 		Logger:         temporalLogger,
 		MetricsHandler: metricsHandler,
 	}
@@ -79,7 +81,7 @@ func RunWorker(ctx context.Context, spec WorkerSpec) error {
 
 	c, err := client.Dial(clientOpts)
 	if err != nil {
-		return fmt.Errorf("dial temporal at %s: %w", temporalAddr, err)
+		return fmt.Errorf("dial temporal at %s (namespace %s): %w", temporalAddr, temporalNamespace, err)
 	}
 	defer c.Close()
 
@@ -110,4 +112,15 @@ func RunWorker(ctx context.Context, spec WorkerSpec) error {
 		return fmt.Errorf("worker %s failed: %w", spec.Service, err)
 	}
 	return nil
+}
+
+// resolveNamespace returns the Temporal namespace this worker polls.
+//
+// Unset means "default", matching what the SDK assumes for an empty field, so
+// a worker deployed without TEMPORAL_NAMESPACE keeps its existing behavior. A
+// worker must poll the same namespace its schedules target: a schedule firing
+// into a namespace nothing polls starts workflows that never run and are not
+// visible next to the ones that do.
+func resolveNamespace() string {
+	return cmp.Or(os.Getenv("TEMPORAL_NAMESPACE"), "default")
 }
