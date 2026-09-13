@@ -1,0 +1,44 @@
+# -------------------------------------------------------------------------------
+# Build and push the worker and website images on every merge to main.
+#
+# Project: Nomad Temporal Jobs / Author: Alex Freidah
+#
+# This file runs only on a Forgejo instance -- GitHub ignores .forgejo/workflows.
+# Its presence is also what stops Forgejo from falling back to .github/workflows,
+# which targets GitHub-hosted runners and fails on a self-hosted one.
+#
+# push-all builds every image, not just the domains a merge touched. The
+# repository reaches Forgejo through a mirror whose pushes are force-updated and
+# can batch several commits, so a push event's own commit range does not reliably
+# describe what changed; and the workers share the root Dockerfile and the
+# internal packages, so most changes are not confined to one domain anyway.
+#
+# It runs serially rather than through push-all-parallel: the runner is a 4 CPU /
+# 4 GB allocation, and eight concurrent image builds do not fit in it.
+# -------------------------------------------------------------------------------
+
+name: Images
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  images:
+    name: Build and push images
+    runs-on: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # every image tags from `git describe --tags`
+
+      - name: Build and push
+        run: |
+          set -euo pipefail
+
+          # The Go builds cross-compile, but the backup and trivy runtime stages
+          # have RUN steps, so their arm64 leg needs an emulator the build host
+          # does not carry.
+          docker run --privileged --rm tonistiigi/binfmt --install all
+
+          make push-all
