@@ -18,8 +18,8 @@ require (
 	github.com/hashicorp/nomad/api v0.0.0-20260316193234-fe53ba32ff2b
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/lib/pq v1.12.3
-	github.com/moby/moby/api v1.55.0
-	github.com/moby/moby/client v0.5.1
+	github.com/moby/moby/api v1.56.0
+	github.com/moby/moby/client v0.6.0
 	github.com/pkg/sftp v1.13.11
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.12.1
