@@ -55,26 +55,23 @@ type SSHTarget struct {
 // NewSSHClient and reuse it; it holds no per-host state and is safe for
 // concurrent use.
 type SSHClient struct {
-	auth    []ssh.AuthMethod
+	cfg     SSHConfig
 	hostKey ssh.HostKeyCallback
 	timeout time.Duration
 }
 
-// NewSSHClient parses the key, optional certificate, and host CA from cfg and
-// returns a ready client. The credentials are read once here rather than on
-// every command.
+// NewSSHClient reads the host CA from cfg and returns a ready client.
+//
+// The credentials are read here only to fail a misconfigured path at startup
+// rather than on the first command; the result is discarded, because every
+// connection reads them again.
 func NewSSHClient(cfg SSHConfig) (*SSHClient, error) {
 	timeout := cfg.Timeout
 	if timeout == 0 {
 		timeout = defaultSSHTimeout
 	}
 
-	signer, err := loadSigner(cfg.KeyPath)
-	if err != nil {
-		return nil, err
-	}
-	auth, err := buildAuthMethods(signer, cfg.CertPath)
-	if err != nil {
+	if _, err := credentials(cfg); err != nil {
 		return nil, err
 	}
 	hostKey, err := hostCACallback(cfg.HostCAPath)
@@ -82,7 +79,23 @@ func NewSSHClient(cfg SSHConfig) (*SSHClient, error) {
 		return nil, err
 	}
 
-	return &SSHClient{auth: auth, hostKey: hostKey, timeout: timeout}, nil
+	return &SSHClient{cfg: cfg, hostKey: hostKey, timeout: timeout}, nil
+}
+
+// credentials reads the key and optional certificate from disk and builds the
+// auth methods they support.
+//
+// Read per connection rather than held for the life of the process. The
+// certificate is short-lived and re-signed into the same path underneath a
+// worker that outlives it, and a copy parsed at startup goes on being offered
+// after it expires - which every host refuses identically, reporting only that
+// no authentication method remained rather than that the cert was stale.
+func credentials(cfg SSHConfig) ([]ssh.AuthMethod, error) {
+	signer, err := loadSigner(cfg.KeyPath)
+	if err != nil {
+		return nil, err
+	}
+	return buildAuthMethods(signer, cfg.CertPath)
 }
 
 // loadSigner reads and parses the SSH private key at keyPath.
@@ -161,9 +174,13 @@ func (c *SSHClient) connect(t SSHTarget) (*sshConn, error) {
 	if port == 0 {
 		port = 22
 	}
+	auth, err := credentials(c.cfg)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &ssh.ClientConfig{
 		User:            t.User,
-		Auth:            c.auth,
+		Auth:            auth,
 		HostKeyCallback: c.hostKey,
 		Timeout:         c.timeout,
 	}
