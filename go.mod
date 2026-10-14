@@ -1,6 +1,6 @@
 module munchbox/temporal-workers
 
-go 1.27.1
+go 1.27.2
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
