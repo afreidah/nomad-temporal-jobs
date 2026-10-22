@@ -87,12 +87,8 @@ func AptlyCleanup(ctx workflow.Context, config AptlyCleanupConfig) (result *Aptl
 		}
 	}
 
-	// --- Measure pool (before) ---
-	var beforeBytes int64
-	if err = workflow.ExecuteActivity(fastCtx, saga.MeasureDataDir, node, config.DataDir).Get(ctx, &beforeBytes); err != nil {
-		return result, fmt.Errorf("measure aptly data dir (before): %w", err)
-	}
-	result.BeforeBytes = nodes.HumanBytes(beforeBytes)
+	// --- Measure pool (before); best-effort, report only ---
+	before := nodes.MeasureBestEffort(fastCtx, node, config.DataDir, "before")
 
 	// --- Scale aptly down to 0 ---
 	if err = workflow.ExecuteActivity(fastCtx, saga.ScaleJob, config.JobName, config.GroupName, 0).Get(ctx, nil); err != nil {
@@ -131,17 +127,9 @@ func AptlyCleanup(ctx workflow.Context, config AptlyCleanupConfig) (result *Aptl
 	}
 	result.Output = output
 
-	// --- Measure pool (after) ---
-	var afterBytes int64
-	if err = workflow.ExecuteActivity(fastCtx, saga.MeasureDataDir, node, config.DataDir).Get(ctx, &afterBytes); err != nil {
-		return result, fmt.Errorf("measure aptly data dir (after): %w", err)
-	}
-	result.AfterBytes = nodes.HumanBytes(afterBytes)
-	if reclaimed := beforeBytes - afterBytes; reclaimed > 0 {
-		result.BytesReclaimed = nodes.HumanBytes(reclaimed)
-	} else {
-		result.BytesReclaimed = "0B"
-	}
+	// --- Measure pool (after); best-effort, report only ---
+	after := nodes.MeasureBestEffort(fastCtx, node, config.DataDir, "after")
+	result.BeforeBytes, result.AfterBytes, result.BytesReclaimed = nodes.SizeReport(before, after)
 
 	logger.Info("Aptly cleanup complete",
 		"node", result.Node, "before", result.BeforeBytes, "after", result.AfterBytes, "reclaimed", result.BytesReclaimed)

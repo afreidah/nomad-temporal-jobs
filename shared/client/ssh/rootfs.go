@@ -51,7 +51,7 @@ func (s *sshConn) RootfsPrune(ctx context.Context, dryRun bool) (ReclaimResult, 
 	var candidates []pruneCandidate
 	for _, name := range rootfsOrphans(entries, string(mounts)) {
 		path := rootfsOverlayDir + "/" + name
-		size, _ := s.DirSize(path) // best-effort accounting
+		size, _ := s.DirSize(ctx, path) // best-effort accounting
 		candidates = append(candidates, pruneCandidate{id: path, size: size})
 	}
 	return sweep(candidates, dryRun, s.RemoveAll), nil

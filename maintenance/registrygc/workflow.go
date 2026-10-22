@@ -111,14 +111,10 @@ func RegistryGC(ctx workflow.Context, config RegistryGCConfig) (result RegistryG
 	result.NodeAddr = node.Address
 
 	// -----------------------------------------------------------------
-	// Measure registry data dir (before)
+	// Measure registry data dir (before); best-effort, report only
 	// -----------------------------------------------------------------
 
-	var beforeBytes int64
-	if err = workflow.ExecuteActivity(fastCtx, saga.MeasureDataDir, node, config.RegistryDataDir).Get(ctx, &beforeBytes); err != nil {
-		return result, fmt.Errorf("measure registry data dir (before): %w", err)
-	}
-	result.BeforeBytes = nodes.HumanBytes(beforeBytes)
+	before := nodes.MeasureBestEffort(fastCtx, node, config.RegistryDataDir, "before")
 
 	// -----------------------------------------------------------------
 	// Scale registry down to 0
@@ -183,19 +179,11 @@ func RegistryGC(ctx workflow.Context, config RegistryGCConfig) (result RegistryG
 	result.BlobsDeleted = gcRun.BlobsDeleted
 
 	// -----------------------------------------------------------------
-	// Measure registry data dir (after)
+	// Measure registry data dir (after); best-effort, report only
 	// -----------------------------------------------------------------
 
-	var afterBytes int64
-	if err = workflow.ExecuteActivity(fastCtx, saga.MeasureDataDir, node, config.RegistryDataDir).Get(ctx, &afterBytes); err != nil {
-		return result, fmt.Errorf("measure registry data dir (after): %w", err)
-	}
-	result.AfterBytes = nodes.HumanBytes(afterBytes)
-	if reclaimed := beforeBytes - afterBytes; reclaimed > 0 {
-		result.BytesReclaimed = nodes.HumanBytes(reclaimed)
-	} else {
-		result.BytesReclaimed = "0B"
-	}
+	after := nodes.MeasureBestEffort(fastCtx, node, config.RegistryDataDir, "after")
+	result.BeforeBytes, result.AfterBytes, result.BytesReclaimed = nodes.SizeReport(before, after)
 
 	logger.Info("Registry garbage-collect complete",
 		"node", result.NodeName,

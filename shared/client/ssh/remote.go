@@ -29,7 +29,7 @@ type ContainerRunner interface {
 }
 
 // DirMeasurer reports the total size in bytes of a directory on a remote host,
-// walked over SFTP. Used for before/after data-dir reporting.
+// measured with du on the host. Used for before/after data-dir reporting.
 type DirMeasurer interface {
 	DirSize(ctx context.Context, t SSHTarget, dir string) (int64, error)
 }
