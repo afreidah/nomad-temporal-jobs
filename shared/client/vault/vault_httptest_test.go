@@ -146,3 +146,80 @@ func TestStartTokenRefresher(t *testing.T) {
 	(&VaultClient{tokenFile: writeTemp(t, "tok", []byte("t"))}).
 		StartTokenRefresher(ctx, time.Hour, slog.Default())
 }
+
+// Ticks reload a rotated token from the file and survive a failed read.
+func TestStartTokenRefresher_Ticks(t *testing.T) {
+	ts := vaultStub()
+	defer ts.Close()
+
+	v := testVault(t, ts)
+	v.tokenFile = writeTemp(t, "tok", []byte("rotated\n"))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	v.StartTokenRefresher(ctx, time.Millisecond, slog.Default())
+	if got := v.api.Token(); got != "rotated" {
+		t.Errorf("token = %q, want rotated", got)
+	}
+
+	v.tokenFile = filepath.Join(t.TempDir(), "absent")
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	v.StartTokenRefresher(ctx, time.Millisecond, slog.Default())
+	if got := v.api.Token(); got != "rotated" {
+		t.Errorf("token after failed read = %q, want rotated", got)
+	}
+}
+
+// statusVault returns a client whose server answers every request with code
+// and body.
+func statusVault(t *testing.T, code int, body string) *VaultClient {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(ts.Close)
+	return testVault(t, ts)
+}
+
+func TestVault_ServerErrors(t *testing.T) {
+	v := statusVault(t, http.StatusInternalServerError, `{"errors":["boom"]}`)
+	ctx := context.Background()
+
+	if _, err := v.ReadKV(ctx, "myapp"); err == nil {
+		t.Error("ReadKV: expected an error")
+	}
+	if _, err := v.ReadKVField(ctx, "myapp", "password"); err == nil {
+		t.Error("ReadKVField: expected an error")
+	}
+	if _, _, err := v.ReadKVMaybe(ctx, "myapp"); err == nil {
+		t.Error("ReadKVMaybe: expected an error")
+	}
+	if err := v.WriteKV(ctx, "myapp", map[string]any{"k": "v"}); err == nil {
+		t.Error("WriteKV: expected an error")
+	}
+}
+
+func TestVault_ReadKVField_NotString(t *testing.T) {
+	v := statusVault(t, http.StatusOK, `{"data":{"data":{"port":5432},"metadata":{"version":1}}}`)
+	if _, err := v.ReadKVField(context.Background(), "myapp", "port"); !errors.Is(err, ErrSecretFieldMissing) {
+		t.Errorf("err = %v, want ErrSecretFieldMissing", err)
+	}
+}
+
+// A KV v2 response whose inner data is not a map reads as absent.
+func TestVault_ReadKVMaybe_MalformedData(t *testing.T) {
+	v := statusVault(t, http.StatusOK, `{"data":{"data":"x"}}`)
+	if _, found, err := v.ReadKVMaybe(context.Background(), "myapp"); err != nil || found {
+		t.Errorf("ReadKVMaybe = (found=%v, err=%v), want (false, nil)", found, err)
+	}
+}
+
+func TestWorkloadToken_FileReadError(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "")
+	t.Setenv("VAULT_TOKEN_FILE", filepath.Join(t.TempDir(), "absent"))
+	if _, err := workloadToken(); err == nil {
+		t.Error("expected an error for an unreadable token file")
+	}
+}

@@ -149,6 +149,23 @@ func TestIsQuotaError_404(t *testing.T) {
 	}
 }
 
+func TestIsQuotaError_Nil(t *testing.T) {
+	if isQuotaError(nil) {
+		t.Error("Expected false for nil error")
+	}
+}
+
+type statusError int
+
+func (e statusError) Error() string       { return "upload failed" }
+func (e statusError) HTTPStatusCode() int { return int(e) }
+
+func TestIsQuotaError_HTTP507(t *testing.T) {
+	if !isQuotaError(statusError(507)) {
+		t.Error("Expected true for an HTTP 507 response error")
+	}
+}
+
 // -------------------------------------------------------------------------
 // BACKUP RESULT TYPES
 // -------------------------------------------------------------------------

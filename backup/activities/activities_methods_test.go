@@ -86,6 +86,17 @@ func actEnv() *testsuite.TestActivityEnvironment {
 	return (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
 }
 
+// blockedDir returns a path beneath a regular file, so mkdir and stat on it
+// fail with ENOTDIR.
+func blockedDir(t *testing.T) string {
+	t.Helper()
+	f := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(f, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(f, "dir")
+}
+
 // --- TakeConsulSnapshot ------------------------------------------------------
 
 func TestTakeConsulSnapshot(t *testing.T) {
@@ -124,6 +135,27 @@ func TestTakeConsulSnapshot_Error(t *testing.T) {
 
 	if _, err := env.ExecuteActivity(a.TakeConsulSnapshot); err == nil {
 		t.Fatal("expected an error when SaveSnapshot fails")
+	}
+}
+
+func TestTakeConsulSnapshot_WriteErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+		rc   io.ReadCloser
+	}{
+		{"mkdir fails", blockedDir(t), io.NopCloser(strings.NewReader("x"))},
+		{"stream fails", t.TempDir(), io.NopCloser(errReader{})},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a := &Activities{config: Config{ConsulBackupDir: c.dir}, consul: &fakeConsul{rc: c.rc}}
+			env := actEnv()
+			env.RegisterActivity(a.TakeConsulSnapshot)
+			if _, err := env.ExecuteActivity(a.TakeConsulSnapshot); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
 	}
 }
 
@@ -290,6 +322,60 @@ func TestCleanupOldS3Backups(t *testing.T) {
 	}
 }
 
+func TestCleanupOldS3Backups_ListError(t *testing.T) {
+	a := &Activities{store: &fakeStore{listErr: errors.New("s3 down")}}
+	env := actEnv()
+	env.RegisterActivity(a.CleanupOldS3Backups)
+	if _, err := env.ExecuteActivity(a.CleanupOldS3Backups, 30); err == nil {
+		t.Fatal("expected an error when listing S3 objects fails")
+	}
+}
+
+// A failed delete is logged and skipped, not fatal.
+func TestCleanupOldS3Backups_DeleteError(t *testing.T) {
+	old := time.Now().AddDate(0, 0, -40)
+	store := &fakeStore{
+		objs:   []s3types.Object{{Key: aws.String("backups/old.snap"), LastModified: &old}},
+		delErr: errors.New("access denied"),
+	}
+	a := &Activities{store: store}
+	env := actEnv()
+	env.RegisterActivity(a.CleanupOldS3Backups)
+	if _, err := env.ExecuteActivity(a.CleanupOldS3Backups, 30); err != nil {
+		t.Fatalf("CleanupOldS3Backups: %v", err)
+	}
+}
+
+func TestUploadToS3_Failures(t *testing.T) {
+	quota := errors.New("InsufficientStorage: quota exceeded")
+	cases := []struct {
+		name          string
+		store         *fakeStore
+		wantEvictions int
+	}{
+		{"non-quota error", &fakeStore{putErrs: []error{errors.New("connection reset")}}, 0},
+		{"evictions exhausted", &fakeStore{putErrs: []error{quota, quota, quota, quota}}, 3},
+		{"eviction fails", &fakeStore{putErrs: []error{quota}, oldestErr: errors.New("nothing to evict")}, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			local := filepath.Join(t.TempDir(), "backup.snap")
+			if err := os.WriteFile(local, []byte("data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a := &Activities{config: Config{S3Bucket: "b"}, store: c.store}
+			env := actEnv()
+			env.RegisterActivity(a.UploadToS3)
+			if _, err := env.ExecuteActivity(a.UploadToS3, UploadRequest{LocalPath: local, KeyPrefix: "backups/nomad"}); err == nil {
+				t.Fatal("expected an upload error")
+			}
+			if c.store.evictions != c.wantEvictions {
+				t.Errorf("evictions = %d, want %d", c.store.evictions, c.wantEvictions)
+			}
+		})
+	}
+}
+
 // --- filesystem cleanup helpers ----------------------------------------------
 
 type nopLog struct{}
@@ -384,5 +470,11 @@ func TestStreamToFile_PartialIsRemoved(t *testing.T) {
 	}
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		t.Error("partial file should have been removed after copy failure")
+	}
+}
+
+func TestStreamToFile_CreateFails(t *testing.T) {
+	if _, err := streamToFile(filepath.Join(blockedDir(t), "out"), strings.NewReader("x")); err == nil {
+		t.Fatal("expected an error when the file cannot be created")
 	}
 }

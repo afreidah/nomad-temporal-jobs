@@ -30,3 +30,20 @@ func TestNewNomad(t *testing.T) {
 		t.Fatal("NewNomad returned nil")
 	}
 }
+
+func TestNewNomadClient_FromEnv(t *testing.T) {
+	t.Setenv("NOMAD_ADDR", "https://nomad.example:4646")
+	t.Setenv("NOMAD_TOKEN", "secret-id")
+	t.Setenv("NOMAD_CACERT", "/etc/nomad/ca.pem")
+
+	if _, err := NewNomadClient(); err != nil {
+		t.Fatalf("NewNomadClient: %v", err)
+	}
+}
+
+func TestNewNomad_BadAddr(t *testing.T) {
+	t.Setenv("NOMAD_ADDR", "http://[::1")
+	if _, err := NewNomad(); err == nil {
+		t.Fatal("expected an error for an unparseable NOMAD_ADDR")
+	}
+}

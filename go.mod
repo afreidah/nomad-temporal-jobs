@@ -1,15 +1,15 @@
 module munchbox/temporal-workers
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/XSAM/otelsql v0.44.0
-	github.com/aws/aws-sdk-go-v2 v1.47.1
+	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.6
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.43
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.0
-	github.com/aws/smithy-go v1.28.1
+	github.com/aws/smithy-go v1.28.5
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/containerd/containerd/v2 v2.3.6
 	github.com/go-acme/lego/v4 v4.35.2
@@ -24,13 +24,13 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.12.1
 	github.com/uber-go/tally/v4 v4.1.17
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
 	go.opentelemetry.io/otel/trace v1.47.0
-	go.temporal.io/api v1.63.5
-	go.temporal.io/sdk v1.48.0
+	go.temporal.io/api v1.63.7
+	go.temporal.io/sdk v1.49.0
 	go.temporal.io/sdk/contrib/opentelemetry v0.8.1
 	go.temporal.io/sdk/contrib/sysinfo v0.1.1
 	go.temporal.io/sdk/contrib/tally v0.2.0
@@ -117,7 +117,7 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
 	github.com/kevinburke/ssh_config v1.2.0 // indirect
-	github.com/klauspost/compress v1.18.5 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/logrusorgru/aurora/v4 v4.0.0 // indirect
@@ -135,7 +135,7 @@ require (
 	github.com/moby/sys/mountinfo v0.7.2 // indirect
 	github.com/moby/sys/sequential v0.6.0 // indirect
 	github.com/moby/sys/signal v0.7.1 // indirect
-	github.com/moby/sys/user v0.4.0 // indirect
+	github.com/moby/sys/user v0.4.1 // indirect
 	github.com/moby/sys/userns v0.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nexus-rpc/nexus-proto-annotations v0.1.0 // indirect

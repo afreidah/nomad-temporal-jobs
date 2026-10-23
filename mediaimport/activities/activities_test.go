@@ -311,3 +311,160 @@ func TestJellyfinRefreshBadStatus(t *testing.T) {
 		t.Fatal("expected error on non-2xx refresh")
 	}
 }
+
+func TestConfigValidateMissingAddr(t *testing.T) {
+	cfg := Config{Vault: fullVault(), SonarrAddr: "a", RadarrAddr: "b", DelugeAddr: "c"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "JellyfinAddr") {
+		t.Fatalf("expected JellyfinAddr error, got %v", err)
+	}
+}
+
+func TestNewInvalidConfig(t *testing.T) {
+	if _, err := New(context.Background(), Config{}); err == nil {
+		t.Fatal("expected error for invalid config")
+	}
+}
+
+// Each Vault read is dropped in turn so every credential's error path fires.
+func TestNewEachMissingSecret(t *testing.T) {
+	cases := []struct {
+		path, field string
+	}{
+		{vaultMediaImportPath, fieldSonarrAPIKey},
+		{vaultMediaImportPath, fieldRadarrAPIKey},
+		{vaultDelugePath, fieldDelugePass},
+		{vaultJellyfinPath, fieldJellyfinKey},
+	}
+	for _, c := range cases {
+		t.Run(c.field, func(t *testing.T) {
+			v := fullVault()
+			delete(v.vals[c.path], c.field)
+			cfg := Config{Vault: v, SonarrAddr: "a", RadarrAddr: "b", DelugeAddr: "c", JellyfinAddr: "d"}
+			_, err := New(context.Background(), cfg)
+			if err == nil || !strings.Contains(err.Error(), c.field) {
+				t.Fatalf("expected error naming %s, got %v", c.field, err)
+			}
+		})
+	}
+}
+
+func TestReconcileConfigApplyDefaults(t *testing.T) {
+	c := ReconcileConfig{}
+	c.ApplyDefaults()
+	if c.Concurrency != 4 {
+		t.Fatalf("default concurrency=%d want 4", c.Concurrency)
+	}
+	c = ReconcileConfig{Concurrency: 7}
+	c.ApplyDefaults()
+	if c.Concurrency != 7 {
+		t.Fatalf("explicit concurrency overwritten: %d", c.Concurrency)
+	}
+}
+
+// delugeServer accepts auth.login and answers get_torrents_status with fn.
+func delugeServer(fn func(http.ResponseWriter)) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req delugeRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "auth.login" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"result": true})
+			return
+		}
+		fn(w)
+	}))
+}
+
+func TestListCompletedStatusErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func(http.ResponseWriter)
+	}{
+		{"rpc error", func(w http.ResponseWriter) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "not authed"}})
+		}},
+		{"bad status", func(w http.ResponseWriter) { w.WriteHeader(http.StatusBadGateway) }},
+		{"bad json", func(w http.ResponseWriter) { _, _ = w.Write([]byte("{not json")) }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := delugeServer(c.fn)
+			defer srv.Close()
+			acts := newTestActs(t, Config{SonarrAddr: "a", RadarrAddr: "b", DelugeAddr: srv.URL, JellyfinAddr: "d"})
+			if _, err := acts.ListCompleted(context.Background()); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestDelugeCallMarshalError(t *testing.T) {
+	acts := newTestActs(t, Config{SonarrAddr: "a", RadarrAddr: "b", DelugeAddr: "c", JellyfinAddr: "d"})
+	err := acts.delugeCall(context.Background(), delugeRequest{Params: []any{func() {}}}, &struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "marshal") {
+		t.Fatalf("expected marshal error, got %v", err)
+	}
+}
+
+// A control character in the address makes http.NewRequest fail, covering the
+// request-build error path of every outbound call.
+func TestActivitiesBuildRequestErrors(t *testing.T) {
+	bad := "http://bad\x7f"
+	acts := newTestActs(t, Config{SonarrAddr: bad, RadarrAddr: bad, DelugeAddr: bad, JellyfinAddr: bad})
+	ctx := context.Background()
+	if _, err := acts.ListCompleted(ctx); err == nil {
+		t.Error("ListCompleted should fail to build its request")
+	}
+	if _, err := acts.RadarrImport(ctx, ImportRequest{Folder: "x"}); err == nil {
+		t.Error("RadarrImport should fail to build its request")
+	}
+	if err := acts.arrManualImport(ctx, bad, "k", nil); err == nil {
+		t.Error("arrManualImport should fail to build its request")
+	}
+	if err := acts.JellyfinRefresh(ctx); err == nil {
+		t.Error("JellyfinRefresh should fail to build its request")
+	}
+}
+
+func TestArrDecisionsDecodeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("{not json"))
+	}))
+	defer srv.Close()
+	acts := newTestActs(t, Config{SonarrAddr: "a", RadarrAddr: srv.URL, DelugeAddr: "c", JellyfinAddr: "d"})
+	if _, err := acts.RadarrImport(context.Background(), ImportRequest{Folder: "m"}); err == nil {
+		t.Fatal("expected decode error")
+	}
+}
+
+func TestArrManualImportMarshalError(t *testing.T) {
+	acts := newTestActs(t, Config{SonarrAddr: "a", RadarrAddr: "b", DelugeAddr: "c", JellyfinAddr: "d"})
+	files := []arrImportFile{{Path: "p", Quality: json.RawMessage(`{`)}}
+	if err := acts.arrManualImport(context.Background(), "http://r", "k", files); err == nil {
+		t.Fatal("expected marshal error for invalid raw quality")
+	}
+}
+
+func TestArrManualImportTransportError(t *testing.T) {
+	acts := newTestActs(t, Config{SonarrAddr: "a", RadarrAddr: "b", DelugeAddr: "c", JellyfinAddr: "d"})
+	acts.http = stubDoer{fn: func(*http.Request) (*http.Response, error) { return nil, errors.New("boom") }}
+	if err := acts.arrManualImport(context.Background(), "http://r", "k", nil); err == nil {
+		t.Fatal("expected transport error")
+	}
+}
+
+func TestRadarrImportPostError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]arrDecision{
+			{Path: "/m/movie.mkv", Movie: &arrRef{ID: 9}, Quality: json.RawMessage(`{}`)},
+		})
+	}))
+	defer srv.Close()
+	acts := newTestActs(t, Config{SonarrAddr: "a", RadarrAddr: srv.URL, DelugeAddr: "c", JellyfinAddr: "d"})
+	if _, err := acts.RadarrImport(context.Background(), ImportRequest{Folder: "m"}); err == nil {
+		t.Fatal("expected error when the ManualImport POST fails")
+	}
+}

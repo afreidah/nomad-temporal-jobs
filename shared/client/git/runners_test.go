@@ -135,3 +135,62 @@ func TestListQueuedSelfHostedJobs(t *testing.T) {
 		t.Errorf("labels = %v, want self-hosted present", j.Labels)
 	}
 }
+
+// fail answers every request with a 500.
+func fail(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "boom", http.StatusInternalServerError)
+}
+
+func TestCreateRunnerRegistrationToken_Errors(t *testing.T) {
+	t.Run("mint fails", func(t *testing.T) {
+		gh := newTestGitHub(t, http.HandlerFunc(fail))
+		if _, _, err := gh.CreateRunnerRegistrationToken(context.Background(), "octo", "widget"); err == nil {
+			t.Fatal("expected an error when the installation token mint fails")
+		}
+	})
+	t.Run("registration fails", func(t *testing.T) {
+		mux := tokenMux()
+		mux.HandleFunc("POST /repos/octo/widget/actions/runners/registration-token", fail)
+		gh := newTestGitHub(t, mux)
+		if _, _, err := gh.CreateRunnerRegistrationToken(context.Background(), "octo", "widget"); err == nil {
+			t.Fatal("expected an error when the registration call fails")
+		}
+	})
+}
+
+func TestListQueuedSelfHostedJobs_Errors(t *testing.T) {
+	t.Run("mint fails", func(t *testing.T) {
+		gh := newTestGitHub(t, http.HandlerFunc(fail))
+		if _, err := gh.ListQueuedSelfHostedJobs(context.Background(), "octo", "widget"); err == nil {
+			t.Fatal("expected an error when the installation token mint fails")
+		}
+	})
+	t.Run("list runs fails", func(t *testing.T) {
+		mux := tokenMux()
+		mux.HandleFunc("GET /repos/octo/widget/actions/runs", fail)
+		gh := newTestGitHub(t, mux)
+		if _, err := gh.ListQueuedSelfHostedJobs(context.Background(), "octo", "widget"); err == nil {
+			t.Fatal("expected an error when listing runs fails")
+		}
+	})
+	t.Run("list jobs fails", func(t *testing.T) {
+		mux := tokenMux()
+		mux.HandleFunc("GET /repos/octo/widget/actions/runs", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{"id": 1}}})
+		})
+		mux.HandleFunc("GET /repos/octo/widget/actions/runs/{run_id}/jobs", fail)
+		gh := newTestGitHub(t, mux)
+		if _, err := gh.ListQueuedSelfHostedJobs(context.Background(), "octo", "widget"); err == nil {
+			t.Fatal("expected an error when listing jobs fails")
+		}
+	})
+}
+
+// A bad base URL fails the per-call token client after the mint succeeds.
+func TestInstallationClient_BadBaseURL(t *testing.T) {
+	gh := newTestGitHub(t, tokenMux())
+	gh.baseURL = "://bad"
+	if _, err := gh.installationClient(context.Background(), "widget", nil); err == nil {
+		t.Fatal("expected an error building the token client")
+	}
+}
