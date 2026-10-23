@@ -113,7 +113,7 @@ func (a *SagaActivities) ResolveJobImage(ctx context.Context, jobName string) (s
 // -------------------------------------------------------------------------
 
 // MeasureDataDir returns the total size in bytes of a directory on the given
-// node, walked over SFTP. Used for before/after reporting; the path is
+// node, from du over SSH. Used for before/after reporting; the path is
 // host-side (e.g. /mnt/gdrive) and the Nomad API doesn't expose disk usage.
 func (a *SagaActivities) MeasureDataDir(ctx context.Context, node NodeInfo, dataDir string) (int64, error) {
 	logger := activity.GetLogger(ctx)

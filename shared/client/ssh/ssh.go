@@ -20,6 +20,7 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -214,17 +215,15 @@ func (c *SSHClient) RunWithHeartbeat(ctx context.Context, t SSHTarget, cmd strin
 	return conn.RunWithHeartbeat(ctx, cmd, interval)
 }
 
-// DirSize opens a connection to t, measures dir over SFTP, and closes the
-// connection. The walk is aborted if ctx is cancelled.
+// DirSize opens a connection to t, measures dir with du on the host, and
+// closes the connection. The command is aborted if ctx is cancelled.
 func (c *SSHClient) DirSize(ctx context.Context, t SSHTarget, dir string) (int64, error) {
 	conn, err := c.connect(t)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = conn.Close() }()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
-	return conn.DirSize(dir)
+	return conn.DirSize(ctx, dir)
 }
 
 // sshConn is the concrete SSH-backed implementation of RemoteHost: an open
@@ -273,24 +272,45 @@ func (s *sshConn) RemoveAll(path string) error {
 	return c.RemoveAll(path)
 }
 
-// DirSize returns the total size in bytes of the regular files under dir,
-// walked over SFTP. Unreadable entries are skipped.
-func (s *sshConn) DirSize(dir string) (int64, error) {
-	c, err := s.sftpClient()
+// DirSize returns the total size in bytes under dir, from `du -sb` run on the
+// host: one command whose walk stays on the host, instead of an SFTP round trip
+// per file, which overran on large trees on NFS. du still prints a total when
+// some entries are unreadable, so that total is used even on a non-zero exit.
+func (s *sshConn) DirSize(ctx context.Context, dir string) (int64, error) {
+	out, err := s.Run(ctx, "du -sb -- "+ShellQuote(dir))
+	return duTotal(out, err, ctx.Err())
+}
+
+// duTotal resolves a du run into a size. A cancelled context always fails; a
+// parsed total wins over a non-zero exit; otherwise the run error is returned,
+// then the parse error.
+func duTotal(out string, runErr, ctxErr error) (int64, error) {
+	if ctxErr != nil {
+		return 0, ctxErr
+	}
+	n, perr := parseDuBytes(out)
+	if perr == nil {
+		return n, nil
+	}
+	if runErr != nil {
+		return 0, runErr
+	}
+	return 0, perr
+}
+
+// parseDuBytes reads the byte total from `du -sb` output: the first field of
+// its last line.
+func parseDuBytes(out string) (int64, error) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) == 0 {
+		return 0, errors.New("du: no output")
+	}
+	n, err := strconv.ParseInt(fields[0], 10, 64)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("du: unexpected output %q", lines[len(lines)-1])
 	}
-	var total int64
-	walker := c.Walk(dir)
-	for walker.Step() {
-		if walker.Err() != nil {
-			continue
-		}
-		if info := walker.Stat(); !info.IsDir() {
-			total += info.Size()
-		}
-	}
-	return total, nil
+	return n, nil
 }
 
 // Run executes cmd on the connection and returns its stdout. stderr is folded

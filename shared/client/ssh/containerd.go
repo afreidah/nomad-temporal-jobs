@@ -120,7 +120,7 @@ func (s *sshConn) ContainerdPrune(ctx context.Context, dryRun bool) (ContainerdP
 		return ContainerdPruneResult{Candidates: len(candidates)}, nil
 	}
 
-	before, _ := s.DirSize(containerdDataDir) // best-effort size accounting
+	before, _ := s.DirSize(ctx, containerdDataDir) // best-effort size accounting
 	var result ContainerdPruneResult
 	is := cli.ImageService()
 	for _, name := range candidates {
@@ -130,7 +130,7 @@ func (s *sshConn) ContainerdPrune(ctx context.Context, dryRun bool) (ContainerdP
 		}
 		result.Deleted++
 	}
-	after, _ := s.DirSize(containerdDataDir)
+	after, _ := s.DirSize(ctx, containerdDataDir)
 	if before > after {
 		result.Reclaimed = uint64(before - after)
 	}

@@ -55,7 +55,7 @@ func (s *sshConn) BuildxVolumePrune(ctx context.Context, dryRun bool) (ReclaimRe
 		if !isBuildxStateVolume(v.Name) {
 			continue
 		}
-		size, _ := s.DirSize(v.Mountpoint) // best-effort accounting
+		size, _ := s.DirSize(ctx, v.Mountpoint) // best-effort accounting
 		candidates = append(candidates, pruneCandidate{id: v.Name, size: size})
 	}
 	return sweep(candidates, dryRun, func(name string) error {

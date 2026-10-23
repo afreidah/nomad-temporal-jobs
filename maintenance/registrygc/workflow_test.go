@@ -5,6 +5,7 @@
 //
 // Tests the saga shape of the workflow with mocked activities. Three cases:
 //   - Happy path: all 6 activities + deferred scale-back run in order.
+//   - Measure failure: GC still runs; sizes report as unknown.
 //   - GC failure: GC activity errors; the deferred scale-back STILL runs so
 //     the registry isn't stranded at count=0.
 //   - Scale-down failure: nothing else runs (no compensation needed because
@@ -83,7 +84,47 @@ func TestRegistryGC_HappyPath(t *testing.T) {
 }
 
 // -------------------------------------------------------------------------
-// GC FAILURE — DEFERRED SCALE-BACK MUST STILL RUN
+// MEASURE FAILURE - GC STILL RUNS, SIZES REPORT UNKNOWN
+// -------------------------------------------------------------------------
+
+func TestRegistryGC_MeasureFailureDoesNotBlockGC(t *testing.T) {
+	suite := &testsuite.WorkflowTestSuite{}
+	env := suite.NewTestWorkflowEnvironment()
+
+	cfgIn := RegistryGCConfig{}
+	expandedCfg := RegistryGCConfig{}
+	expandedCfg.ApplyDefaults()
+	node := nodes.NodeInfo{ID: "node-1", Name: "stabler", Address: "192.168.68.61"}
+
+	env.OnActivity(saga.FindJobNode, mock.Anything, expandedCfg.JobName).Return(node, nil)
+	env.OnActivity(saga.MeasureDataDir, mock.Anything, node, expandedCfg.RegistryDataDir).
+		Return(int64(0), errors.New("activity StartToClose timeout"))
+	env.OnActivity(saga.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).Return(nil)
+	env.OnActivity(saga.WaitJobDrained, mock.Anything, expandedCfg.JobName).Return(nil)
+	env.OnActivity(acts.RunRegistryGarbageCollect, mock.Anything, node, expandedCfg).
+		Return(RegistryGCRunResult{BlobsDeleted: 7}, nil)
+	env.OnActivity(saga.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).Return(nil)
+	env.OnActivity(saga.WaitJobRunning, mock.Anything, expandedCfg.JobName).Return(nil)
+
+	env.ExecuteWorkflow(RegistryGC, cfgIn)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("a failed measurement must not fail the workflow: %v", err)
+	}
+	var got RegistryGCResult
+	if err := env.GetWorkflowResult(&got); err != nil {
+		t.Fatalf("get result: %v", err)
+	}
+	if got.BlobsDeleted != 7 {
+		t.Errorf("BlobsDeleted = %d, want 7 (GC must still run)", got.BlobsDeleted)
+	}
+	if got.BeforeBytes != "unknown" || got.AfterBytes != "unknown" || got.BytesReclaimed != "unknown" {
+		t.Errorf("sizes = %q/%q/%q, want unknown", got.BeforeBytes, got.AfterBytes, got.BytesReclaimed)
+	}
+}
+
+// -------------------------------------------------------------------------
+// GC FAILURE - DEFERRED SCALE-BACK MUST STILL RUN
 // -------------------------------------------------------------------------
 
 func TestRegistryGC_GCFailureStillScalesBack(t *testing.T) {
@@ -100,7 +141,7 @@ func TestRegistryGC_GCFailureStillScalesBack(t *testing.T) {
 		Return(int64(10*1024*1024*1024), nil).Once()
 	env.OnActivity(saga.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 0).Return(nil)
 	env.OnActivity(saga.WaitJobDrained, mock.Anything, expandedCfg.JobName).Return(nil)
-	// GC fails — workflow should error out, BUT compensation still runs.
+	// GC fails - workflow should error out, BUT compensation still runs.
 	env.OnActivity(acts.RunRegistryGarbageCollect, mock.Anything, node, expandedCfg).
 		Return(RegistryGCRunResult{}, errors.New("docker run failed: exit 1"))
 	// Compensation MUST fire:
@@ -119,12 +160,12 @@ func TestRegistryGC_GCFailureStillScalesBack(t *testing.T) {
 		t.Fatal("expected workflow error from GC failure, got nil")
 	}
 	if !scaleBackCalled {
-		t.Fatal("compensation scale-back to 1 was NOT called — registry would be stranded at count=0")
+		t.Fatal("compensation scale-back to 1 was NOT called - registry would be stranded at count=0")
 	}
 }
 
 // -------------------------------------------------------------------------
-// SCALE-DOWN FAILURE — NO COMPENSATION NEEDED
+// SCALE-DOWN FAILURE - NO COMPENSATION NEEDED
 // -------------------------------------------------------------------------
 
 func TestRegistryGC_ScaleDownFailureSkipsCompensation(t *testing.T) {
@@ -146,7 +187,7 @@ func TestRegistryGC_ScaleDownFailureSkipsCompensation(t *testing.T) {
 	scaleBackCalled := false
 	env.OnActivity(saga.ScaleJob, mock.Anything, expandedCfg.JobName, expandedCfg.GroupName, 1).
 		Run(func(args mock.Arguments) { scaleBackCalled = true }).
-		Return(nil).Maybe() // Maybe — assert it does NOT run below.
+		Return(nil).Maybe() // Maybe - assert it does NOT run below.
 
 	env.ExecuteWorkflow(RegistryGC, cfgIn)
 
