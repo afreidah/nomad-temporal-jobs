@@ -76,4 +76,41 @@ func TestNewVaultClient_NoToken(t *testing.T) {
 	if _, err := NewVaultClient(); !errors.Is(err, ErrNoVaultToken) {
 		t.Errorf("error = %v, want ErrNoVaultToken", err)
 	}
+	if _, err := NewVaultWithRefresher(t.Context(), nil); !errors.Is(err, ErrNoVaultToken) {
+		t.Errorf("NewVaultWithRefresher error = %v, want ErrNoVaultToken", err)
+	}
+}
+
+func TestNewVaultClient_CustomMount(t *testing.T) {
+	t.Setenv("VAULT_ADDR", "https://vault.example:8200")
+	t.Setenv("VAULT_CACERT", "")
+	t.Setenv("VAULT_TOKEN", "test-token")
+	t.Setenv("VAULT_KV_MOUNT", "kv")
+
+	vc, err := NewVaultClient()
+	if err != nil {
+		t.Fatalf("NewVaultClient: %v", err)
+	}
+	if vc.mount != "kv" {
+		t.Errorf("mount = %q, want kv", vc.mount)
+	}
+}
+
+func TestNewVaultClient_BadCACert(t *testing.T) {
+	t.Setenv("VAULT_CACERT", filepath.Join(t.TempDir(), "absent.pem"))
+	t.Setenv("VAULT_TOKEN", "test-token")
+
+	if _, err := NewVaultClient(); err == nil {
+		t.Error("expected an error for an unreadable VAULT_CACERT")
+	}
+}
+
+func TestNewVaultClient_BadAddr(t *testing.T) {
+	t.Setenv("VAULT_ADDR", "http://[::1")
+	t.Setenv("VAULT_CACERT", "")
+	t.Setenv("VAULT_TOKEN", "test-token")
+
+	if _, err := NewVaultClient(); err == nil {
+		t.Error("expected an error for an unparseable VAULT_ADDR")
+	}
 }

@@ -119,3 +119,48 @@ func TestIssueWildcardCert_ObtainError(t *testing.T) {
 		t.Error("nothing should be staged when obtain fails")
 	}
 }
+
+func TestIssueWildcardCert_SetupErrors(t *testing.T) {
+	req := IssueRequest{Domains: []string{"*.munchbox.cc"}, Email: "a@b.c"}
+
+	t.Run("load account", func(t *testing.T) {
+		fake := newFakeVault()
+		fake.maybeErr = errors.New("vault down")
+		if err := runIssue(t, issueActs(fake, &fakeIssuer{}), req); err == nil {
+			t.Fatal("expected an error when the account read fails")
+		}
+	})
+	t.Run("new issuer", func(t *testing.T) {
+		a := New(Config{Vault: newFakeVault()})
+		a.newIssuer = func(context.Context, *acmeUser) (certIssuer, error) { return nil, errors.New("bad directory") }
+		if err := runIssue(t, a, req); err == nil {
+			t.Fatal("expected an error when the issuer cannot be built")
+		}
+	})
+	t.Run("save account", func(t *testing.T) {
+		fake := newFakeVault()
+		fake.writeErr = errors.New("vault read-only")
+		if err := runIssue(t, issueActs(fake, &fakeIssuer{}), req); err == nil {
+			t.Fatal("expected an error when the new account cannot be persisted")
+		}
+	})
+}
+
+// A staging write failure on an existing account fails issuance.
+func TestIssueWildcardCert_StagingWriteError(t *testing.T) {
+	fake := newFakeVault()
+	a := issueActs(fake, &fakeIssuer{cert: []byte("C"), key: []byte("K")})
+	key, err := certcrypto.GeneratePrivateKey(certcrypto.EC256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.saveAccount(context.Background(), &acmeUser{email: "a@b.c", key: key}); err != nil {
+		t.Fatal(err)
+	}
+	fake.kv[a.cfg.AccountPath] = fake.writes[a.cfg.AccountPath]
+	fake.writeErr = errors.New("vault read-only")
+
+	if err := runIssue(t, a, IssueRequest{Domains: []string{"*.munchbox.cc"}, Email: "a@b.c"}); err == nil {
+		t.Fatal("expected an error when the staging write fails")
+	}
+}

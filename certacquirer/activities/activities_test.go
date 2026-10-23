@@ -15,8 +15,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/go-acme/lego/v4/acme"
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/registration"
 	"go.temporal.io/sdk/temporal"
@@ -150,6 +152,33 @@ func TestLoadAccount_BadJSON(t *testing.T) {
 	}
 }
 
+func TestLoadAccount_EmptyAccountField(t *testing.T) {
+	for _, data := range []map[string]any{{"account": ""}, {"account": 42}, {}} {
+		fake := newFakeVault()
+		acts := New(Config{Vault: fake})
+		fake.kv[acts.cfg.AccountPath] = data
+
+		user, err := acts.loadAccount(context.Background())
+		if err != nil {
+			t.Fatalf("loadAccount(%v): %v", data, err)
+		}
+		if user != nil {
+			t.Errorf("loadAccount(%v) = %v, want nil for an empty or non-string account", data, user)
+		}
+	}
+}
+
+func TestLoadAccount_BadKey(t *testing.T) {
+	fake := newFakeVault()
+	acts := New(Config{Vault: fake})
+	body, _ := json.Marshal(persistedAccount{Email: "ops@munchbox.cc", KeyPEM: "not-a-pem-key"})
+	fake.kv[acts.cfg.AccountPath] = map[string]any{"account": string(body)}
+
+	if _, err := acts.loadAccount(context.Background()); err == nil {
+		t.Fatal("loadAccount must error on an unparseable account key")
+	}
+}
+
 func TestEnsureUser_NewAccount(t *testing.T) {
 	acts := New(Config{Vault: newFakeVault()})
 
@@ -226,6 +255,21 @@ func TestSaveAccount_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestSaveAccount_EncodeError(t *testing.T) {
+	fake := newFakeVault()
+	acts := New(Config{Vault: fake})
+
+	// An invalid json.RawMessage inside the registration makes json.Marshal fail.
+	key, _ := certcrypto.GeneratePrivateKey(certcrypto.EC256)
+	reg := &registration.Resource{Body: acme.Account{ExternalAccountBinding: json.RawMessage("{")}}
+	if err := acts.saveAccount(context.Background(), &acmeUser{email: "ops@munchbox.cc", key: key, registration: reg}); err == nil {
+		t.Fatal("saveAccount must error when the account cannot be encoded")
+	}
+	if _, ok := fake.writes[acts.cfg.AccountPath]; ok {
+		t.Error("nothing should be written when encoding fails")
+	}
+}
+
 // -------------------------------------------------------------------------
 // PUBLISH
 // -------------------------------------------------------------------------
@@ -264,6 +308,31 @@ func TestPublishWildcardCert_MissingStaging(t *testing.T) {
 	}
 }
 
+func TestPublishWildcardCert_ReadError(t *testing.T) {
+	fake := newFakeVault()
+	fake.readErr = errors.New("vault unreachable")
+	acts := New(Config{Vault: fake})
+
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(acts)
+	if _, err := env.ExecuteActivity(acts.PublishWildcardCert); err == nil {
+		t.Fatal("want error when the staged cert cannot be read")
+	}
+}
+
+func TestPublishWildcardCert_WriteError(t *testing.T) {
+	fake := newFakeVault()
+	fake.writeErr = errors.New("vault read-only")
+	acts := New(Config{Vault: fake})
+	fake.kv[acts.cfg.StagingPath] = map[string]any{"cert": "CERTPEM", "key": "KEYPEM"}
+
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(acts)
+	if _, err := env.ExecuteActivity(acts.PublishWildcardCert); err == nil {
+		t.Fatal("want error when the publish write fails")
+	}
+}
+
 // -------------------------------------------------------------------------
 // CLASSIFICATION
 // -------------------------------------------------------------------------
@@ -290,5 +359,17 @@ func TestIsRateLimit(t *testing.T) {
 	}
 	if isRateLimit(errors.New("connection refused")) {
 		t.Error("connection refused should not classify as rate limit")
+	}
+}
+
+// A typed ACME problem classifies by its type, not its message.
+func TestIsRateLimit_ProblemDetails(t *testing.T) {
+	limited := fmt.Errorf("obtain: %w", &acme.ProblemDetails{Type: "urn:ietf:params:acme:error:rateLimited"})
+	if !isRateLimit(limited) {
+		t.Error("a rateLimited problem should classify as rate limit")
+	}
+	other := &acme.ProblemDetails{Type: "urn:ietf:params:acme:error:malformed", Detail: "too many dots"}
+	if isRateLimit(other) {
+		t.Error("a malformed problem should not classify as rate limit")
 	}
 }

@@ -77,6 +77,32 @@ func TestConfig_Validate_MissingDBPassword(t *testing.T) {
 	}
 }
 
+// New fails on an invalid config, a bad Nomad address, and an unreachable
+// database (port 1 refuses the connection, so the ping fails fast).
+func TestNew_Errors(t *testing.T) {
+	valid := Config{
+		TrivyServerAddr: "http://localhost:4954",
+		DBHost:          "127.0.0.1",
+		DBPort:          "1",
+		DBUser:          "user",
+		DBPassword:      "pass",
+		DBName:          "trivy",
+		DBSSLMode:       "disable",
+	}
+
+	if _, err := New(Config{}); err == nil {
+		t.Error("expected an error for an invalid config")
+	}
+	if _, err := New(valid); err == nil {
+		t.Error("expected an error when the database is unreachable")
+	}
+
+	t.Setenv("NOMAD_ADDR", "http://[::1")
+	if _, err := New(valid); err == nil {
+		t.Error("expected an error for an unparseable NOMAD_ADDR")
+	}
+}
+
 // -------------------------------------------------------------------------
 // NULL STRING HELPER
 // -------------------------------------------------------------------------

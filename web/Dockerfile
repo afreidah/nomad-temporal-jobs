@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.27.2 AS godoc
+FROM --platform=$BUILDPLATFORM golang:1.27.3 AS godoc
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

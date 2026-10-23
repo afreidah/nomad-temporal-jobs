@@ -116,6 +116,63 @@ func TestSonarCloud_BadAuth(t *testing.T) {
 	}
 }
 
+func TestSonarCloud_RejectedCalls(t *testing.T) {
+	ts := sonarStub(t)
+	defer ts.Close()
+	sc := NewSonarCloud(SonarCloudConfig{Token: "wrong", BaseURL: ts.URL})
+
+	if _, err := sc.MintToken(context.Background(), "n", time.Time{}); err == nil {
+		t.Error("MintToken: expected an error when the master token is rejected")
+	}
+	if err := sc.RevokeToken(context.Background(), "n"); err == nil {
+		t.Error("RevokeToken: expected an error when the master token is rejected")
+	}
+}
+
+// fixedBody serves the same 200 body for every request.
+func fixedBody(t *testing.T, body string) *SonarCloud {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(ts.Close)
+	return testSonar(ts)
+}
+
+func TestSonarCloud_MintToken_EmptyToken(t *testing.T) {
+	sc := fixedBody(t, `{}`)
+	if _, err := sc.MintToken(context.Background(), "n", time.Time{}); err == nil || !strings.Contains(err.Error(), "empty token") {
+		t.Errorf("err = %v, want an empty-token error", err)
+	}
+}
+
+func TestSonarCloud_DecodeError(t *testing.T) {
+	sc := fixedBody(t, `not json`)
+	if _, err := sc.ListTokenNames(context.Background()); err == nil || !strings.Contains(err.Error(), "decode") {
+		t.Errorf("err = %v, want a decode error", err)
+	}
+}
+
+func TestSonarCloud_TransportError(t *testing.T) {
+	ts := httptest.NewServer(http.NotFoundHandler())
+	sc := testSonar(ts)
+	ts.Close()
+	if _, err := sc.ListTokenNames(context.Background()); err == nil {
+		t.Error("expected an error when the server is unreachable")
+	}
+}
+
+// A control character in the base URL fails request construction.
+func TestSonarCloud_BadBaseURL(t *testing.T) {
+	sc := NewSonarCloud(SonarCloudConfig{Token: "x", BaseURL: "http://\x7f"})
+	if err := sc.RevokeToken(context.Background(), "n"); err == nil {
+		t.Error("post: expected a request construction error")
+	}
+	if _, err := sc.ListTokenNames(context.Background()); err == nil {
+		t.Error("get: expected a request construction error")
+	}
+}
+
 func TestSonarCloud_DefaultBaseURL(t *testing.T) {
 	sc := NewSonarCloud(SonarCloudConfig{Token: "x"})
 	if sc.base != "https://sonarcloud.io" {

@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,6 +185,7 @@ func (f fakeFileInfo) Sys() any           { return nil }
 type fakeRemoteHost struct {
 	entries    []os.FileInfo
 	readErr    error
+	removeErr  error
 	removed    []string
 	reclaimed  uint64
 	warnings   []string
@@ -203,7 +205,13 @@ type fakeRemoteHost struct {
 
 func (f *fakeRemoteHost) Close() error                          { return nil }
 func (f *fakeRemoteHost) ReadDir(string) ([]os.FileInfo, error) { return f.entries, f.readErr }
-func (f *fakeRemoteHost) RemoveAll(p string) error              { f.removed = append(f.removed, p); return nil }
+func (f *fakeRemoteHost) RemoveAll(p string) error {
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	f.removed = append(f.removed, p)
+	return nil
+}
 func (f *fakeRemoteHost) DockerSystemPrune(context.Context) (uint64, []string, error) {
 	return f.reclaimed, f.warnings, f.pruneErr
 }
@@ -292,5 +300,63 @@ func TestCleanupNodeViaSSH_DryRun(t *testing.T) {
 	}
 	if result.Deleted != 0 || len(host.removed) != 0 {
 		t.Errorf("dry-run must not delete: Deleted=%d removed=%v", result.Deleted, host.removed)
+	}
+}
+
+// Failing to read running jobs, connect, or list the data dir fails the node.
+func TestCleanupNodeViaSSH_Errors(t *testing.T) {
+	cases := []struct {
+		name  string
+		nomad *fakeNomad
+		conn  *fakeConnector
+	}{
+		{"running jobs", &fakeNomad{jobErr: errors.New("nomad down")}, &fakeConnector{host: &fakeRemoteHost{}}},
+		{"connect", &fakeNomad{}, &fakeConnector{err: errors.New("ssh refused")}},
+		{"list data dirs", &fakeNomad{}, &fakeConnector{host: &fakeRemoteHost{readErr: errors.New("sftp down")}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a := New(c.nomad, c.conn)
+			env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+			env.RegisterActivity(a.CleanupNodeViaSSH)
+			if _, err := env.ExecuteActivity(a.CleanupNodeViaSSH, nodes.NodeInfo{Name: "n1"}, CleanupConfig{DataDir: "/data"}); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}
+
+// A young orphan is skipped; a failed delete is recorded, not fatal.
+func TestCleanupNodeViaSSH_GraceAndDeleteError(t *testing.T) {
+	host := &fakeRemoteHost{
+		entries: []os.FileInfo{
+			fakeFileInfo{name: "newjob", mtime: time.Now()},
+			fakeFileInfo{name: "oldjob", mtime: time.Now().AddDate(0, 0, -30)},
+		},
+		removeErr: errors.New("permission denied"),
+	}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", GraceDays: 7})
+	if r.Skipped != 1 || r.Orphaned != 1 || r.Deleted != 0 {
+		t.Errorf("skipped=%d orphaned=%d deleted=%d, want 1/1/0", r.Skipped, r.Orphaned, r.Deleted)
+	}
+	if len(r.Errors) != 1 {
+		t.Errorf("errors = %v, want one delete error", r.Errors)
+	}
+}
+
+// Dry-run skips the Docker prune entirely.
+func TestCleanupNodeViaSSH_DockerPruneDryRun(t *testing.T) {
+	r := runCleanupCfg(t, &fakeRemoteHost{reclaimed: 1024}, CleanupConfig{DataDir: "/data", DryRun: true, DockerPrune: true})
+	if r.DockerSpaceFreed != "0B" {
+		t.Errorf("dry-run DockerSpaceFreed = %q, want 0B", r.DockerSpaceFreed)
+	}
+}
+
+// Containerd prune warnings are carried into the output.
+func TestCleanupNodeViaSSH_ContainerdPruneWarnings(t *testing.T) {
+	host := &fakeRemoteHost{ctrdResult: ssh.ContainerdPruneResult{Deleted: 1, Reclaimed: 10, Warnings: []string{"delete x: in use"}}}
+	r := runCleanupCfg(t, host, CleanupConfig{DataDir: "/data", ContainerdPrune: true})
+	if !strings.Contains(r.Output, "delete x: in use") {
+		t.Errorf("output %q missing the containerd warning", r.Output)
 	}
 }

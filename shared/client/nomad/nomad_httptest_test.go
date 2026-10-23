@@ -14,6 +14,7 @@ package nomad
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -62,6 +63,8 @@ func nomadStub(failPath string) *httptest.Server {
 			_ = enc.Encode([]*api.AllocationListStub{
 				{ID: "a1", NodeID: "n1", ClientStatus: api.AllocClientStatusRunning},
 			})
+		case p == "/v1/job/idle/allocations":
+			_ = enc.Encode([]*api.AllocationListStub{})
 		case r.Method == http.MethodGet && p == "/v1/job/aptly":
 			// Mirrors the real aptly job: prestart alpine sidecar precedes the
 			// aptly workload task, so JobImage must skip the sidecar and resolve
@@ -340,5 +343,84 @@ func TestNomad_RunnerTerminal(t *testing.T) {
 		if err == nil && done != c.wantDone {
 			t.Errorf("%s: done = %v, want %v", c.job, done, c.wantDone)
 		}
+	}
+}
+
+// Each method surfaces a failure of the endpoint it depends on.
+func TestNomad_CallErrors(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name     string
+		failPath string
+		call     func(n *Nomad) error
+	}{
+		{"RunningImages list", "/v1/allocations", func(n *Nomad) error { _, err := n.RunningImages(ctx); return err }},
+		{"RunningJobIDs", "/v1/node/n1/allocations", func(n *Nomad) error { _, err := n.RunningJobIDs(ctx, "n1"); return err }},
+		{"FindJobNode allocs", "/v1/job/web/allocations", func(n *Nomad) error { _, err := n.FindJobNode(ctx, "web"); return err }},
+		{"FindJobNode node info", "/v1/node/n1", func(n *Nomad) error { _, err := n.FindJobNode(ctx, "web"); return err }},
+		{"ScaleJob", "/scale", func(n *Nomad) error { return n.ScaleJob(ctx, "web", "grp", 0, "test") }},
+		{"DispatchJob", "/dispatch", func(n *Nomad) error { _, err := n.DispatchJob(ctx, "ci-runner", nil); return err }},
+		{"StopJob", "/v1/job/ci-runner", func(n *Nomad) error { return n.StopJob(ctx, "ci-runner/dispatch-1-abc") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts := nomadStub(c.failPath)
+			defer ts.Close()
+			if err := c.call(testNomad(t, ts)); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}
+
+func TestNomad_FindJobNode_NoRunningAlloc(t *testing.T) {
+	ts := nomadStub("")
+	defer ts.Close()
+	if _, err := testNomad(t, ts).FindJobNode(context.Background(), "idle"); !errors.Is(err, ErrNoRunningAlloc) {
+		t.Errorf("err = %v, want ErrNoRunningAlloc", err)
+	}
+}
+
+// Per-item info failures are skipped, not surfaced.
+func TestNomad_InfoErrorsSkipped(t *testing.T) {
+	ts := nomadStub("/v1/allocation/a1")
+	defer ts.Close()
+	imgs, err := testNomad(t, ts).RunningImages(context.Background())
+	if err != nil || len(imgs) != 0 {
+		t.Errorf("RunningImages = (%v, %v), want (empty, nil)", imgs, err)
+	}
+
+	ts2 := nomadStub("/v1/node/n1")
+	defer ts2.Close()
+	nodes, err := testNomad(t, ts2).ClientNodes(context.Background())
+	if err != nil || len(nodes) != 0 {
+		t.Errorf("ClientNodes = (%v, %v), want (empty, nil)", nodes, err)
+	}
+}
+
+func TestNomad_WaitAllocCount_ZeroTarget(t *testing.T) {
+	ts := nomadStub("")
+	defer ts.Close()
+	if err := testNomad(t, ts).WaitAllocCount(context.Background(), "idle", 0, time.Millisecond, nil); err != nil {
+		t.Fatalf("WaitAllocCount: %v", err)
+	}
+}
+
+// List errors are retried until the context ends.
+func TestNomad_WaitAllocCount_ContextEnds(t *testing.T) {
+	ts := nomadStub("/v1/job/web/allocations")
+	defer ts.Close()
+	n := testNomad(t, ts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := n.WaitAllocCount(ctx, "web", 1, time.Millisecond, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v, want DeadlineExceeded", err)
+	}
+
+	done, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if err := n.WaitAllocCount(done, "web", 1, time.Millisecond, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want Canceled", err)
 	}
 }
