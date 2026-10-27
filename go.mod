@@ -14,7 +14,7 @@ require (
 	github.com/containerd/containerd/v2 v2.3.6
 	github.com/go-acme/lego/v4 v4.35.2
 	github.com/google/go-github/v88 v88.0.0
-	github.com/hashicorp/consul/api v1.34.5
+	github.com/hashicorp/consul/api v1.35.0
 	github.com/hashicorp/nomad/api v0.0.0-20260316193234-fe53ba32ff2b
 	github.com/hashicorp/vault/api v1.23.0
 	github.com/lib/pq v1.12.3
