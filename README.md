@@ -13,7 +13,21 @@
   <strong><a href="https://nomad-temporal-jobs.munchbox.cc">Project Website</a></strong>
 </p>
 
-The recurring work a Nomad, Consul and Vault cluster needs — Raft snapshots, image scanning, storage reclamation, certificate and token renewal — written as Temporal workflows. Workers reach the cluster through native Go clients and never a remote shell, so a run that fails part-way resumes where it stopped, and one that takes a service offline to do its work always brings it back. **Seven worker binaries host ten scheduled jobs.** Six workers map to one job each — backup, vulnerability scanning, certificate acquisition, GitHub token renewal, on-demand CI runner scaling, and media-library import — while the **cleanup worker** hosts four maintenance workflows on a shared task queue: orphaned-data node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM` maintenance. Each worker is an independent container image with its own Nomad service job; the cert-acquirer worker issues the `*.munchbox.cc` wildcard via ACME. Newer workers authenticate to Vault with their Nomad Workload Identity and pull every other credential through a shared client, so no static service tokens are templated into the job. Workflows fire on cron from Temporal Schedules, managed as code in the `infrastructure/terragrunt` repo.
+Temporal workflows that run a Nomad, Consul and Vault cluster: **on-demand CI runners**, Raft snapshots, image scanning, storage reclamation, and certificate and token renewal. Every job is a durable workflow. A run that fails part-way resumes where it stopped, and a job that takes a service offline always brings it back. Workers reach the cluster through native Go clients rather than a remote shell.
+
+The main component is the **CI runner scaler**. It turns Nomad parameterized batch jobs into self-hosted GitHub Actions and Forgejo Actions runners that exist only while a job is queued. There is no idle runner fleet: the scaler watches the forge's queue, dispatches one ephemeral Nomad batch job per missing runner, and reaps it when the CI job finishes. See [On-Demand CI Runners](#on-demand-ci-runners).
+
+### Highlights
+
+- **Scale-to-zero CI runners on Nomad.** Queued `self-hosted` jobs on GitHub or Forgejo become ephemeral runners dispatched as Nomad batch jobs. Label-based profiles route each job to its own runner pool (VM, Go toolchain, default), and `maxConcurrent` caps each pool. Registration tokens are minted inside activities, so they never land in workflow history.
+- **Backups** of Nomad Raft, Consul Raft (which holds Vault's data) and every PostgreSQL database, uploaded to S3 with tag-based lifecycle.
+- **Trivy scanning** of every image running in Nomad, with CVE results stored in PostgreSQL.
+- **Maintenance sagas** that scale a service to 0, do the offline work (registry GC, `aptly db cleanup`), and always scale it back, even on failure or cancellation.
+- **Node cleanup** of orphaned allocation directories, Docker and containerd image stores, stale rootfs entries and buildx volumes, all through SFTP and tunneled Docker/containerd APIs.
+- **Secrets without static tokens.** Workers log in to Vault with Nomad Workload Identity. The cert acquirer issues the wildcard certificate over ACME DNS-01, and the token renewer keeps repository CI secrets fresh using a GitHub App.
+- **Fully traced.** OpenTelemetry spans carry `peer.service` for every external call, the Temporal SDK exposes Prometheus metrics, and logs are JSON `slog`.
+
+**Seven worker binaries host ten scheduled jobs.** Six workers map to one job each: CI runner scaling, backup, vulnerability scanning, certificate acquisition, GitHub token renewal, and media-library import. The **cleanup worker** hosts four maintenance workflows on a shared task queue: node cleanup, registry GC, aptly cleanup, and PostgreSQL `VACUUM`. Each worker is its own container image with its own Nomad service job. Temporal Schedules fire the workflows on cron; the schedules are managed as code in the `infrastructure/terragrunt` repo.
 
 ```
   Temporal Schedules            Temporal Server
@@ -21,6 +35,10 @@ The recurring work a Nomad, Consul and Vault cluster needs — Raft snapshots, i
          |                               |
          | start workflow on cron        | Task Queue dispatch
          v                               v
+                            +------------------------+
+                            | ci-runner-scaler       |  <-- on-demand CI runners
+                            | ci-runner-scaler-      |      (Nomad batch dispatch)
+                            |  task-queue            |
                             +------------------------+
                             | backup-worker          |
                             | backup-task-queue      |
@@ -40,27 +58,25 @@ The recurring work a Nomad, Consul and Vault cluster needs — Raft snapshots, i
                             | (github-token-renewer- |
                             |  task-queue)           |
                             +------------------------+
-                            | ci-runner-scaler       |
-                            | ci-runner-scaler-      |
-                            |  task-queue            |
-                            +------------------------+
                             | media-import-worker    |
                             | media-import-task-queue|
                             +------------------------+
                                         |
                                         v
-                              Nomad, Consul, S3,
+                              Nomad, Consul, Vault,
+                              GitHub, Forgejo, S3,
                               PostgreSQL, Trivy,
                               SSH (client nodes),
-                              Vault, ACME, Cloudflare,
-                              GitHub, Deluge, Sonarr,
-                              Radarr, Jellyfin
+                              ACME, Cloudflare,
+                              Deluge, Sonarr, Radarr,
+                              Jellyfin
 ```
 
 Each worker is a long-running Temporal worker process that polls its dedicated task queue. Workflows are pure orchestration; all I/O happens in activities. Activities are registered as struct methods, sharing pooled connections (DB, S3) across invocations.
 
 ## Table of Contents
 
+- [On-Demand CI Runners](#on-demand-ci-runners)
 - [Workflow Domains](#workflow-domains)
 - [Maintenance Sagas](#maintenance-sagas)
 - [Shared Infrastructure](#shared-infrastructure)
@@ -71,6 +87,59 @@ Each worker is a long-running Temporal worker process that polls its dedicated t
 - [Development](#development)
 - [Deployment](#deployment)
 - [Project Structure](#project-structure)
+
+## On-Demand CI Runners
+
+The `ci-runner-scaler` worker gives GitHub and Forgejo repositories self-hosted runners **only while there is work**. Each runner is a Nomad *parameterized batch job*. The scaler dispatches one instance per queued CI job, the runner registers as ephemeral, takes exactly one job, and exits. When the queue is empty, nothing runs and no capacity sits reserved.
+
+```mermaid
+flowchart LR
+  S[Temporal Schedule<br/>every ~30s] --> P[PollAndDispatch]
+  P -->|runners/config| C[(Consul KV)]
+  P -->|queued self-hosted jobs| F[GitHub / Forgejo]
+  P -->|pending + running dispatches| N[(Nomad allocs)]
+  P -->|one child per missing runner| H[HandleRunner]
+  H -->|mint registration token| F
+  H -->|Jobs.Dispatch meta| D[Nomad batch job<br/>ci-runner / profile job]
+  D -->|ephemeral runner<br/>one job, then exits| F
+  H -->|wait terminal or backstop, then purge| D
+```
+
+### How a tick works
+
+`PollAndDispatch` runs on a short Temporal Schedule (calendar `second=0,30`):
+
+1. **Load config.** It reads the per-repo provisioning map from Consul KV (`runners/config`). Repos are sorted so the workflow replays deterministically.
+2. **Find demand.** For each repo it lists queued jobs whose `runs-on` includes `self-hosted`, at most `concurrency` repos at a time. GitHub has no "list queued jobs" endpoint, so the scaler walks the queued and in-progress workflow runs and collects their queued jobs. Forgejo lists runner jobs directly and counts only jobs that are `waiting` and not yet claimed. If one repo's poll fails, that repo is skipped for the tick and the rest still run.
+3. **Find supply.** It counts the runner dispatches that are pending or running in Nomad across the default job and every profile job, reading each one's `repo_url` and `labels` dispatch meta. If this count fails, the whole tick fails, because dispatching without a count would over-provision.
+4. **Reconcile by depth.** Queued jobs and active runners are both bucketed by `(repo, sorted labels)`. For each bucket the scaler starts `queued − active` `HandleRunner` children, capped by `maxConcurrent`; overflow stays queued on the forge until a slot frees. An ephemeral repo-scoped runner isn't bound to a particular job, since the forge hands any label-matching runner whichever job is next. That makes depth reconciliation idempotent without per-job dedupe or an external state store: a bucket left short is topped up on the next tick.
+
+`HandleRunner` owns one runner's lifecycle:
+
+- **Dispatch.** It mints a registration token inside the activity, so the token never enters Temporal history. It then calls Nomad `Jobs.Dispatch` with meta `repo_url`, `labels`, `runner_token` (or `runner_secret`, a Vault path, in `vault` mode) and an optional `runner_image`. Dispatch runs with no retry and a 2-minute timeout.
+- **Wait.** It polls the dispatched job every 5s and heartbeats, until the job is terminal or the `reap_after` backstop expires (default 1h).
+- **Reap.** On finish, timeout or cancellation alike, it purges the dispatched job on a disconnected context. A runner that never picked up its job is therefore never left holding a slot.
+
+### Modes
+
+Each repo picks a `mode`, which decides how the scaler polls and who mints the registration token:
+
+| Mode | Polls with | Registration token | Use for |
+|------|-----------|--------------------|---------|
+| `app` (default) | The shared GitHub App, using an installation token scoped to the repo | Minted by the scaler at dispatch time | Repos where the App is installed |
+| `vault` | A PAT from Vault at `vaultPath` (needs only Actions:read) | Nothing is minted. The runner job reads `registerVaultPath` (repo admin) and registers itself | Repos you collaborate on but don't own, keeping the poll credential separate from the admin one |
+| `forgejo` | A Forgejo API token from Vault at `vaultPath`, against `forgejoUrl` | Minted per repo by the scaler at dispatch time | Self-hosted Forgejo repos, polled in the same loop as GitHub |
+
+Stored tokens are re-read on every call, so a rotated secret takes effect without restarting the worker.
+
+### Profiles
+
+Ordered **profiles** map a distinguishing `runs-on` label to a parameterized Nomad job, with an optional image override. The first matching label wins. A repo can send `vm` jobs to a VM-capable pool and `go` jobs to a pool with a warm toolchain, while a bare `[self-hosted]` job falls back to the default `ci-runner`. Each profile, or the repo as a whole, can set `maxConcurrent` to cap that pool. See [Runner Scaler Worker](#runner-scaler-worker) for the config format.
+
+**Task queue:** `ci-runner-scaler-task-queue`
+**Workflows:** `PollAndDispatch`, `HandleRunner`
+**Image:** `ci-runner-scaler`
+**Dependencies:** Vault (Workload Identity; the App key for `app` repos, stored tokens for `vault`/`forgejo` repos), Consul KV (`runners/config`), GitHub and/or Forgejo API, Nomad (parameterized-job dispatch, allocation listing, purge)
 
 ## Workflow Domains
 
@@ -146,19 +215,6 @@ Keeps each managed repository's CI/release token secret continuously valid so it
 **Image:** `github-token-renewer`
 **Dependencies:** Vault (Workload Identity, holds the App key), Consul KV (repo list), GitHub API
 
-### Runner Scaler
-
-Scales self-hosted CI runners on demand (zero idle) instead of running them always-on. On a short schedule, the `PollAndDispatch` workflow reads a per-repo provisioning config from Consul KV (`runners/config`) and, for each repo, lists the queued Actions jobs whose `runs-on` includes `self-hosted`. Rather than one child per job, it **reconciles by depth**: it buckets the queued jobs by `(repo, labels)`, counts the ephemeral runners already pending/running for each bucket, and starts `HandleRunner` children only for the shortfall. Ephemeral repo-scoped runners aren't bound to a specific job — GitHub hands any label-matching runner whichever job is queued — so a bucket left short is simply topped back up on the next tick; there is no per-job dedup or external state store.
-
-Each repo picks a **mode**. `app` repos are polled through the shared GitHub App, and the child mints a runner registration token inside the dispatch activity (so it never enters workflow history). `vault` repos are polled with a PAT read from the secret store and dispatch a self-registering runner job that mints nothing — the poll token (`vaultPath`, needs only Actions:read) is split from the registration token (`registerVaultPath`, needs repo admin), so a write-only collaborator can poll a repo it doesn't own while a higher-privilege PAT registers. `forgejo` repos are polled against a Forgejo instance with an API token from the secret store (`vaultPath`) and behave like `app` repos from there on: Forgejo mints a registration token per repository on demand, so the dispatch mints one too and the runner receives a credential spent once. Every runner is ephemeral (one job, then it self-deregisters); a backstop timer reaps one that never picked its job up.
-
-Ordered **profiles** map a distinguishing `runs-on` label to the parameterized Nomad job (and optional image) dispatched for it — first matching label wins — so a repo routes e.g. `vm`/`go` jobs to different runner pools, and a bare `[self-hosted]` job falls back to the default `ci-runner`. Each profile, or the repo as a whole, can set `maxConcurrent` to cap that pool's concurrent runners; overflow stays queued on GitHub until a slot frees.
-
-**Task queue:** `ci-runner-scaler-task-queue`
-**Workflows:** `PollAndDispatch`, `HandleRunner`
-**Image:** `ci-runner-scaler`
-**Dependencies:** Vault (Workload Identity — the App key for `app` repos, per-repo PATs for `vault` repos), Consul KV (`runners/config`), GitHub API, Nomad (job dispatch)
-
 ### Media Import
 
 Reconciles torrents grabbed in Deluge *outside* of Sonarr/Radarr into the media library so Jellyfin can see them. Downloads that Sonarr/Radarr never initiated have no queue entry, so Completed Download Handling ignores them — they sit in the download folder forever, invisible to Jellyfin. The `Reconcile` workflow lists the torrents Deluge reports as 100% complete (in-progress ones are skipped so partial files are never linked), then offers each folder to Sonarr (TV) and, on no series match, Radarr (movies) through their manual-import API with `importMode=Copy` — hardlinking the genuinely-missing episodes/movie into the library while the torrent keeps seeding. It imports only what's actually missing: duplicates and quality-downgrades ("not an upgrade") are skipped, and the multi-season-pack guard ("episode unexpected") is overridden with explicit episode mappings. A single Jellyfin scan fires when anything imported; folders with no series/movie match or unmappable release names are logged for a human. The worker authenticates to Vault with its Nomad Workload Identity and pulls the Sonarr/Radarr/Deluge/Jellyfin credentials through it; no static secrets are templated into the job.
@@ -196,24 +252,23 @@ Once the scale-down to 0 succeeds, a **compensation** is registered with `defer`
 
 The `shared/` package provides common functionality used by all workers:
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `runtime.go` | `RunWorker` — the common worker bootstrap (tracing, logging, metrics, Temporal client + interceptor, workflow/activity registration, run-until-interrupt). Each worker `main.go` is ~15 lines. |
+| `runtime.go` | `RunWorker`, the common worker bootstrap: tracing, logging, metrics, Temporal client and interceptor, namespace selection, workflow/activity registration, run-until-interrupt. Each worker's `main.go` is about 15 lines. |
 | `telemetry.go` | OpenTelemetry tracer init, span helpers, `peer.service` attributes |
 | `logging.go` | JSON slog logger wrapped for Temporal SDK compatibility |
 | `metrics.go` | Prometheus metrics handler for Temporal SDK metrics (Tally bridge) |
 | `temporal.go` | Shared retry-policy and activity-option presets (`StandardRetry`, `NoRetry`, `QuickActivityOptions`, `LongActivityOptions`) |
-| `heartbeat.go` | `WithHeartbeat` — run a function while emitting activity heartbeats |
-| `nomad.go` | OTel-instrumented Nomad client + `Nomad` service (running images, client nodes, running job IDs, find-job-node, idempotent scaling, alloc-count waits) |
-| `postgres.go` | OTel-instrumented PostgreSQL connection factory + `Postgres` maintenance service (list databases, VACUUM ANALYZE) |
-| `s3store.go` | `S3Store` — multipart upload, listing, and retention / quota-eviction over an S3-compatible API |
-| `vault.go` | Self-authenticating Vault client (Workload Identity + KV) |
-| `consul.go` | OTel-instrumented Consul client + `Consul` service (Raft snapshots), token sourced from Vault |
-| `ssh.go` | Certificate-authenticated SSH client with SFTP file operations (`ReadDir`/`RemoveAll`/`DirSize`) — no remote shell |
-| `docker.go` | Remote Docker daemon driven through the Docker API, tunneled over the SSH connection to `/var/run/docker.sock` (one-shot containers + prune) |
-| `containerd.go` | Remote containerd driven through its gRPC API, tunneled over the SSH connection to `/run/containerd/containerd.sock` (store-aware `moby` image-store reclamation) |
-| `rootfs.go` | SFTP sweep of orphaned `/var/lib/docker/rootfs/overlayfs` entries, guarded by the host mount table (`/proc/self/mountinfo`) so live rootfs is never removed |
-| `buildx.go` | Dangling buildx builder-state volume removal through the tunneled Docker volume API |
+| `heartbeat.go` | `WithHeartbeat`: runs a function while emitting activity heartbeats |
+| `client/nomad/` | OTel-instrumented Nomad client and service: running images, client nodes, find-job-node, idempotent scaling, alloc waits, parameterized dispatch, active runner slots |
+| `client/git/` | GitHub clients: App installation tokens, queued-job lister and registration-token minter, PAT-backed lister, repo list, Vault-backed construction |
+| `client/forgejo/` | Forgejo Actions client: queued runner jobs and per-repo registration tokens |
+| `client/vault/` | Self-authenticating Vault client (Workload Identity + KV) |
+| `client/consul/` | OTel-instrumented Consul client (Raft snapshots, KV), with its token sourced from Vault |
+| `client/postgres/` | OTel-instrumented PostgreSQL connection factory and maintenance service (list databases, VACUUM ANALYZE) |
+| `client/s3store/` | `S3Store`: multipart upload, listing, and retention / quota eviction over an S3-compatible API |
+| `client/sonarcloud/` | SonarCloud API client |
+| `client/ssh/` | Certificate-authenticated SSH client that re-reads its short-lived cert on every connection. Provides SFTP file operations and tunnels the Docker and containerd APIs over the SSH connection (one-shot containers, prune, store-aware `moby` reclaim), plus the mount-guarded rootfs sweep and buildx volume removal. No remote shell. |
 
 Reusable clients (`Nomad`, `Postgres`, `Consul`, `S3Store`, `VaultClient`) are concrete `shared` services; each worker declares its own **narrow consumer interface** over the subset it calls (e.g. `nomadImages`, `pgMaintainer`, `s3Store`), satisfied structurally. Workers depend on small, testable surfaces and the shared client can grow without bloating existing consumers.
 
@@ -291,6 +346,7 @@ All configuration is via environment variables, injected by Nomad job templates 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TEMPORAL_ADDRESS` | `localhost:7233` | Temporal server endpoint |
+| `TEMPORAL_NAMESPACE` | `default` | Temporal namespace the worker polls |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `tempo.service.consul:4317` | OTLP gRPC endpoint |
 | `METRICS_LISTEN` | `:9090` | Prometheus metrics listen address |
 
@@ -357,14 +413,17 @@ The cert worker carries no static service tokens: it reads its Vault token from 
 
 ### Runner Scaler Worker
 
-Authenticates to Vault with its Workload Identity and pulls credentials through it — the GitHub App key for `app`-mode repos, and the per-repo PATs for `vault`-mode repos; Consul uses the local agent token and Nomad uses `NOMAD_TOKEN`.
+Authenticates to Vault with its Workload Identity and pulls credentials through it — the GitHub App key for `app`-mode repos, the per-repo PATs for `vault`-mode repos, and the API tokens for `forgejo`-mode repos; Consul uses the local agent token and Nomad uses `NOMAD_TOKEN`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GITHUB_APP_VAULT_PATH` | `github/token-renewer-app` | Vault KV path holding the App `app_id`, `installation_id`, `private_key` (used by `app`-mode repos) |
 | `RUNNERS_CONFIG_KEY` | `runners/config` | Consul KV key with the per-repo provisioning config (JSON; see below) |
 | `RUNNER_JOB_ID` | `ci-runner` | Default parameterized Nomad job dispatched when no profile matches |
-| `NOMAD_TOKEN` | -- | Nomad API token (dispatch/stop the runner job) |
+| `NOMAD_ADDR` | Nomad SDK default | Nomad API endpoint |
+| `NOMAD_TOKEN` | -- | Nomad API token (dispatch, read allocations, purge the runner jobs) |
+| `NOMAD_CACERT` | -- | CA cert path for Nomad TLS |
+| `VAULT_ADDR` / `VAULT_TOKEN_FILE` / `VAULT_KV_MOUNT` | see Cert Acquirer | Vault login via Workload Identity |
 
 The config at `RUNNERS_CONFIG_KEY` is a JSON object keyed by `owner/repo`:
 
@@ -455,6 +514,12 @@ make push-backup
 make push-trivy
 make push-cleanup
 make push-cert
+make push-ghtokens
+make push-runnerscaler
+make push-mediaimport
+
+# Build and push everything in parallel
+make push-all-parallel
 ```
 
 Each domain also has its own `Makefile` in its subdirectory for independent builds:
@@ -464,22 +529,31 @@ cd backup && make help
 cd trivyscan && make help
 cd maintenance && make help
 cd certacquirer && make help
+cd ghtokenrenewer && make help
+cd runnerscaler && make help
+cd mediaimport && make help
 ```
 
 ### Image builds
 
-All four worker images build from a single root `Dockerfile` with one shared builder stage and one runtime *profile* per worker. Each domain `Makefile` picks its profile via `RUNTIME_TARGET`, so the build half is written once:
+All seven worker images build from a single root `Dockerfile` with one shared builder stage and one runtime *profile* per worker. Each domain `Makefile` picks its profile via `RUNTIME_TARGET`, so the build half is written once:
 
 | Profile (`--target`) | Base | Worker | Runtime user |
 |----------------------|------|--------|--------------|
-| `runtime-distroless-nonroot` | distroless static | cert-acquirer | non-root |
+| `runtime-distroless-nonroot` | distroless static | ci-runner-scaler, cert-acquirer, github-token-renewer, media-import | non-root |
 | `runtime-distroless-root` | distroless static | cleanup | root (reads root-owned SSH key) |
 | `runtime-backup` | Debian slim | backup | root (bundles the PostgreSQL 18 client; `pg_dump`/`pg_dumpall` have no Go-native equivalent) |
 | `runtime-trivy` | Alpine | trivy-scan | non-root (Trivy CLI, downloaded and SHA256-verified) |
 
-The builder cross-compiles with `CGO_ENABLED=0` (`$BUILDPLATFORM` → `$TARGETARCH`), so the Go toolchain never emulates. Images are built **multi-arch (`linux/amd64` + `linux/arm64`)** since the Nomad clients are a mix of both (e.g. the cleanup-worker is pinned to an arm64 node). For the pure-Go distroless profiles (cleanup, cert) the arm64 leg is free — just the cross-compiled binary in a multi-arch base. The backup (`apt`) and trivy (`apk`) profiles have `RUN` steps in their runtime stage, so their arm64 leg emulates under QEMU; the build host needs binfmt registered (`docker run --privileged --rm tonistiigi/binfmt --install arm64`). BuildKit cache mounts persist the module and build caches across builds and across workers, so the standard library and shared dependencies compile once for the whole fleet.
+The builder cross-compiles with `CGO_ENABLED=0` (`$BUILDPLATFORM` → `$TARGETARCH`), so the Go toolchain never emulates. Images are built **multi-arch (`linux/amd64` + `linux/arm64`)** since the Nomad clients are a mix of both (e.g. the cleanup-worker is pinned to an arm64 node). For the pure-Go distroless profiles the arm64 leg is free — just the cross-compiled binary in a multi-arch base. The backup (`apt`) and trivy (`apk`) profiles have `RUN` steps in their runtime stage, so their arm64 leg emulates under QEMU; the build host needs binfmt registered (`docker run --privileged --rm tonistiigi/binfmt --install arm64`). BuildKit cache mounts persist the module and build caches across builds and across workers, so the standard library and shared dependencies compile once for the whole fleet.
 
 Adding a pure-Go worker needs **no Dockerfile** — its `Makefile` just sets `IMAGE`, `PKG`, and `RUNTIME_TARGET := runtime-distroless-nonroot`.
+
+### CI/CD
+
+- **GitHub Actions** (`.github/workflows/ci.yml`) runs on every PR and on pushes to main: golangci-lint, `go test -race` with coverage, `go vet`, govulncheck, and SonarCloud analysis. Dependabot keeps Go modules and Actions current.
+- **Release** (`.github/workflows/release.yml`) runs on `v*` tags. It lints and tests, publishes the GitHub Release with goreleaser, and opens a CHANGELOG PR with git-cliff.
+- **Image builds** (`.forgejo/workflows/images.yml`) run on the Forgejo mirror on merge to main, on the self-hosted `build` runner. They run `make push-all`, which pushes every worker image and the website to `registry.munchbox.cc`.
 
 ### Versioning
 
@@ -563,7 +637,10 @@ temporal workflow start --task-queue media-import-task-queue --type Reconcile \
 ```
 nomad-temporal-jobs/
   .github/workflows/
-    ci.yml                           CI: lint, test, vet, govulncheck
+    ci.yml                           CI: lint, test, vet, govulncheck, SonarCloud
+    release.yml                      Tag-triggered release (goreleaser + git-cliff)
+  .forgejo/workflows/
+    images.yml                       Build + push all images on merge to main
   .gitignore                         Ignores coverage output and dist artifacts
   .golangci.yml                      Linter configuration (gocritic, misspell)
   LICENSE                            MIT
@@ -580,17 +657,16 @@ nomad-temporal-jobs/
     metrics.go                       Prometheus metrics handler via Tally bridge
     temporal.go                      Shared retry-policy + activity-option presets
     heartbeat.go                     WithHeartbeat: run a func while emitting activity heartbeats
-    nomad.go                         OTel-instrumented Nomad client + Nomad service (images, nodes, scaling, alloc waits)
-    postgres.go                      OTel-instrumented PostgreSQL factory + Postgres maintenance service (list, vacuum)
-    s3store.go                       S3Store: multipart upload, listing, retention/quota eviction
-    vault.go                         Self-authenticating Vault client (Workload Identity + KV)
-    consul.go                        OTel-instrumented Consul client + Consul service (Raft snapshots)
-    ssh.go                           Cert-auth SSH client with SFTP file ops (no remote shell)
-    docker.go                        Docker API over an SSH socket tunnel (one-shot runs + prune)
-    containerd.go                    containerd gRPC API over an SSH socket tunnel (store-aware moby-store reclaim)
-    rootfs.go                        SFTP sweep of orphaned /var/lib/docker/rootfs (mount-table guarded)
-    buildx.go                        Dangling buildx builder-state volume removal (Docker volume API)
-    client/git/                      GitHub clients: App lister + registration-token minter (runners.go) and a PAT-backed lister for repos the App can't reach (pat.go)
+    client/
+      nomad/                         Nomad client + service (images, nodes, scaling, alloc waits, dispatch, runner slots)
+      git/                           GitHub App/PAT clients: queued jobs, registration tokens, repo list
+      forgejo/                       Forgejo Actions client: queued jobs, registration tokens
+      vault/                         Self-authenticating Vault client (Workload Identity + KV)
+      consul/                        Consul client (Raft snapshots, KV)
+      postgres/                      PostgreSQL factory + maintenance service (list, vacuum)
+      s3store/                       S3Store: multipart upload, listing, retention/quota eviction
+      sonarcloud/                    SonarCloud API client
+      ssh/                           Cert-auth SSH + SFTP, Docker/containerd over SSH tunnels, rootfs + buildx reclaim
   backup/
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-backup), includes ../_common.mk
     activities/
@@ -629,7 +705,7 @@ nomad-temporal-jobs/
       cert_acquirer.go               Issue-then-publish orchestration with split retry policies
     worker/
       main.go                       Worker entry point (builds the shared Vault client)
-  runnerscaler/                      ci-runner-scaler: on-demand ephemeral CI runners
+  runnerscaler/                      ci-runner-scaler: on-demand ephemeral CI runners as Nomad batch dispatches
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-nonroot), includes ../_common.mk
     activities/
       activities.go                  Activity struct: read per-repo config, list queued jobs, count active + dispatch/reap runners
@@ -637,7 +713,7 @@ nomad-temporal-jobs/
       poll_dispatch.go               PollAndDispatch parent: scan repos, reconcile runner count per (repo, labels) bucket
       handle_job.go                  HandleRunner child: dispatch one ephemeral runner + backstop reap timer
     worker/
-      main.go                        Worker entry point (Vault App client, per-repo PAT listers, Consul, Nomad)
+      main.go                        Worker entry point (Vault App client, per-repo PAT/Forgejo clients, Consul, Nomad)
   mediaimport/                       media-import-worker: reconcile manual downloads into the library
     Makefile                         Sets IMAGE/PKG/RUNTIME_TARGET (runtime-distroless-nonroot), includes ../_common.mk
     activities/
