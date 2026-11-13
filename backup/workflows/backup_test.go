@@ -11,6 +11,7 @@
 package workflows
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -18,6 +19,22 @@ import (
 
 	"munchbox/temporal-workers/backup/activities"
 )
+
+// captureUploads records every UploadToS3 request. Mocked activities run on
+// their own goroutines and the workflow uploads concurrently, so the append
+// must be locked.
+func captureUploads(env *testsuite.TestWorkflowEnvironment) *[]activities.UploadRequest {
+	var mu sync.Mutex
+	var uploads []activities.UploadRequest
+	env.OnActivity(a.UploadToS3, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			mu.Lock()
+			defer mu.Unlock()
+			uploads = append(uploads, args.Get(1).(activities.UploadRequest))
+		}).
+		Return("s3key", nil)
+	return &uploads
+}
 
 // mockAllSuccess wires every backup activity to succeed. Individual tests
 // override specific activities to exercise failure paths.
@@ -148,14 +165,7 @@ func TestBackup_UploadTags(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	// The test environment runs workflow goroutines on a single thread, so
-	// collecting the requests without a lock is safe.
-	var uploads []activities.UploadRequest
-	env.OnActivity(a.UploadToS3, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) {
-			uploads = append(uploads, args.Get(1).(activities.UploadRequest))
-		}).
-		Return("s3key", nil)
+	uploads := captureUploads(env)
 	mockAllSuccess(env, []string{"app"})
 
 	env.ExecuteWorkflow(Backup, activities.BackupConfig{DumpConcurrency: 2})
@@ -165,12 +175,12 @@ func TestBackup_UploadTags(t *testing.T) {
 	}
 
 	// nomad, consul, postgres globals, and the one database.
-	if len(uploads) != 4 {
-		t.Fatalf("uploads = %d, want 4: %+v", len(uploads), uploads)
+	if len(*uploads) != 4 {
+		t.Fatalf("uploads = %d, want 4: %+v", len(*uploads), *uploads)
 	}
 
-	byPrefix := make(map[string]activities.UploadRequest, len(uploads))
-	for _, u := range uploads {
+	byPrefix := make(map[string]activities.UploadRequest, len(*uploads))
+	for _, u := range *uploads {
 		byPrefix[u.KeyPrefix] = u
 	}
 
@@ -205,12 +215,7 @@ func TestBackup_UploadTags_SanitizesDatabaseTag(t *testing.T) {
 	suite := &testsuite.WorkflowTestSuite{}
 	env := suite.NewTestWorkflowEnvironment()
 
-	var uploads []activities.UploadRequest
-	env.OnActivity(a.UploadToS3, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) {
-			uploads = append(uploads, args.Get(1).(activities.UploadRequest))
-		}).
-		Return("s3key", nil)
+	uploads := captureUploads(env)
 	mockAllSuccess(env, []string{"weird name!"})
 
 	env.ExecuteWorkflow(Backup, activities.BackupConfig{DumpConcurrency: 2})
@@ -221,7 +226,7 @@ func TestBackup_UploadTags_SanitizesDatabaseTag(t *testing.T) {
 
 	const safe = "weird_name_"
 	found := false
-	for _, u := range uploads {
+	for _, u := range *uploads {
 		if u.Tags[tagDatabase] == "" {
 			continue
 		}
