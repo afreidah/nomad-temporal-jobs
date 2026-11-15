@@ -52,11 +52,15 @@ ENTRYPOINT ["worker"]
 
 # ---- profile: backup (PostgreSQL 18 client; pg_dump/pg_dumpall have no Go-native
 #      equivalent). Debian for access to the official pgdg apt repo. curl/gnupg
-#      are pulled only to add the repo and purged in the same layer. ----
+#      are pulled only to add the repo and purged in the same layer. The key is
+#      fetched to a file because curl can only retry a dropped transfer into a
+#      file, not a pipe. ----
 FROM debian:bookworm-slim AS runtime-backup
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
-    && curl -fsSL --proto '=https' --proto-redir '=https' https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
+    && curl -fsSL --retry 5 --retry-all-errors --proto '=https' --proto-redir '=https' -o /tmp/pgdg.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg /tmp/pgdg.asc \
+    && rm /tmp/pgdg.asc \
     && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client-18 \
@@ -81,8 +85,8 @@ RUN set -eux; \
     f="trivy_${TRIVY_VERSION}_Linux-${ta}.tar.gz"; \
     base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"; \
     cd /tmp; \
-    curl -fsSL --proto '=https' --proto-redir '=https' "$base/$f" -o "$f"; \
-    curl -fsSL --proto '=https' --proto-redir '=https' "$base/trivy_${TRIVY_VERSION}_checksums.txt" -o sums.txt; \
+    curl -fsSL --retry 5 --retry-all-errors --proto '=https' --proto-redir '=https' "$base/$f" -o "$f"; \
+    curl -fsSL --retry 5 --retry-all-errors --proto '=https' --proto-redir '=https' "$base/trivy_${TRIVY_VERSION}_checksums.txt" -o sums.txt; \
     grep "Linux-${ta}.tar.gz\$" sums.txt | sha256sum -c -; \
     tar -xzf "$f" -C /usr/local/bin trivy
 
