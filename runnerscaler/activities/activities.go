@@ -503,9 +503,9 @@ func splitLabels(s string) []string {
 // so the caller can reap promptly instead of waiting out the whole backstop.
 // Transient poll errors are logged and retried -- only a terminal runner or a
 // cancelled/timed-out context ends the wait, so a blip never triggers an early
-// reap of a still-running runner. The activity's StartToCloseTimeout is the
-// backstop ceiling: a wedged runner times the activity out and the caller reaps
-// anyway.
+// reap of a still-running runner. The caller's ScheduleToCloseTimeout is the
+// backstop ceiling across every attempt: a wedged runner times the wait out and
+// the caller reaps anyway.
 func (a *Activities) WaitRunnerDone(ctx context.Context, dispatchedID string) error {
 	logger := activity.GetLogger(ctx)
 

@@ -4,7 +4,7 @@ linkTitle: "Runner Scaler"
 weight: 90
 ---
 
-Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `PollAndDispatch` parent loads the per-repo config from Consul (`runners/config`) and scans each repo for queued `self-hosted` Actions jobs, then **reconciles by depth**: it buckets the queued jobs by `(repo, labels)`, counts the runners already pending/running, and starts one `HandleRunner` child per missing runner &mdash; clamped by an optional `maxConcurrent` cap. A bucket left short is simply topped back up on the next tick, so there is no per-job dedup or external state store. Each child dispatches one ephemeral Nomad runner &mdash; `app`-mode repos mint a registration token, `vault`-mode repos pass a Vault secret path the runner self-registers with &mdash; and a backstop timer reaps a runner that never picked its job up. **Hover over any step** for implementation details.
+Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `PollAndDispatch` parent loads the per-repo config from Consul (`runners/config`) and scans each repo for queued `self-hosted` Actions jobs, then **reconciles by depth**: it buckets the queued jobs by `(repo, labels)`, counts the runners already pending/running, and starts one `HandleRunner` child per missing runner &mdash; clamped by an optional `maxConcurrent` cap. A bucket left short is simply topped back up on the next tick, so there is no per-job dedup or external state store. Each child dispatches one ephemeral Nomad runner &mdash; `app`-mode repos mint a registration token, `vault`-mode repos pass a Vault secret path the runner self-registers with &mdash; and a backstop deadline reaps a runner that never picked its job up. A wait that loses its worker to a restart of the scaler is retried rather than reaping a runner mid-job. **Hover over any step** for implementation details.
 
 <style>
 
@@ -61,8 +61,10 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
     '',
     '    STARTCHILD -.spawns.-> CSTART',
     '    CSTART([HandleRunner<br/>Child]):::workflow --> DISPATCH[Dispatch Runner<br/>mint token or Vault secret]:::activity',
-    '    DISPATCH --> WAIT[Wait Runner Done<br/>backstop deadline]:::activity',
-    '    WAIT --> REAP[Reap Runner<br/>stop Nomad job]:::activity',
+    '    DISPATCH --> WAIT[Wait Runner Done<br/>backstop across attempts]:::activity',
+    '    WAIT --> WAITGATE{Wait<br/>Outcome?}:::decision',
+    '    WAITGATE -->|heartbeat timeout, worker lost| WAIT',
+    '    WAITGATE -->|done, backstop or cancel| REAP[Reap Runner<br/>stop Nomad job]:::activity',
     '    REAP --> CDONE([Child<br/>Complete]):::workflow',
     '',
     '    classDef workflow fill:#7c3aed,stroke:#a78bfa,color:#fff,font-weight:bold',
@@ -180,7 +182,12 @@ Scales self-hosted CI runners on demand (zero idle). On a short schedule, the `P
     WAIT: {
       title: 'Wait Runner Done',
       badge: 'activity', badgeText: 'activity, heartbeat',
-      body: '<p><code>WaitRunnerDone</code> blocks (heartbeating) until the ephemeral runner\'s Nomad job completes, bounded by a backstop deadline sized as an upper bound on one CI job. On the happy path the runner takes its one job and exits well before it fires.</p>'
+      body: '<p><code>WaitRunnerDone</code> blocks (heartbeating) until the ephemeral runner\'s Nomad job completes. The backstop deadline is its <code>ScheduleToCloseTimeout</code>, sized as an upper bound on one CI job and spanning every attempt, so a retry never extends it. On the happy path the runner takes its one job and exits well before it fires.</p>'
+    },
+    WAITGATE: {
+      title: 'Wait Outcome?',
+      badge: 'decision', badgeText: 'retry or reap',
+      body: '<p>A heartbeat timeout means the worker running the wait went away &mdash; a redeploy or reschedule of the scaler &mdash; not that the runner finished, so the wait is retried on the next worker and the runner keeps its job. A finished runner, the backstop deadline or an operator cancel ends the wait and falls through to the reap.</p>'
     },
     REAP: {
       title: 'Reap Runner',
