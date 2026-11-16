@@ -8,8 +8,9 @@
 // per (repo, labels), dispatches only the shortfall when runners are already in
 // flight, and skips a repo whose listing errors without aborting the tick; a
 // vault-mode repo dispatches its profile job with minting disabled; the child
-// dispatches a runner and reaps it once the backstop timer fires. matchProfile's
-// label->job selection is covered directly.
+// dispatches a runner and reaps it once the runner finishes, the backstop fires
+// or the wait is cancelled, and retries a wait that lost its worker instead of
+// reaping. matchProfile's label->job selection is covered directly.
 // -------------------------------------------------------------------------------
 
 package workflows
@@ -20,6 +21,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/mock"
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 
@@ -350,11 +353,17 @@ func TestHandleRunner_DispatchThenReap(t *testing.T) {
 func TestHandleRunner_WaitBackstopStillReaps(t *testing.T) {
 	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
 
-	// The wait ends in error (backstop deadline / wedged runner) -- the workflow
-	// must still reap and complete cleanly, never orphaning the Nomad job.
+	// The wait hits its backstop (a wedged runner) -- the workflow must still reap
+	// and complete cleanly, never orphaning the Nomad job, and must not retry a
+	// wait whose ceiling has passed.
+	waits := 0
 	var reaped string
 	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("ci-runner/dispatch-1-abc", nil)
-	env.OnActivity(a.WaitRunnerDone, mock.Anything, mock.Anything).Return(errors.New("backstop deadline"))
+	env.OnActivity(a.WaitRunnerDone, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, _ string) error {
+			waits++
+			return temporal.NewTimeoutError(enumspb.TIMEOUT_TYPE_SCHEDULE_TO_CLOSE, nil)
+		})
 	env.OnActivity(a.ReapRunner, mock.Anything, mock.Anything).Return(
 		func(_ context.Context, id string) error { reaped = id; return nil })
 
@@ -366,8 +375,74 @@ func TestHandleRunner_WaitBackstopStillReaps(t *testing.T) {
 	if err := env.GetWorkflowError(); err != nil {
 		t.Fatalf("a wait timeout should still reap, not fail the workflow: %v", err)
 	}
+	if waits != 1 {
+		t.Errorf("WaitRunnerDone ran %d times, want 1: the backstop is not retried", waits)
+	}
 	if reaped != "ci-runner/dispatch-1-abc" {
 		t.Errorf("reaped %q, want the dispatched job id even after a wait backstop", reaped)
+	}
+}
+
+func TestHandleRunner_WaitSurvivesWorkerLoss(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	// The first wait loses its worker (a redeploy of the scaler) and surfaces as
+	// a heartbeat timeout; the retry on the next worker sees the runner finish.
+	// The reap must follow the finish, not the lost heartbeat.
+	waits, reapedAfter := 0, 0
+	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("ci-runner/dispatch-1-abc", nil)
+	env.OnActivity(a.WaitRunnerDone, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, _ string) error {
+			waits++
+			if waits == 1 {
+				return temporal.NewHeartbeatTimeoutError()
+			}
+			return nil
+		})
+	env.OnActivity(a.ReapRunner, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, _ string) error { reapedAfter = waits; return nil })
+
+	env.ExecuteWorkflow(HandleRunner, RunnerSpec{Repo: "octo/widget", Labels: []string{"self-hosted"}})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if waits != 2 {
+		t.Errorf("WaitRunnerDone ran %d times, want 2: the lost attempt is retried", waits)
+	}
+	if reapedAfter != 2 {
+		t.Errorf("reaped after wait %d, want 2: a lost worker must not reap a running runner", reapedAfter)
+	}
+}
+
+func TestHandleRunner_CancelledWaitReaps(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	// An operator cancel ends the wait without a retry and still reaps.
+	waits := 0
+	var reaped string
+	env.OnActivity(a.DispatchRunner, mock.Anything, mock.Anything).Return("ci-runner/dispatch-1-abc", nil)
+	env.OnActivity(a.WaitRunnerDone, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, _ string) error { waits++; return temporal.NewCanceledError() })
+	env.OnActivity(a.ReapRunner, mock.Anything, mock.Anything).Return(
+		func(_ context.Context, id string) error { reaped = id; return nil })
+
+	env.ExecuteWorkflow(HandleRunner, RunnerSpec{Repo: "octo/widget", Labels: []string{"self-hosted"}})
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if waits != 1 {
+		t.Errorf("WaitRunnerDone ran %d times, want 1: a cancel is not retried", waits)
+	}
+	if reaped != "ci-runner/dispatch-1-abc" {
+		t.Errorf("reaped %q, want the dispatched job id after a cancel", reaped)
 	}
 }
 

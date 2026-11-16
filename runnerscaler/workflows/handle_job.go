@@ -6,9 +6,11 @@
 // HandleRunner dispatches one ephemeral ci-runner for a (repo, labels) bucket,
 // waits for that runner's alloc to go terminal, then reaps it -- so the child
 // completes (and the dead dispatched job is purged) promptly after the CI job
-// finishes rather than lingering for the full backstop. reapAfter is now the
-// wait's ceiling: a runner that wedges or never claims a job times the wait out
-// and is reaped anyway. The dispatch runs under NoRetry: it creates a new runner
+// finishes rather than lingering for the full backstop. reapAfter bounds the
+// wait: a runner that wedges or never claims a job times the wait out and is
+// reaped anyway. A wait that loses its worker (a redeploy or reschedule of this
+// job) is retried on the next worker, so a restart never reaps a runner that is
+// still working. The dispatch runs under NoRetry: it creates a new runner
 // each call, so a retried dispatch would double up. The runner is NOT bound to a
 // specific job_id -- it takes whichever matching job is queued -- so the parent
 // poller decides how many of these to start by reconciling queued depth against
@@ -21,6 +23,7 @@ import (
 	"fmt"
 	"time"
 
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"munchbox/temporal-workers/runnerscaler/activities"
@@ -33,6 +36,17 @@ import (
 // before this; it must exceed the longest legitimate job so a busy runner is
 // never killed mid-build.
 const defaultReapAfter = time.Hour
+
+// waitRetry reschedules WaitRunnerDone after a heartbeat timeout, which is how
+// the loss of the worker running it surfaces. Attempts are unbounded: the wait's
+// ScheduleToCloseTimeout is the bound.
+func waitRetry() *temporal.RetryPolicy {
+	return &temporal.RetryPolicy{
+		InitialInterval:    time.Second,
+		BackoffCoefficient: 2.0,
+		MaximumInterval:    30 * time.Second,
+	}
+}
 
 // RunnerSpec is the child input: the repo the runner serves, the labels to
 // register it with, the parameterized job to dispatch (empty => the default
@@ -89,14 +103,16 @@ func HandleRunner(ctx workflow.Context, spec RunnerSpec) error {
 		reapAfter = defaultReapAfter
 	}
 	// Wait until the runner's alloc goes terminal so we reap promptly, with
-	// reapAfter as the backstop ceiling (StartToCloseTimeout): a wedged runner
-	// times the wait out and we reap anyway. NoRetry -- a timeout means "reap
-	// now", not "wait another ceiling". A cancellation (operator terminate) also
-	// falls through to the reap below so the dispatched runner is never orphaned.
+	// reapAfter as the backstop ceiling. It is the ScheduleToCloseTimeout, which
+	// spans every attempt, so a retry never extends it: a wedged runner times the
+	// wait out and we reap anyway. A heartbeat timeout is the worker going away,
+	// not the runner finishing, so it is retried rather than reaped. A
+	// cancellation (operator terminate) is not retried and falls through to the
+	// reap below, so the dispatched runner is never orphaned.
 	waitCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: reapAfter,
-		HeartbeatTimeout:    time.Minute,
-		RetryPolicy:         shared.NoRetry(),
+		ScheduleToCloseTimeout: reapAfter,
+		HeartbeatTimeout:       time.Minute,
+		RetryPolicy:            waitRetry(),
 	})
 	if err := workflow.ExecuteActivity(waitCtx, a.WaitRunnerDone, dispatchedID).Get(waitCtx, nil); err != nil {
 		logger.Info("Runner wait ended early (backstop deadline or cancellation); reaping now", "job", dispatchedID, "error", err)

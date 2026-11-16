@@ -43,7 +43,7 @@ offline to do its work always brings it back.
 - **Certificate renewal** (weekly) &mdash; ACME DNS-01 wildcard issued and published to the Vault path Traefik reads
 - **Token renewal** (weekly) &mdash; a fresh GitHub App installation token and a per-repo SonarCloud token written into each repo's Actions secrets, replacing hand-rotated PATs
 - **Media reconciliation** &mdash; completed Deluge downloads reconciled into the Sonarr/Radarr library
-- **CI runner scaling** (continuous) &mdash; queued self-hosted jobs reconciled against active runners, dispatching one ephemeral Nomad runner per shortfall and reaping it after
+- **CI runner scaling** (continuous) &mdash; queued self-hosted jobs reconciled against active runners, dispatching one ephemeral Nomad runner per shortfall and reaping it once its job is done, without losing a runner mid-job to a restart of the scaler
 
 </div>
 
