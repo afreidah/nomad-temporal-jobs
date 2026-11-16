@@ -485,12 +485,14 @@ Adding a pure-Go worker needs **no Dockerfile** — its `Makefile` just sets `IM
 
 Nothing is hand-bumped. Every version is derived from git:
 
-- **Image tags** (all workers + the `temporal-workers-web` image) come from `git describe --tags --always --dirty`, computed in `_common.mk`. `make push-backup` (and `push-all`) tag whatever the current commit resolves to, so an image tag always points back to an exact commit. Override with `VERSION=...` if you ever need to. Each push also publishes `:latest` for the same image — the Nomad jobs pin `:latest`, while the git-describe tag stays as the immutable, traceable alias for that exact build.
+- **Image tags** (all workers + the `temporal-workers-web` image) come from `git describe --tags --always --dirty`, computed in `_common.mk`. `make push-backup` (and `push-all`) tag whatever the current commit resolves to, so an image tag always points back to an exact commit. Override with `VERSION=...` (and `WEB_TAG=...` for the website image) if you ever need to. Each push also publishes `:latest` as an alias for the same image; the Nomad jobs pin the git-describe tag, the immutable, traceable name for that exact build.
 - **Release tags** are computed from the conventional-commit history by [`svu`](https://github.com/caarlos0/svu). `make release` runs `svu next`, tags it, and pushes — which triggers the Release workflow. You decide *when* to cut a release; the *number* is derived from the `feat:`/`fix:`/breaking commits since the last tag.
 
 ## Deployment
 
 Each domain is deployed as a separate Nomad service job. Workflows are started on cron by Temporal Schedules (Terraform-managed in `infrastructure/terragrunt`), not by Nomad jobs.
+
+A merge to `main` deploys itself. The Forgejo `images` workflow resolves the git-describe version once, builds and pushes every image under it, records it in Consul KV at `deploy/versions/nomad-temporal-jobs`, and dispatches the infrastructure repository's `deploy-version` workflow, which rolls every job onto that tag.
 
 ### Nomad Jobs
 

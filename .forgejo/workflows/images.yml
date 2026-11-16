@@ -1,5 +1,6 @@
 # -------------------------------------------------------------------------------
-# Build and push the worker and website images on every merge to main.
+# Build and push the worker and website images on every merge to main, record
+# their version and start the deployment.
 #
 # Project: Nomad Temporal Jobs / Author: Alex Freidah
 #
@@ -47,7 +48,15 @@ jobs:
             exit 1
           fi
 
+      # Every image is tagged with this one value, and it is the value recorded
+      # below, so the deployment cannot name a tag that was not pushed.
+      - name: Resolve the version
+        id: version
+        run: echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -56,4 +65,34 @@ jobs:
           # does not carry.
           docker run --privileged --rm tonistiigi/binfmt --install all
 
-          make push-all
+          make push-all VERSION="$VERSION" WEB_TAG="$VERSION"
+
+      # The deployment reads its version from this key, so it is written only
+      # once the images above exist under that tag.
+      - name: Record the released version
+        env:
+          CONSUL_HTTP_ADDR: http://127.0.0.1:8500
+          CONSUL_HTTP_TOKEN: ${{ secrets.CONSUL_HTTP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          consul kv put deploy/versions/nomad-temporal-jobs "$VERSION"
+
+          # Read back, so a silently-accepted write cannot pass as a success.
+          got=$(consul kv get deploy/versions/nomad-temporal-jobs)
+          [ "$got" = "$VERSION" ] || {
+            echo "::error::readback mismatch: stored $got, expected $VERSION"
+            exit 1
+          }
+          echo "recorded ${got}"
+
+      - name: Start the deployment
+        env:
+          RELEASE_DISPATCH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+        run: |
+          curl -fsS --max-time 30 -X POST \
+            -H "Authorization: token ${RELEASE_DISPATCH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{"ref":"main","inputs":{"app":"nomad-temporal-jobs"}}' \
+            http://forgejo.service.consul:30028/api/v1/repos/alex/munchbox/actions/workflows/deploy-version.yml/dispatches

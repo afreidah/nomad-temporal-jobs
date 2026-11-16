@@ -32,8 +32,8 @@ $(error git describe produced no version -- is this a git checkout with tags?)
 endif
 
 FULL_TAG   := $(REGISTRY)/$(IMAGE):$(VERSION)
-# Nomad jobs pin `:latest`; the git-describe tag is the immutable, traceable
-# alias for the exact same image. Both are pushed together.
+# The git-describe tag is the immutable, traceable name a deployment pins;
+# `:latest` is pushed with it as an alias for the same image.
 LATEST_TAG := $(REGISTRY)/$(IMAGE):latest
 # Every image is multi-arch (our Nomad clients are a mix of amd64 and arm64).
 # The Go build cross-compiles via $BUILDPLATFORM/$TARGETARCH, so it never
