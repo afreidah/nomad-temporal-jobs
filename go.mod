@@ -20,7 +20,7 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/moby/moby/api v1.57.0
 	github.com/moby/moby/client v0.6.1
-	github.com/pkg/sftp v1.13.11
+	github.com/pkg/sftp v1.13.12
 	github.com/prometheus/client_golang v1.25.0
 	github.com/stretchr/testify v1.12.1
 	github.com/uber-go/tally/v4 v4.1.17
