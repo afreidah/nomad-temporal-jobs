@@ -4,7 +4,8 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Tests for the package's pure functions (orphan classification, job-running
-// detection). External dependencies (Nomad API, SSH) are not tested here.
+// and mounted-directory detection). External dependencies (Nomad API, SSH) are
+// not tested here.
 // -------------------------------------------------------------------------------
 
 package nodecleanup
@@ -12,6 +13,8 @@ package nodecleanup
 import (
 	"testing"
 	"time"
+
+	"munchbox/temporal-workers/shared/client/nomad"
 )
 
 // -------------------------------------------------------------------------
@@ -38,8 +41,53 @@ func TestIsJobRunning(t *testing.T) {
 	}
 }
 
+func TestNewActiveDirs(t *testing.T) {
+	w := nomad.NodeWorkloads{
+		JobIDs: map[string]struct{}{"loki": {}},
+		HostPaths: []string{
+			"/data/prometheus",
+			"/data/cache-${NOMAD_ALLOC_INDEX}/redis",
+			"/data/${NOMAD_JOB_NAME}-a.b/x",
+			"/data/../data/tidy//sub/",
+			"/etc/nomad.d/tls/ca-chain.crt",
+			"/database/elsewhere",
+			"local/app.conf",
+		},
+	}
+	d := newActiveDirs(w, "/data/")
+	cases := []struct {
+		dir  string
+		want bool
+	}{
+		{"loki-1", true},     // job-name match still applies
+		{"prometheus", true}, // mounted, exact
+		{"cache-0", true},    // mounted, ${...} matches the index
+		{"cache-12", true},   // any index
+		{"cache", false},     // the literal dash is required
+		{"web-a.b", true},    // a leading ${...} matches the job name
+		{"web-axb", false},   // the dot is literal, not a regex wildcard
+		{"tidy", true},       // the path is cleaned before it is indexed
+		{"elsewhere", false}, // /database is not under /data
+		{"app.conf", false},  // task-relative paths are ignored
+		{"orphan", false},
+	}
+	for _, c := range cases {
+		if got := d.contains(c.dir); got != c.want {
+			t.Errorf("contains(%q) = %v, want %v", c.dir, got, c.want)
+		}
+	}
+}
+
+// A live alloc mounting the data dir itself protects every entry in it.
+func TestNewActiveDirs_DataDirMounted(t *testing.T) {
+	d := newActiveDirs(nomad.NodeWorkloads{HostPaths: []string{"/data"}}, "/data")
+	if !d.contains("anything") {
+		t.Error("a mount of the data dir itself must protect every entry")
+	}
+}
+
 func TestClassifyEntry(t *testing.T) {
-	running := map[string]struct{}{"loki": {}}
+	running := activeDirs{jobs: map[string]struct{}{"loki": {}}}
 	cfg := CleanupConfig{GraceDays: 7}
 	now := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
 	oldDir := now.AddDate(0, 0, -10)

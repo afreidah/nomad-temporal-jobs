@@ -4,8 +4,9 @@
 // Project: Nomad Temporal Jobs / Author: Alex Freidah
 //
 // Runs CleanupNodeViaSSH end-to-end with a fake HostConnector / RemoteHost and a
-// fake Nomad job set: orphan deletion, active-job protection, runtime-dir
-// exclusion, and the Docker prune path -- all without a real host or daemon.
+// fake Nomad workload set: orphan deletion, active-job and mounted-dir
+// protection, runtime-dir exclusion, and the Docker prune path -- all without a
+// real host or daemon.
 // -------------------------------------------------------------------------------
 
 package nodecleanup
@@ -21,6 +22,7 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"munchbox/temporal-workers/maintenance/internal/nodes"
+	"munchbox/temporal-workers/shared/client/nomad"
 	"munchbox/temporal-workers/shared/client/ssh"
 )
 
@@ -249,7 +251,7 @@ func TestCleanupNodeViaSSH(t *testing.T) {
 		reclaimed: 1024,
 	}
 	a := New(
-		&fakeNomad{jobs: map[string]struct{}{"livejob": {}}},
+		&fakeNomad{workloads: nomad.NodeWorkloads{JobIDs: map[string]struct{}{"livejob": {}}}},
 		&fakeConnector{host: host},
 	)
 	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
@@ -275,6 +277,40 @@ func TestCleanupNodeViaSSH(t *testing.T) {
 	}
 	if result.DockerSpaceFreed == "0B" {
 		t.Error("expected DockerSpaceFreed to reflect the prune, got 0B")
+	}
+}
+
+// A directory a live alloc mounts is kept even when its name matches no job ID
+// and its own mtime is past grace; an unmounted neighbour is still deleted.
+func TestCleanupNodeViaSSH_MountedDirKept(t *testing.T) {
+	old := time.Now().AddDate(0, 0, -30)
+	host := &fakeRemoteHost{entries: []os.FileInfo{
+		fakeFileInfo{name: "cache-0", mtime: old},
+		fakeFileInfo{name: "oldjob", mtime: old},
+	}}
+	a := New(
+		&fakeNomad{workloads: nomad.NodeWorkloads{
+			JobIDs:    map[string]struct{}{"cache-cluster": {}},
+			HostPaths: []string{"/data/cache-${NOMAD_ALLOC_INDEX}/server"},
+		}},
+		&fakeConnector{host: host},
+	)
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(a.CleanupNodeViaSSH)
+
+	val, err := env.ExecuteActivity(a.CleanupNodeViaSSH, nodes.NodeInfo{Name: "n1"}, CleanupConfig{DataDir: "/data", GraceDays: 7})
+	if err != nil {
+		t.Fatalf("CleanupNodeViaSSH: %v", err)
+	}
+	var result CleanupResult
+	if err := val.Get(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(host.removed) != 1 || host.removed[0] != "/data/oldjob" {
+		t.Errorf("removed = %v, want only [/data/oldjob]", host.removed)
+	}
+	if !strings.Contains(result.Output, "OK (active): cache-0") {
+		t.Errorf("output %q should report cache-0 as active", result.Output)
 	}
 }
 
@@ -310,7 +346,7 @@ func TestCleanupNodeViaSSH_Errors(t *testing.T) {
 		nomad *fakeNomad
 		conn  *fakeConnector
 	}{
-		{"running jobs", &fakeNomad{jobErr: errors.New("nomad down")}, &fakeConnector{host: &fakeRemoteHost{}}},
+		{"running workloads", &fakeNomad{workloadErr: errors.New("nomad down")}, &fakeConnector{host: &fakeRemoteHost{}}},
 		{"connect", &fakeNomad{}, &fakeConnector{err: errors.New("ssh refused")}},
 		{"list data dirs", &fakeNomad{}, &fakeConnector{host: &fakeRemoteHost{readErr: errors.New("sftp down")}}},
 	}
