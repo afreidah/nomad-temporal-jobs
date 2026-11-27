@@ -21,18 +21,18 @@ import (
 )
 
 type fakeNomad struct {
-	nodes   []nomad.NomadNode
-	nodeErr error
-	jobs    map[string]struct{}
-	jobErr  error
+	nodes       []nomad.NomadNode
+	nodeErr     error
+	workloads   nomad.NodeWorkloads
+	workloadErr error
 }
 
 func (f *fakeNomad) ClientNodes(_ context.Context) ([]nomad.NomadNode, error) {
 	return f.nodes, f.nodeErr
 }
 
-func (f *fakeNomad) RunningJobIDs(_ context.Context, _ string) (map[string]struct{}, error) {
-	return f.jobs, f.jobErr
+func (f *fakeNomad) RunningWorkloads(_ context.Context, _ string) (nomad.NodeWorkloads, error) {
+	return f.workloads, f.workloadErr
 }
 
 func TestGetAllNomadClientNodes(t *testing.T) {

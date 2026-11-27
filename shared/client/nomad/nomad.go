@@ -284,19 +284,83 @@ func (n *Nomad) ClientNodes(ctx context.Context) ([]NomadNode, error) {
 	return nodes, nil
 }
 
-// RunningJobIDs returns the set of job IDs with a running allocation on nodeID.
-func (n *Nomad) RunningJobIDs(ctx context.Context, nodeID string) (map[string]struct{}, error) {
+// NodeWorkloads is what the live allocations on one node hold: their job IDs,
+// and the host paths their docker tasks bind-mount. The paths are as written in
+// the job spec -- the API does not interpolate them -- so they can carry
+// references such as ${NOMAD_ALLOC_INDEX}.
+type NodeWorkloads struct {
+	JobIDs    map[string]struct{}
+	HostPaths []string
+}
+
+// RunningWorkloads returns the job IDs and docker bind-mount host paths of the
+// pending and running allocations on nodeID. A pending alloc is already placed
+// on the node, so its data is as live as a running one's.
+func (n *Nomad) RunningWorkloads(ctx context.Context, nodeID string) (NodeWorkloads, error) {
 	allocs, _, err := n.client.Nodes().Allocations(nodeID, (&api.QueryOptions{}).WithContext(ctx))
 	if err != nil {
-		return nil, fmt.Errorf("list allocations for node %s: %w", nodeID, err)
+		return NodeWorkloads{}, fmt.Errorf("list allocations for node %s: %w", nodeID, err)
 	}
-	running := make(map[string]struct{})
+	w := NodeWorkloads{JobIDs: make(map[string]struct{})}
 	for _, al := range allocs {
-		if al.ClientStatus == api.AllocClientStatusRunning {
-			running[al.JobID] = struct{}{}
+		if al.ClientStatus != api.AllocClientStatusRunning && al.ClientStatus != api.AllocClientStatusPending {
+			continue
+		}
+		w.JobIDs[al.JobID] = struct{}{}
+		w.HostPaths = append(w.HostPaths, allocHostPaths(al)...)
+	}
+	return w, nil
+}
+
+// allocHostPaths returns the host side of every docker volume and bind mount
+// declared by the tasks of the alloc's own task group.
+func allocHostPaths(al *api.Allocation) []string {
+	if al.Job == nil {
+		return nil
+	}
+	var paths []string
+	for _, tg := range al.Job.TaskGroups {
+		if tg.Name == nil || *tg.Name != al.TaskGroup {
+			continue
+		}
+		for _, task := range tg.Tasks {
+			if task.Driver == "docker" && task.Config != nil {
+				paths = append(paths, dockerHostPaths(task.Config)...)
+			}
 		}
 	}
-	return running, nil
+	return paths
+}
+
+// dockerHostPaths reads a docker task config's `volumes` ("host:container[:mode]")
+// and its bind-type `mount` / `mounts` entries, returning their host-side paths.
+// Volume-type mounts name a docker volume, not a host path, so they are skipped.
+func dockerHostPaths(cfg map[string]any) []string {
+	var paths []string
+	if vols, ok := cfg["volumes"].([]any); ok {
+		for _, v := range vols {
+			if s, ok := v.(string); ok {
+				host, _, _ := strings.Cut(s, ":")
+				paths = append(paths, host)
+			}
+		}
+	}
+	for _, key := range []string{"mount", "mounts"} {
+		mounts, ok := cfg[key].([]any)
+		if !ok {
+			continue
+		}
+		for _, m := range mounts {
+			mm, ok := m.(map[string]any)
+			if !ok || mm["type"] != "bind" {
+				continue
+			}
+			if src, ok := mm["source"].(string); ok && src != "" {
+				paths = append(paths, src)
+			}
+		}
+	}
+	return paths
 }
 
 // FindJobNode returns the node running the named job's first running alloc

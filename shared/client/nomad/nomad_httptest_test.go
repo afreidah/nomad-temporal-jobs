@@ -17,6 +17,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,8 +49,28 @@ func nomadStub(failPath string) *httptest.Server {
 			})
 		case p == "/v1/node/n1/allocations":
 			_ = enc.Encode([]*api.Allocation{
-				{JobID: "web", ClientStatus: api.AllocClientStatusRunning},
-				{JobID: "db", ClientStatus: api.AllocClientStatusComplete}, // skipped: not running
+				{JobID: "web", TaskGroup: "app", ClientStatus: api.AllocClientStatusRunning, Job: &api.Job{
+					TaskGroups: []*api.TaskGroup{
+						{Name: new("app"), Tasks: []*api.Task{
+							{Driver: "docker", Config: map[string]any{
+								"volumes": []any{"/opt/nomad/data/web-${NOMAD_ALLOC_INDEX}:/data", "local/web.conf:/etc/web.conf:ro"},
+								"mount": []any{
+									map[string]any{"type": "bind", "source": "/srv/shared", "target": "/shared"},
+									map[string]any{"type": "volume", "source": "web-cache", "target": "/cache"}, // a docker volume, not a host path
+								},
+							}},
+							{Driver: "exec", Config: map[string]any{"volumes": []any{"/srv/exec:/x"}}}, // not docker
+							{Driver: "docker", Config: map[string]any{
+								"mounts": []any{map[string]any{"type": "bind", "source": "/srv/legacy", "target": "/legacy"}},
+							}},
+						}},
+						{Name: new("other"), Tasks: []*api.Task{ // another group's tasks run elsewhere
+							{Driver: "docker", Config: map[string]any{"volumes": []any{"/opt/nomad/data/other:/data"}}},
+						}},
+					},
+				}},
+				{JobID: "queue", ClientStatus: api.AllocClientStatusPending},
+				{JobID: "db", ClientStatus: api.AllocClientStatusComplete}, // skipped: not live
 			})
 		case p == "/v1/allocations":
 			_ = enc.Encode([]*api.AllocationListStub{{ID: "a1", ClientStatus: api.AllocClientStatusRunning}})
@@ -115,15 +136,21 @@ func TestNomad_ClientNodes(t *testing.T) {
 	}
 }
 
-func TestNomad_RunningJobIDs(t *testing.T) {
+func TestNomad_RunningWorkloads(t *testing.T) {
 	ts := nomadStub("")
 	defer ts.Close()
-	jobs, err := testNomad(t, ts).RunningJobIDs(context.Background(), "n1")
+	w, err := testNomad(t, ts).RunningWorkloads(context.Background(), "n1")
 	if err != nil {
-		t.Fatalf("RunningJobIDs: %v", err)
+		t.Fatalf("RunningWorkloads: %v", err)
 	}
-	if _, ok := jobs["web"]; !ok || len(jobs) != 1 {
-		t.Errorf("jobs = %v, want only {web} (db is complete)", jobs)
+	_, web := w.JobIDs["web"]
+	_, queue := w.JobIDs["queue"]
+	if !web || !queue || len(w.JobIDs) != 2 {
+		t.Errorf("JobIDs = %v, want {web, queue} (db is complete)", w.JobIDs)
+	}
+	want := []string{"/opt/nomad/data/web-${NOMAD_ALLOC_INDEX}", "local/web.conf", "/srv/shared", "/srv/legacy"}
+	if !slices.Equal(w.HostPaths, want) {
+		t.Errorf("HostPaths = %v, want %v", w.HostPaths, want)
 	}
 }
 
@@ -355,7 +382,7 @@ func TestNomad_CallErrors(t *testing.T) {
 		call     func(n *Nomad) error
 	}{
 		{"RunningImages list", "/v1/allocations", func(n *Nomad) error { _, err := n.RunningImages(ctx); return err }},
-		{"RunningJobIDs", "/v1/node/n1/allocations", func(n *Nomad) error { _, err := n.RunningJobIDs(ctx, "n1"); return err }},
+		{"RunningWorkloads", "/v1/node/n1/allocations", func(n *Nomad) error { _, err := n.RunningWorkloads(ctx, "n1"); return err }},
 		{"FindJobNode allocs", "/v1/job/web/allocations", func(n *Nomad) error { _, err := n.FindJobNode(ctx, "web"); return err }},
 		{"FindJobNode node info", "/v1/node/n1", func(n *Nomad) error { _, err := n.FindJobNode(ctx, "web"); return err }},
 		{"ScaleJob", "/scale", func(n *Nomad) error { return n.ScaleJob(ctx, "web", "grp", 0, "test") }},

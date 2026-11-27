@@ -7,7 +7,8 @@
 // cleaning up orphaned job data directories via SSH. Orphaned directories
 // accumulate when Nomad jobs move between nodes and their ephemeral data
 // is left behind. Safety features include dry-run mode, a configurable
-// grace period, and system directory exclusion.
+// grace period, system directory exclusion, and protection of every
+// directory a live allocation on the node mounts.
 // -------------------------------------------------------------------------------
 
 package nodecleanup
@@ -15,6 +16,7 @@ package nodecleanup
 import (
 	"context"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -37,7 +39,7 @@ import (
 // structurally.
 type nomadClient interface {
 	ClientNodes(ctx context.Context) ([]nomad.NomadNode, error)
-	RunningJobIDs(ctx context.Context, nodeID string) (map[string]struct{}, error)
+	RunningWorkloads(ctx context.Context, nodeID string) (nomad.NodeWorkloads, error)
 }
 
 // Activities holds shared dependencies for node cleanup activities. Register
@@ -124,10 +126,11 @@ func (a *Activities) GetAllNomadClientNodes(ctx context.Context) ([]nodes.NodeIn
 }
 
 // CleanupNodeViaSSH removes orphaned Nomad job data directories on a node. The
-// set of running jobs comes from the Nomad API (so no token is shipped to the
-// node); the directory scan and deletions run over SSH because the data lives
-// on the node's disk and Nomad exposes no API for it. Dry-run reports what
-// would be deleted without removing anything.
+// node's live jobs and the host paths they mount come from the Nomad API (so no
+// token is shipped to the node), and failing to read them aborts the node
+// before anything is deleted; the directory scan and deletions run over SSH
+// because the data lives on the node's disk and Nomad exposes no API for it.
+// Dry-run reports what would be deleted without removing anything.
 func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo, config CleanupConfig) (CleanupResult, error) {
 	logger := activity.GetLogger(ctx)
 	result := CleanupResult{
@@ -135,12 +138,12 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 		DockerSpaceFreed: "0B", ContainerdSpaceFreed: "0B", RootfsSpaceFreed: "0B", BuildxSpaceFreed: "0B",
 	}
 
-	// Running jobs on this node, straight from the Nomad API.
-	running, err := a.runningJobs(ctx, node.ID)
+	workloads, err := a.runningWorkloads(ctx, node.ID)
 	if err != nil {
 		result.Errors = append(result.Errors, err.Error())
 		return result, err
 	}
+	active := newActiveDirs(workloads, config.DataDir)
 
 	logger.Info("Connecting to node via SSH", "node", node.Name, "address", node.Address)
 	conn, err := a.host.Connect(nodes.Target(node))
@@ -157,7 +160,7 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 	}
 
 	var out strings.Builder
-	out.WriteString(a.sweepDataDirs(ctx, conn, entries, running, config, &result))
+	out.WriteString(a.sweepDataDirs(ctx, conn, entries, active, config, &result))
 
 	if config.DockerPrune {
 		freed, dockerOut := a.dockerPrune(ctx, conn, config.DryRun)
@@ -203,7 +206,7 @@ func (a *Activities) CleanupNodeViaSSH(ctx context.Context, node nodes.NodeInfo,
 // dry-run, reports them), updating the scan counters on result and returning the
 // per-entry log. Split out of CleanupNodeViaSSH so that method stays a flat
 // sequence of steps rather than nesting the scan loop's switch inside it.
-func (a *Activities) sweepDataDirs(ctx context.Context, conn ssh.RemoteHost, entries []dirEntry, running map[string]struct{}, config CleanupConfig, result *CleanupResult) string {
+func (a *Activities) sweepDataDirs(ctx context.Context, conn ssh.RemoteHost, entries []dirEntry, active activeDirs, config CleanupConfig, result *CleanupResult) string {
 	logger := activity.GetLogger(ctx)
 	now := time.Now()
 	var out strings.Builder
@@ -211,7 +214,7 @@ func (a *Activities) sweepDataDirs(ctx context.Context, conn ssh.RemoteHost, ent
 		result.Scanned++
 		activity.RecordHeartbeat(ctx, e.name) // progress signal so a long scan trips HeartbeatTimeout, not StartToClose
 
-		action, ageDays := classifyEntry(e, running, config, now)
+		action, ageDays := classifyEntry(e, active, config, now)
 		switch action {
 		case entrySkipExcluded:
 			result.Skipped++
@@ -255,13 +258,78 @@ type dirEntry struct {
 	mtime time.Time
 }
 
-// runningJobs returns the set of job IDs with a running allocation on the node,
-// read from the Nomad API.
-func (a *Activities) runningJobs(ctx context.Context, nodeID string) (map[string]struct{}, error) {
+// runningWorkloads returns the live job IDs on the node and the host paths
+// their tasks mount, read from the Nomad API.
+func (a *Activities) runningWorkloads(ctx context.Context, nodeID string) (nomad.NodeWorkloads, error) {
 	ctx, span := shared.StartPeerSpan(ctx, "nomad", "nomad.node_allocations")
 	defer span.End()
 
-	return a.nomad.RunningJobIDs(ctx, nodeID)
+	return a.nomad.RunningWorkloads(ctx, nodeID)
+}
+
+// interpolationRef matches one ${...} reference in an uninterpolated job-spec
+// path, such as ${NOMAD_ALLOC_INDEX}.
+var interpolationRef = regexp.MustCompile(`\$\{[^}]*\}`)
+
+// activeDirs answers whether a data-dir entry belongs to a live workload on the
+// node: its name maps to a live job ID, or a live alloc mounts a path inside it.
+// A data-dir name need not match its job's ID, so the mounts are what protect a
+// directory named after something else.
+type activeDirs struct {
+	jobs     map[string]struct{}
+	mounted  map[string]struct{}
+	patterns []*regexp.Regexp // mounted names that carry ${...}, matched as wildcards
+	all      bool             // a live alloc mounts the data dir itself
+}
+
+// newActiveDirs indexes the workloads' host paths by the data-dir entry each
+// one falls under. Relative paths (task-local files) and paths outside dataDir
+// are ignored. A ${...} reference in the entry name matches any text, since the
+// API returns the path uninterpolated -- over-protecting is the safe failure.
+func newActiveDirs(w nomad.NodeWorkloads, dataDir string) activeDirs {
+	d := activeDirs{jobs: w.JobIDs, mounted: make(map[string]struct{})}
+	root := path.Clean(dataDir)
+	for _, p := range w.HostPaths {
+		if !strings.HasPrefix(p, "/") {
+			continue
+		}
+		p = path.Clean(p)
+		if p == root {
+			d.all = true
+			continue
+		}
+		rest, ok := strings.CutPrefix(p, root+"/")
+		if !ok {
+			continue
+		}
+		name, _, _ := strings.Cut(rest, "/")
+		if !strings.Contains(name, "${") {
+			d.mounted[name] = struct{}{}
+			continue
+		}
+		literals := interpolationRef.Split(name, -1)
+		for i, lit := range literals {
+			literals[i] = regexp.QuoteMeta(lit)
+		}
+		d.patterns = append(d.patterns, regexp.MustCompile("^"+strings.Join(literals, ".*")+"$"))
+	}
+	return d
+}
+
+// contains reports whether the data-dir entry name belongs to a live workload.
+func (d activeDirs) contains(name string) bool {
+	if d.all || isJobRunning(name, d.jobs) {
+		return true
+	}
+	if _, ok := d.mounted[name]; ok {
+		return true
+	}
+	for _, re := range d.patterns {
+		if re.MatchString(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // listDataDirs returns the immediate subdirectories of dataDir on the remote
@@ -296,18 +364,18 @@ type orphanAction int
 
 const (
 	entrySkipExcluded orphanAction = iota // a protected Nomad runtime dir
-	entryActive                           // belongs to a running job
+	entryActive                           // belongs to a live workload
 	entryWithinGrace                      // orphaned but younger than the grace period
 	entryOrphan                           // a deletion candidate
 )
 
 // classifyEntry decides what should happen to one data-dir entry and returns
 // the action plus the entry's age in days.
-func classifyEntry(e dirEntry, running map[string]struct{}, cfg CleanupConfig, now time.Time) (orphanAction, int) {
+func classifyEntry(e dirEntry, active activeDirs, cfg CleanupConfig, now time.Time) (orphanAction, int) {
 	if _, excluded := orphanExcludes[e.name]; excluded {
 		return entrySkipExcluded, 0
 	}
-	if isJobRunning(e.name, running) {
+	if active.contains(e.name) {
 		return entryActive, 0
 	}
 	ageDays := int(now.Sub(e.mtime).Hours() / 24)
