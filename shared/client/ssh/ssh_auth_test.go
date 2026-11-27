@@ -78,9 +78,10 @@ func TestBuildAuthMethods(t *testing.T) {
 	t.Run("valid cert yields cert then key", func(t *testing.T) {
 		caSigner, _ := testSigner(t)
 		cert := &ssh.Certificate{
-			Key:         signer.PublicKey(),
-			CertType:    ssh.UserCert,
-			ValidBefore: ssh.CertTimeInfinity,
+			Key:             signer.PublicKey(),
+			CertType:        ssh.UserCert,
+			ValidPrincipals: []string{"root"}, // x/crypto refuses to sign a cert with none
+			ValidBefore:     ssh.CertTimeInfinity,
 		}
 		if err := cert.SignCert(rand.Reader, caSigner); err != nil {
 			t.Fatalf("sign cert: %v", err)
